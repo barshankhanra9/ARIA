@@ -4,6 +4,8 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -20,6 +22,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Backup
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -54,11 +57,15 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.nocturne.player.BuildConfig
+import app.nocturne.player.R
 import app.nocturne.player.data.model.AnimationIntensity
 import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.ArtworkTapAction
@@ -137,6 +144,46 @@ fun SettingsScreen(
     ) {
         item {
             EditorialSectionHeader(eyebrow = "PREFERENCES", title = "Settings")
+            Spacer(Modifier.height(12.dp))
+            PaperCard(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("settings_brand_header_card"),
+                containerColor = palette.paperElevated,
+                elevation = 3.dp,
+                cornerRadius = 16.dp,
+                onClick = { showAboutDialog = true },
+                contentPadding = PaddingValues(14.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Image(
+                        painter = painterResource(R.drawable.aria_app_logo),
+                        contentDescription = "ARIA app logo",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(1.dp, palette.divider, RoundedCornerShape(14.dp))
+                    )
+                    Spacer(Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "ARIA",
+                            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+                            color = palette.inkPrimary
+                        )
+                        Text(
+                            text = "Modern Paper Audio · v${BuildConfig.VERSION_NAME}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                    }
+                    InkStampTag(text = "PLAYER", accented = true)
+                }
+            }
         }
 
         // 1. AUDIO & EQUALIZER
@@ -594,7 +641,15 @@ fun SettingsScreen(
                     Text("Open-Source Licenses", color = palette.inkPrimary)
                 }
                 TextButton(onClick = { showAboutDialog = true }) {
-                    Icon(Icons.Rounded.Info, null, tint = palette.accent, modifier = Modifier.size(18.dp))
+                    Image(
+                        painter = painterResource(R.drawable.aria_app_logo),
+                        contentDescription = "ARIA app logo",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .clip(RoundedCornerShape(5.dp))
+                            .border(0.5.dp, palette.divider, RoundedCornerShape(5.dp))
+                    )
                     Spacer(Modifier.width(8.dp))
                     Text("About ARIA (${BuildConfig.VERSION_NAME})", color = palette.inkPrimary)
                 }
@@ -639,7 +694,25 @@ fun SettingsScreen(
             onDismissRequest = { showAboutDialog = false },
             title = "ARIA · Modern Paper Audio",
             text = {
-                Text("Version ${BuildConfig.VERSION_NAME}\nA tactile offline music journal powered by AndroidX Media3.")
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Image(
+                        painter = painterResource(R.drawable.aria_app_logo),
+                        contentDescription = "ARIA app logo",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(76.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .border(1.dp, palette.divider, RoundedCornerShape(18.dp))
+                    )
+                    Text(
+                        text = "Version ${BuildConfig.VERSION_NAME}\nA tactile offline & streaming music journal powered by AndroidX Media3.",
+                        color = palette.inkPrimary
+                    )
+                }
             },
             confirmButton = {
                 TextButton(onClick = { showAboutDialog = false }) { Text("Close", color = palette.accent) }
