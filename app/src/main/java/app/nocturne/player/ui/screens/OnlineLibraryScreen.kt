@@ -79,7 +79,7 @@ fun OnlineLibraryScreen(
     onRemoveQueueItem: (Int) -> Unit,
     onClearQueue: () -> Unit,
     onOpenQueueSheet: () -> Unit,
-    onOpenArtist: (String, OnlineProviderType) -> Unit,
+    onOpenArtist: (String, OnlineProviderType, String?) -> Unit,
     onOpenPlaylist: (OnlinePlaylist) -> Unit
 ) {
     val palette = AriaPaperTheme.palette
@@ -151,7 +151,7 @@ fun OnlineLibraryScreen(
                 currentTrackId = onlineSnapshot.currentTrack?.id,
                 emptyIcon = Icons.Rounded.PlayArrow,
                 emptyTitle = "No Most Played Streams Yet",
-                emptySubtitle = "Stream tracks across YouTube, SoundCloud, or Bandcamp to build your rotation.",
+                emptySubtitle = "Stream tracks across your configured providers to build your rotation.",
                 onPlayTracks = onPlayTracks,
                 onToggleFavorite = onToggleFavorite,
                 onOpenContextMenu = onOpenContextMenu
@@ -308,7 +308,7 @@ fun OnlineLibraryScreen(
                                     if (rep.artistUrl.isNullOrBlank() && rep.artistId.isNullOrBlank()) {
                                         onPlayTracks(artistTracks, 0, false)
                                     } else {
-                                        onOpenArtist(target, rep.providerType)
+                                        onOpenArtist(target, rep.providerType, rep.effectiveProviderId())
                                     }
                                 },
                                 contentPadding = PaddingValues(12.dp)
@@ -326,7 +326,7 @@ fun OnlineLibraryScreen(
                                         Text(artistName, style = MaterialTheme.typography.titleMedium, color = palette.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                         Text("${artistTracks.size} saved track(s)", style = MaterialTheme.typography.bodySmall, color = palette.inkSecondary)
                                     }
-                                    InkStampTag(text = rep.providerType.badge)
+                                    InkStampTag(text = rep.effectiveBadge())
                                 }
                             }
                         }

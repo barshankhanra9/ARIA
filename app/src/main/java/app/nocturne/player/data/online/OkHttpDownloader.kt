@@ -72,7 +72,7 @@ object OnlineHttpClient {
             .writeTimeout(15, TimeUnit.SECONDS)
             .dns(InputAndUrlSecurity.ssrfSafeDns())
             .followRedirects(true)
-            .followSslRedirects(true)
+            .followSslRedirects(false)
             .retryOnConnectionFailure(true)
             .addInterceptor(mobileBrowserHeadersInterceptor)
             .addNetworkInterceptor(InputAndUrlSecurity.ssrfNetworkGuardInterceptor)

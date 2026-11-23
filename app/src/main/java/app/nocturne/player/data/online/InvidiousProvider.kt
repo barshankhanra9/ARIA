@@ -1,6 +1,7 @@
 package app.nocturne.player.data.online
 
 import android.net.Uri
+import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -12,10 +13,10 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -29,27 +30,41 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
 
 class InvidiousProvider(
     private val client: OkHttpClient = OnlineHttpClient.client,
     private val baseUrlsOverride: List<String>? = null,
-    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null
+    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null,
+    private val healthTracker: ProviderHealthTracker = ProviderHealthTracker(),
+    private val dynamicConfigProvider: (() -> DynamicProviderConfig?)? = null,
+    executorOverride: DynamicHttpExecutor? = null
 ) : OnlineMusicProvider {
 
     override val providerType: OnlineProviderType = OnlineProviderType.INVIDIOUS
+    override val providerId: String
+        get() = currentConfig()?.id ?: "invidious"
+    override val displayName: String
+        get() = currentConfig()?.displayName ?: OnlineProviderType.INVIDIOUS.displayName
     override val supportsPagination: Boolean = true
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val discoveryMutex = Mutex()
-    private var discoveredInstances: List<String> = emptyList()
-    private var lastDiscoveryAtMs: Long = 0L
-    private val instanceFailureCooldowns = ConcurrentHashMap<String, Long>()
+    private val executor: DynamicHttpExecutor = executorOverride ?: DynamicHttpExecutor(
+        baseClient = client,
+        healthTracker = healthTracker,
+        allowLoopbackForTests = baseUrlsOverride != null
+    )
+
     @Volatile
     var lastWorkingInstance: String? = null
         private set
+
+    override fun currentConfig(): DynamicProviderConfig? = dynamicConfigProvider?.invoke()
+
+    override fun supportsCapability(capability: String): Boolean =
+        currentConfig()?.supportsCapability(capability) ?: true
+
+    override fun activeEndpointFor(operation: OperationType): String? =
+        healthTracker.activeEndpointFor(providerId, operation) ?: lastWorkingInstance
 
     override suspend fun search(
         query: String,
@@ -65,8 +80,8 @@ class InvidiousProvider(
             else -> "all"
         }
         val encodedQ = Uri.encode(safeQuery)
-        val body = executeWithInstanceFallback("/api/v1/search?q=$encodedQ&page=$page&type=$typeParam")
-        val arr = json.parseToJsonElement(body).jsonArray
+        val resp = executeRawWithFallback(OperationType.SEARCH, "/api/v1/search?q=$encodedQ&page=$page&type=$typeParam")
+        val arr = json.parseToJsonElement(resp.body).jsonArray
 
         val tracks = mutableListOf<OnlineTrack>()
         val artists = mutableListOf<OnlineArtistSummary>()
@@ -89,7 +104,9 @@ class InvidiousProvider(
             albums = albums,
             nextPageToken = if (hasMore) (page + 1).toString() else null,
             hasMore = hasMore,
-            providerUsed = OnlineProviderType.INVIDIOUS
+            providerUsed = OnlineProviderType.INVIDIOUS,
+            providerUsedId = providerId,
+            providerUsedLabel = displayName
         )
     }
 
@@ -97,18 +114,18 @@ class InvidiousProvider(
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (safeQuery.isBlank()) return@withContext emptyList()
         val encodedQ = Uri.encode(safeQuery)
-        val body = executeWithInstanceFallback("/api/v1/search/suggestions?q=$encodedQ")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.SEARCH, "/api/v1/search/suggestions?q=$encodedQ")
+        val obj = json.parseToJsonElement(resp.body).jsonObject
         obj["suggestions"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
-        val body = runCatching {
-            executeWithInstanceFallback("/api/v1/trending?type=music")
+        val resp = runCatching {
+            executeRawWithFallback(OperationType.SEARCH, "/api/v1/trending?type=music")
         }.getOrElse {
-            executeWithInstanceFallback("/api/v1/popular")
+            executeRawWithFallback(OperationType.SEARCH, "/api/v1/popular")
         }
-        val arr = json.parseToJsonElement(body).jsonArray
+        val arr = json.parseToJsonElement(resp.body).jsonArray
         arr.mapNotNull { parseVideoObject(it.jsonObject) }
     }
 
@@ -118,8 +135,9 @@ class InvidiousProvider(
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Invidious video ID")
-        val (instanceUrl, body) = executeWithInstanceAndUrl("/api/v1/videos/${Uri.encode(videoId)}")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.PLAYBACK, "/api/v1/videos/${Uri.encode(videoId)}")
+        val instanceUrl = resp.endpointUrl
+        val obj = json.parseToJsonElement(resp.body).jsonObject
 
         val allowedTestOrigin = instanceUrl.takeIf { baseUrlsOverride != null }
         val adaptive = obj["adaptiveFormats"]?.jsonArray.orEmpty()
@@ -151,7 +169,7 @@ class InvidiousProvider(
             streams = streams,
             speedTier = speedTier,
             allowedLoopbackOrigin = allowedTestOrigin
-        ) ?: throw IllegalStateException("No audio stream returned by Invidious")
+        ) ?: throw IllegalStateException("No audio stream returned by $displayName")
 
         val title = obj.str("title") ?: track.title
         val author = obj.str("author") ?: track.artist
@@ -175,15 +193,18 @@ class InvidiousProvider(
             streams = streams,
             selectedStream = selected,
             relatedTracks = related,
-            resolvedBy = OnlineProviderType.INVIDIOUS
+            resolvedBy = OnlineProviderType.INVIDIOUS,
+            resolvedByProviderId = providerId,
+            resolvedByLabel = displayName
         )
     }
 
     override suspend fun fetchArtist(artistIdOrUrl: String): OnlineArtistPage = withContext(Dispatchers.IO) {
         val channelId = InputAndUrlSecurity.sanitizePathSegment(extractChannelId(artistIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Invidious channel ID")
-        val (instanceUrl, body) = executeWithInstanceAndUrl("/api/v1/channels/${Uri.encode(channelId)}")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.METADATA, "/api/v1/channels/${Uri.encode(channelId)}")
+        val instanceUrl = resp.endpointUrl
+        val obj = json.parseToJsonElement(resp.body).jsonObject
         val videos = obj["latestVideos"]?.jsonArray.orEmpty().mapNotNull {
             parseVideoObject(it.jsonObject, instanceUrl)
         }
@@ -203,110 +224,75 @@ class InvidiousProvider(
             description = obj.str("description").orEmpty(),
             tracks = videos,
             playlists = emptyList(),
-            providerType = OnlineProviderType.INVIDIOUS
+            providerType = OnlineProviderType.INVIDIOUS,
+            providerId = providerId
         )
     }
 
     override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val playlistId = InputAndUrlSecurity.sanitizePathSegment(extractPlaylistId(albumIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Invidious playlist ID")
-        val (instanceUrl, body) = executeWithInstanceAndUrl("/api/v1/playlists/${Uri.encode(playlistId)}")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.METADATA, "/api/v1/playlists/${Uri.encode(playlistId)}")
+        val instanceUrl = resp.endpointUrl
+        val obj = json.parseToJsonElement(resp.body).jsonObject
         val videos = obj["videos"]?.jsonArray.orEmpty().mapNotNull {
             parseVideoObject(it.jsonObject, instanceUrl)
         }
         OnlineAlbumPage(
             id = playlistId,
             title = obj.str("title") ?: "Playlist",
-            artist = obj.str("author") ?: "Invidious",
+            artist = obj.str("author") ?: displayName,
             url = "https://www.youtube.com/playlist?list=${Uri.encode(playlistId)}",
             thumbnailUrl = obj.str("playlistThumbnail")?.let { resolveInstanceMediaUrl(instanceUrl, it) }
                 ?: videos.firstOrNull()?.thumbnailUrl,
             description = obj.str("description").orEmpty(),
             tracks = videos,
-            providerType = OnlineProviderType.INVIDIOUS
+            providerType = OnlineProviderType.INVIDIOUS,
+            providerId = providerId
         )
     }
 
-    private suspend fun getCandidateInstances(): List<String> {
-        if (baseUrlsOverride != null) {
-            return baseUrlsOverride.mapNotNull {
-                InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = true)
-            }
-        }
-        val remoteConfigured = dynamicBaseUrlsProvider?.invoke().orEmpty()
-            .mapNotNull { InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = false) }
-        discoveryMutex.withLock {
-            val now = System.currentTimeMillis()
-            if (discoveredInstances.isEmpty() || now - lastDiscoveryAtMs > DISCOVERY_TTL_MS) {
-                val fresh = runCatching { fetchHealthyInstancesFromDirectory() }.getOrDefault(emptyList())
-                discoveredInstances = (remoteConfigured + fresh + DEFAULT_INSTANCES).distinct()
-                lastDiscoveryAtMs = now
-            }
-        }
-        val combined = (remoteConfigured + discoveredInstances).distinct()
-        val now = System.currentTimeMillis()
-        val ready = combined.filter { (instanceFailureCooldowns[it] ?: 0L) <= now }
-        return ready.ifEmpty { combined }
-    }
-
-    private fun fetchHealthyInstancesFromDirectory(): List<String> {
-        val req = Request.Builder()
-            .url("https://api.invidious.io/instances.json?sort_by=type,api,users")
-            .header("User-Agent", OnlineHttpClient.USER_AGENT)
-            .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val body = InputAndUrlSecurity.readBodyBounded(resp.body, 1024L * 1024L)
-            val arr = json.parseToJsonElement(body).jsonArray
-            return arr.mapNotNull { entry ->
-                val pair = entry.jsonArray
-                if (pair.size < 2) return@mapNotNull null
-                val meta = pair[1].jsonObject
-                val type = meta.str("type")
-                val api = meta.bool("api") ?: false
-                val uri = meta.str("uri")
-                if (type == "https" && api) {
-                    InputAndUrlSecurity.validateRemoteBaseUrl(uri, allowLoopback = false)
-                } else null
-            }.take(12)
-        }
-    }
-
-    private suspend fun executeWithInstanceFallback(path: String): String {
-        return executeWithInstanceAndUrl(path).second
-    }
-
-    private suspend fun executeWithInstanceAndUrl(path: String): Pair<String, String> {
-        val candidates = getCandidateInstances()
-        var lastErr: Throwable? = null
-        for (base in candidates) {
-            val cleanBase = base.trimEnd('/')
-            val url = "$cleanBase$path"
-            try {
-                val req = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", OnlineHttpClient.USER_AGENT)
-                    .header("Accept", "application/json")
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        throw IOException("HTTP ${resp.code} from $cleanBase")
-                    }
-                    val body = InputAndUrlSecurity.readBodyBounded(resp.body)
-                    if (body.isBlank() || body.trimStart().startsWith("<")) {
-                        throw IOException("Non-JSON response from $cleanBase")
-                    }
-                    lastWorkingInstance = cleanBase
-                    instanceFailureCooldowns.remove(cleanBase)
-                    return cleanBase to body
+    private fun getEndpointConfigs(operation: OperationType): List<ProviderEndpointConfig> {
+        val baseList = when {
+            baseUrlsOverride != null -> baseUrlsOverride.mapIndexedNotNull { idx, raw ->
+                InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = true)?.let { clean ->
+                    ProviderEndpointConfig(url = clean, priority = idx + 1)
                 }
-            } catch (t: Throwable) {
-                lastErr = t
-                instanceFailureCooldowns[cleanBase] = System.currentTimeMillis() + INSTANCE_COOLDOWN_MS
             }
+            currentConfig() != null -> currentConfig()!!.endpointsFor(operation)
+            else -> dynamicBaseUrlsProvider?.invoke().orEmpty()
+                .mapIndexedNotNull { idx, raw ->
+                    InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = false)?.let { clean ->
+                        ProviderEndpointConfig(url = clean, priority = idx + 1)
+                    }
+                }
+                .distinctBy { it.url }
         }
-        throw lastErr ?: IOException("All Invidious instances unavailable")
+        val stickyForOp = healthTracker.activeEndpointFor(providerId, operation)
+        val preferred = if (stickyForOp == null) lastWorkingInstance else null
+        return if (preferred != null && baseList.any { it.url == preferred }) {
+            val reordered = listOf(baseList.first { it.url == preferred }) + baseList.filterNot { it.url == preferred }
+            reordered.mapIndexed { idx, ep -> ep.copy(priority = idx + 1) }
+        } else {
+            baseList
+        }
+    }
+
+    private suspend fun executeRawWithFallback(operation: OperationType, path: String): ExecutedHttpResponse {
+        val endpoints = getEndpointConfigs(operation)
+        val cfg = currentConfig()
+        val resp = executor.executeRawGet(
+            providerId = providerId,
+            operation = operation,
+            configuredEndpoints = endpoints,
+            pathAndQuery = path,
+            headers = cfg?.headers ?: emptyMap(),
+            timeoutMs = cfg?.timeoutMs ?: 10_000L,
+            maxRetries = cfg?.maxRetries ?: 1,
+            cooldownMs = cfg?.cooldownMs ?: 60_000L
+        )
+        lastWorkingInstance = resp.endpointUrl
+        return resp
     }
 
     private fun parseVideoObject(obj: JsonObject, baseUrl: String? = null): OnlineTrack? {
@@ -321,18 +307,19 @@ class InvidiousProvider(
             id = OnlineTrack.canonicalId(OnlineProviderType.YOUTUBE, id),
             sourceId = id,
             providerType = OnlineProviderType.INVIDIOUS,
-            providerLabel = OnlineProviderType.INVIDIOUS.displayName,
+            providerLabel = displayName,
             sourceUrl = "https://www.youtube.com/watch?v=$id",
             title = title,
             artist = author,
             artistId = authorId,
             artistUrl = authorId?.let { "https://www.youtube.com/channel/$it" },
-            album = "YouTube · Invidious",
+            album = "YouTube · $displayName",
             durationMs = lengthSec * 1000L,
             thumbnailUrl = thumb,
             viewCount = obj.long("viewCount") ?: 0L,
             publishedText = obj.str("publishedText").orEmpty(),
-            isLive = obj.bool("liveNow") ?: false
+            isLive = obj.bool("liveNow") ?: false,
+            providerId = providerId
         )
     }
 
@@ -347,13 +334,14 @@ class InvidiousProvider(
             id = OnlineTrack.canonicalId(OnlineProviderType.YOUTUBE, id),
             sourceId = id,
             providerType = OnlineProviderType.INVIDIOUS,
-            providerLabel = OnlineProviderType.INVIDIOUS.displayName,
+            providerLabel = displayName,
             sourceUrl = "https://www.youtube.com/watch?v=$id",
             title = title,
             artist = author,
             artistId = obj.str("authorId"),
             durationMs = lengthSec * 1000L,
-            thumbnailUrl = thumb
+            thumbnailUrl = thumb,
+            providerId = providerId
         )
     }
 
@@ -367,7 +355,8 @@ class InvidiousProvider(
             url = "https://www.youtube.com/channel/$id",
             thumbnailUrl = thumb,
             subscriberText = obj.long("subCount")?.let { "${it / 1000}K" }.orEmpty(),
-            providerType = OnlineProviderType.INVIDIOUS
+            providerType = OnlineProviderType.INVIDIOUS,
+            providerId = providerId
         )
     }
 
@@ -380,7 +369,8 @@ class InvidiousProvider(
             url = "https://www.youtube.com/playlist?list=$id",
             thumbnailUrl = obj.str("playlistThumbnail"),
             trackCount = obj.int("videoCount") ?: 0,
-            providerType = OnlineProviderType.INVIDIOUS
+            providerType = OnlineProviderType.INVIDIOUS,
+            providerId = providerId
         )
     }
 
@@ -420,19 +410,6 @@ class InvidiousProvider(
         return runCatching {
             Uri.parse(idOrUrl).getQueryParameter("list")?.takeIf { it.isNotBlank() }
         }.getOrNull() ?: idOrUrl
-    }
-
-    companion object {
-        private const val DISCOVERY_TTL_MS = 30 * 60_000L
-        private const val INSTANCE_COOLDOWN_MS = 90_000L
-
-        private val DEFAULT_INSTANCES = listOf(
-            "https://inv.nadeko.net",
-            "https://invidious.nerdvpn.de",
-            "https://invidious.jing.rocks",
-            "https://yt.artemislena.eu",
-            "https://invidious.privacyredirect.com"
-        )
     }
 }
 

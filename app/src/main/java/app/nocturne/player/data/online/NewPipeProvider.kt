@@ -1,6 +1,7 @@
 package app.nocturne.player.data.online
 
 import android.net.Uri
+import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -12,6 +13,7 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -36,10 +38,24 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class NewPipeProvider(
-    override val providerType: OnlineProviderType
+    override val providerType: OnlineProviderType,
+    private val dynamicConfigProvider: (() -> DynamicProviderConfig?)? = null
 ) : OnlineMusicProvider {
 
+    override val providerId: String
+        get() = currentConfig()?.id ?: providerType.defaultProviderId()
+
+    override val displayName: String
+        get() = currentConfig()?.displayName ?: providerType.displayName
+
     override val supportsPagination: Boolean = true
+
+    override fun currentConfig(): DynamicProviderConfig? = dynamicConfigProvider?.invoke()
+
+    override fun supportsCapability(capability: String): Boolean =
+        currentConfig()?.supportsCapability(capability) ?: true
+
+    override fun activeEndpointFor(operation: OperationType): String = "NewPipe Extractor"
 
     private data class PagedSession(
         val handler: SearchQueryHandler,
@@ -165,7 +181,9 @@ class NewPipeProvider(
             streams = mappedStreams,
             selectedStream = selected,
             relatedTracks = related,
-            resolvedBy = providerType
+            resolvedBy = providerType,
+            resolvedByProviderId = providerId,
+            resolvedByLabel = displayName
         )
     }
 
@@ -201,7 +219,8 @@ class NewPipeProvider(
             description = info.description.orEmpty(),
             tracks = tracks.distinctBy { it.id },
             playlists = playlists.distinctBy { it.id },
-            providerType = providerType
+            providerType = providerType,
+            providerId = providerId
         )
     }
 
@@ -220,7 +239,8 @@ class NewPipeProvider(
             thumbnailUrl = pickBestImage(info.thumbnails) ?: tracks.firstOrNull()?.thumbnailUrl,
             description = "",
             tracks = tracks,
-            providerType = providerType
+            providerType = providerType,
+            providerId = providerId
         )
     }
 
@@ -248,7 +268,9 @@ class NewPipeProvider(
             albums = albums,
             nextPageToken = nextPageToken,
             hasMore = nextPageToken != null,
-            providerUsed = providerType
+            providerUsed = providerType,
+            providerUsedId = providerId,
+            providerUsedLabel = displayName
         )
     }
 
@@ -273,7 +295,8 @@ class NewPipeProvider(
             thumbnailUrl = pickBestImage(item.thumbnails),
             viewCount = item.viewCount.coerceAtLeast(0L),
             publishedText = item.textualUploadDate.orEmpty(),
-            isLive = isLive
+            isLive = isLive,
+            providerId = providerId
         )
     }
 
@@ -285,7 +308,8 @@ class NewPipeProvider(
             url = url,
             thumbnailUrl = pickBestImage(item.thumbnails),
             subscriberText = if (item.subscriberCount > 0L) formatSubscribers(item.subscriberCount) else "",
-            providerType = providerType
+            providerType = providerType,
+            providerId = providerId
         )
     }
 
@@ -294,11 +318,12 @@ class NewPipeProvider(
         return OnlineAlbumSummary(
             id = extractPlaylistId(url),
             title = item.name.orEmpty().ifBlank { "Album" },
-            artist = item.uploaderName.orEmpty().ifBlank { providerType.displayName },
+            artist = item.uploaderName.orEmpty().ifBlank { displayName },
             url = url,
             thumbnailUrl = pickBestImage(item.thumbnails),
             trackCount = item.streamCount.toInt().coerceAtLeast(0),
-            providerType = providerType
+            providerType = providerType,
+            providerId = providerId
         )
     }
 

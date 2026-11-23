@@ -131,6 +131,12 @@ private enum class AppTab(
     SETTINGS("Settings", Icons.Rounded.Settings, Icons.Outlined.Settings)
 }
 
+private data class OnlineNavTarget(
+    val idOrUrl: String,
+    val providerType: OnlineProviderType,
+    val providerId: String? = null
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -157,6 +163,7 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     val lyrics by viewModel.currentLyrics.collectAsStateWithLifecycle()
     val presetPreview by viewModel.presetBandPreview.collectAsStateWithLifecycle()
     val remoteConfig by viewModel.remoteConfig.collectAsStateWithLifecycle()
+    val remoteConfigStatus by viewModel.remoteConfigStatus.collectAsStateWithLifecycle()
     val isRefreshingRemoteConfig by viewModel.isRefreshingRemoteConfig.collectAsStateWithLifecycle()
     val lastRemoteConfigError by viewModel.lastRemoteConfigError.collectAsStateWithLifecycle()
 
@@ -172,6 +179,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     val onlineHistory by viewModel.online.history.collectAsStateWithLifecycle()
     val onlinePlaylists by viewModel.online.playlists.collectAsStateWithLifecycle()
     val onlineRecentSearches by viewModel.online.recentSearches.collectAsStateWithLifecycle()
+    val providerDiagnostics by viewModel.online.providerDiagnostics.collectAsStateWithLifecycle()
+    val providerTestResults by viewModel.online.providerTestResults.collectAsStateWithLifecycle()
+    val isTestingProviders by viewModel.online.isTestingProviders.collectAsStateWithLifecycle()
 
     var currentTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var librarySection by rememberSaveable { mutableStateOf(LibrarySection.ALL_SONGS) }
@@ -180,8 +190,8 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
 
     var onlineLibrarySection by rememberSaveable { mutableStateOf(OnlineLibrarySection.FAVORITES) }
     var onlinePlaylistTarget by remember { mutableStateOf<OnlinePlaylistViewTarget?>(null) }
-    var lastArtistNav by remember { mutableStateOf<Pair<String, OnlineProviderType>?>(null) }
-    var lastAlbumNav by remember { mutableStateOf<Pair<String, OnlineProviderType>?>(null) }
+    var lastArtistNav by remember { mutableStateOf<OnlineNavTarget?>(null) }
+    var lastAlbumNav by remember { mutableStateOf<OnlineNavTarget?>(null) }
 
     var showNowPlaying by rememberSaveable { mutableStateOf(false) }
     var showQueueSheet by remember { mutableStateOf(false) }
@@ -431,9 +441,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onRefreshTrending = { viewModel.online.refreshTrending() },
                                     onOpenSearch = { currentTab = AppTab.SEARCH },
                                     onSelectCategory = { category -> viewModel.online.selectDiscoveryCategory(category) },
-                                    onOpenArtist = { urlOrId, p ->
-                                        lastArtistNav = urlOrId to p
-                                        viewModel.online.openArtist(urlOrId, p)
+                                    onOpenArtist = { urlOrId, p, pid ->
+                                        lastArtistNav = OnlineNavTarget(urlOrId, p, pid)
+                                        viewModel.online.openArtist(urlOrId, p, pid)
                                     },
                                     onOpenPlayer = { showNowPlaying = true },
                                     onOpenQueue = { showOnlineQueueSheet = true },
@@ -515,9 +525,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onRemoveQueueItem = { viewModel.online.removeQueueItem(it) },
                                     onClearQueue = { viewModel.online.clearQueue() },
                                     onOpenQueueSheet = { showOnlineQueueSheet = true },
-                                    onOpenArtist = { urlOrId, p ->
-                                        lastArtistNav = urlOrId to p
-                                        viewModel.online.openArtist(urlOrId, p)
+                                    onOpenArtist = { urlOrId, p, pid ->
+                                        lastArtistNav = OnlineNavTarget(urlOrId, p, pid)
+                                        viewModel.online.openArtist(urlOrId, p, pid)
                                     },
                                     onOpenPlaylist = { pl ->
                                         onlinePlaylistTarget = OnlinePlaylistViewTarget.Custom(pl.id)
@@ -592,13 +602,13 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onPlayTracks = { list, idx -> viewModel.online.playTracks(list, idx, false) },
                                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
                                     onOpenContextMenu = { onlineContextMenuTrack = it },
-                                    onOpenArtist = { urlOrId, p ->
-                                        lastArtistNav = urlOrId to p
-                                        viewModel.online.openArtist(urlOrId, p)
+                                    onOpenArtist = { urlOrId, p, pid ->
+                                        lastArtistNav = OnlineNavTarget(urlOrId, p, pid)
+                                        viewModel.online.openArtist(urlOrId, p, pid)
                                     },
-                                    onOpenAlbum = { urlOrId, p ->
-                                        lastAlbumNav = urlOrId to p
-                                        viewModel.online.openAlbum(urlOrId, p)
+                                    onOpenAlbum = { urlOrId, p, pid ->
+                                        lastAlbumNav = OnlineNavTarget(urlOrId, p, pid)
+                                        viewModel.online.openAlbum(urlOrId, p, pid)
                                     }
                                 )
                             } else {
@@ -683,9 +693,16 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                 onExportBackup = { viewModel.exportFullBackup(it) },
                                 onImportBackup = { viewModel.importFullBackup(it) },
                                 remoteConfig = remoteConfig,
+                                remoteConfigStatus = remoteConfigStatus,
+                                providerDiagnostics = providerDiagnostics,
+                                providerTestResults = providerTestResults,
+                                isTestingProviders = isTestingProviders,
                                 isRefreshingRemoteConfig = isRefreshingRemoteConfig,
                                 lastRemoteConfigError = lastRemoteConfigError,
-                                onRefreshRemoteConfig = { viewModel.refreshRemoteConfig(it) }
+                                onRefreshRemoteConfig = { viewModel.refreshRemoteConfig(it) },
+                                onRollbackRemoteConfig = { viewModel.rollbackRemoteConfig() },
+                                onTestProvider = { viewModel.online.testProviderConnectivity(it) },
+                                onTestAllProviders = { viewModel.online.testAllProvidersConnectivity() }
                             )
                         }
                     }
@@ -702,13 +719,13 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     state = onlineArtistDetail,
                     currentPlayingTrackId = onlineSnapshot.currentTrack?.id,
                     onBack = { viewModel.online.clearArtistDetail() },
-                    onRetry = lastArtistNav?.let { (idOrUrl, prov) -> { viewModel.online.openArtist(idOrUrl, prov) } },
+                    onRetry = lastArtistNav?.let { nav -> { viewModel.online.openArtist(nav.idOrUrl, nav.providerType, nav.providerId) } },
                     onPlayTracks = { list, idx, shuf -> viewModel.online.playTracks(list, idx, shuf) },
                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
                     onOpenContextMenu = { onlineContextMenuTrack = it },
-                    onOpenAlbum = { idOrUrl, prov ->
-                        lastAlbumNav = idOrUrl to prov
-                        viewModel.online.openAlbum(idOrUrl, prov)
+                    onOpenAlbum = { idOrUrl, prov, pid ->
+                        lastAlbumNav = OnlineNavTarget(idOrUrl, prov, pid)
+                        viewModel.online.openAlbum(idOrUrl, prov, pid)
                     }
                 )
             }
@@ -722,7 +739,7 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     state = onlineAlbumDetail,
                     currentPlayingTrackId = onlineSnapshot.currentTrack?.id,
                     onBack = { viewModel.online.clearAlbumDetail() },
-                    onRetry = lastAlbumNav?.let { (idOrUrl, prov) -> { viewModel.online.openAlbum(idOrUrl, prov) } },
+                    onRetry = lastAlbumNav?.let { nav -> { viewModel.online.openAlbum(nav.idOrUrl, nav.providerType, nav.providerId) } },
                     onPlayTracks = { list, idx, shuf -> viewModel.online.playTracks(list, idx, shuf) },
                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
                     onOpenContextMenu = { onlineContextMenuTrack = it }
@@ -793,8 +810,8 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                             val cur = onlineSnapshot.currentTrack
                             val url = cur?.albumUrl?.takeIf { it.isNotBlank() }
                             if (url != null) {
-                                lastAlbumNav = url to cur.providerType
-                                viewModel.online.openAlbum(url, cur.providerType)
+                                lastAlbumNav = OnlineNavTarget(url, cur.providerType, cur.effectiveProviderId())
+                                viewModel.online.openAlbum(url, cur.providerType, cur.effectiveProviderId())
                             } else {
                                 viewModel.switchPlaybackMode(PlaybackMode.ONLINE)
                                 currentTab = AppTab.SEARCH
@@ -812,8 +829,8 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                             val cur = onlineSnapshot.currentTrack
                             val target = cur?.artistUrl?.takeIf { it.isNotBlank() } ?: cur?.artistId?.takeIf { it.isNotBlank() }
                             if (target != null && cur != null) {
-                                lastArtistNav = target to cur.providerType
-                                viewModel.online.openArtist(target, cur.providerType)
+                                lastArtistNav = OnlineNavTarget(target, cur.providerType, cur.effectiveProviderId())
+                                viewModel.online.openArtist(target, cur.providerType, cur.effectiveProviderId())
                             } else {
                                 viewModel.switchPlaybackMode(PlaybackMode.ONLINE)
                                 currentTab = AppTab.SEARCH
@@ -985,14 +1002,14 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     onToggleFavorite = { viewModel.online.toggleFavorite(tr) },
                     onOpenArtist = (tr.artistUrl?.takeIf { it.isNotBlank() } ?: tr.artistId?.takeIf { it.isNotBlank() })?.let { target ->
                         {
-                            lastArtistNav = target to tr.providerType
-                            viewModel.online.openArtist(target, tr.providerType)
+                            lastArtistNav = OnlineNavTarget(target, tr.providerType, tr.effectiveProviderId())
+                            viewModel.online.openArtist(target, tr.providerType, tr.effectiveProviderId())
                         }
                     },
                     onOpenAlbum = tr.albumUrl?.takeIf { it.isNotBlank() }?.let { target ->
                         {
-                            lastAlbumNav = target to tr.providerType
-                            viewModel.online.openAlbum(target, tr.providerType)
+                            lastAlbumNav = OnlineNavTarget(target, tr.providerType, tr.effectiveProviderId())
+                            viewModel.online.openAlbum(target, tr.providerType, tr.effectiveProviderId())
                         }
                     },
                     onViewDetails = { onlineDetailsTrack = tr }

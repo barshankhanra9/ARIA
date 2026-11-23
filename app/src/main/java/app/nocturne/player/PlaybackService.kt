@@ -101,9 +101,15 @@ class PlaybackService : MediaLibraryService() {
     private var crossfadeJob: Job? = null
     private var receiversRegistered = false
 
+    private data class ResolvedStreamCtx(
+        val track: OnlineTrack,
+        val providerType: OnlineProviderType,
+        val providerId: String
+    )
+
     private val onlineTrackMap = ConcurrentHashMap<String, OnlineTrack>()
     private val onlineRetryCounts = ConcurrentHashMap<String, Int>()
-    private val resolvedStreamContext = ConcurrentHashMap<String, Pair<OnlineTrack, OnlineProviderType>>()
+    private val resolvedStreamContext = ConcurrentHashMap<String, ResolvedStreamCtx>()
     private var lastCountedOnlineId: String? = null
     private var onlineAccumulatedMs: Long = 0L
 
@@ -344,19 +350,24 @@ class PlaybackService : MediaLibraryService() {
 
         val trackId = extractOnlineTrackIdFromUri(uri)
         val sourceUrl = uri.getQueryParameter("src").orEmpty()
-        val providerName = uri.host?.uppercase() ?: "YOUTUBE"
-        val pType = runCatching { OnlineProviderType.valueOf(providerName) }
-            .getOrDefault(OnlineProviderType.YOUTUBE)
+        val rawHost = uri.host?.lowercase()?.takeIf { it.isNotBlank() } ?: "youtube"
+        val pType = OnlineProviderType.fromProviderId(rawHost)
         val sourceId = uri.pathSegments.firstOrNull().orEmpty()
+        val fallbackLabel = if (pType == OnlineProviderType.DYNAMIC) {
+            rawHost.replaceFirstChar { it.uppercase() }
+        } else {
+            pType.displayName
+        }
 
         val track = onlineTrackMap[trackId] ?: OnlineTrack(
             id = trackId,
             sourceId = sourceId,
             providerType = pType,
-            providerLabel = pType.displayName,
+            providerLabel = fallbackLabel,
             sourceUrl = sourceUrl,
             title = "Online Track",
-            artist = pType.displayName
+            artist = fallbackLabel,
+            providerId = rawHost
         )
 
         PlaybackRuntimeBus.updateOnlineSnapshot {
@@ -369,13 +380,15 @@ class PlaybackService : MediaLibraryService() {
             }
             val safeStreamUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(resolution.selectedStream.url)
                 ?: throw IOException("Blocked unsafe or non-HTTPS stream URL")
+            val resolvedPid = resolution.resolvedByProviderId.ifBlank { resolution.resolvedBy.defaultProviderId() }
+            val resolvedLabel = resolution.resolvedByLabel.ifBlank { resolution.resolvedBy.displayName }
             onlineTrackMap[track.id] = resolution.track
-            resolvedStreamContext[safeStreamUrl] = resolution.track to resolution.resolvedBy
+            resolvedStreamContext[safeStreamUrl] = ResolvedStreamCtx(resolution.track, resolution.resolvedBy, resolvedPid)
             PlaybackRuntimeBus.updateOnlineSnapshot { snap ->
                 snap.copy(
                     isResolving = false,
                     activeStreamLabel = resolution.selectedStream.formatLabel,
-                    activeProviderLabel = resolution.resolvedBy.displayName,
+                    activeProviderLabel = resolvedLabel,
                     relatedTracks = resolution.relatedTracks,
                     errorMessage = null
                 )
@@ -417,9 +430,9 @@ class PlaybackService : MediaLibraryService() {
                 val ctx = resolvedStreamContext[dataSpec.uri.toString()]
                 if (!isRecoverableHttp || ctx == null) throw err
 
-                val (track, initialFailedProvider) = ctx
-                val excluded = mutableSetOf(initialFailedProvider)
-                providerManager.recordStreamFailure(initialFailedProvider)
+                val (track, initialFailedType, initialFailedId) = ctx
+                val excludedIds = mutableSetOf(initialFailedId)
+                providerManager.recordStreamFailure(initialFailedType, initialFailedId)
                 providerManager.invalidateCachedStream(track.id)
 
                 var lastErr: HttpDataSource.HttpDataSourceException = err
@@ -429,26 +442,29 @@ class PlaybackService : MediaLibraryService() {
                             providerManager.resolveStream(
                                 track = track,
                                 forceRefresh = true,
-                                excludedProviders = excluded
+                                excludedProviders = emptySet(),
+                                excludedProviderIds = excludedIds
                             )
                         }.getOrNull()
                     } ?: throw lastErr
 
-                    excluded.add(altResolution.resolvedBy)
+                    val altPid = altResolution.resolvedByProviderId.ifBlank { altResolution.resolvedBy.defaultProviderId() }
+                    val altLabel = altResolution.resolvedByLabel.ifBlank { altResolution.resolvedBy.displayName }
+                    excludedIds.add(altPid)
                     val safeAltUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(altResolution.selectedStream.url)
                         ?: run {
-                            providerManager.recordStreamFailure(altResolution.resolvedBy)
+                            providerManager.recordStreamFailure(altResolution.resolvedBy, altPid)
                             providerManager.invalidateCachedStream(track.id)
                             throw lastErr
                         }
                     onlineTrackMap[track.id] = altResolution.track
                     resolvedStreamContext[safeAltUrl] =
-                        altResolution.track to altResolution.resolvedBy
+                        ResolvedStreamCtx(altResolution.track, altResolution.resolvedBy, altPid)
                     PlaybackRuntimeBus.updateOnlineSnapshot { snap ->
                         snap.copy(
                             isResolving = false,
                             activeStreamLabel = altResolution.selectedStream.formatLabel,
-                            activeProviderLabel = altResolution.resolvedBy.displayName,
+                            activeProviderLabel = altLabel,
                             relatedTracks = altResolution.relatedTracks,
                             errorMessage = null
                         )
@@ -465,7 +481,7 @@ class PlaybackService : MediaLibraryService() {
                         return upstream.open(retrySpec)
                     } catch (retryErr: HttpDataSource.HttpDataSourceException) {
                         lastErr = retryErr
-                        providerManager.recordStreamFailure(altResolution.resolvedBy)
+                        providerManager.recordStreamFailure(altResolution.resolvedBy, altPid)
                         providerManager.invalidateCachedStream(track.id)
                     }
                 }
@@ -487,11 +503,10 @@ class PlaybackService : MediaLibraryService() {
     }
 
     private fun extractOnlineTrackIdFromUri(uri: Uri): String {
-        val providerName = uri.host?.uppercase() ?: "YOUTUBE"
-        val pType = runCatching { OnlineProviderType.valueOf(providerName) }
-            .getOrDefault(OnlineProviderType.YOUTUBE)
+        val rawHost = uri.host?.lowercase()?.takeIf { it.isNotBlank() } ?: "youtube"
+        val pType = OnlineProviderType.fromProviderId(rawHost)
         val sourceId = uri.pathSegments.firstOrNull().orEmpty()
-        return OnlineTrack.canonicalId(pType, sourceId)
+        return OnlineTrack.canonicalId(rawHost, pType, sourceId)
     }
 
     private fun handleOnlinePlayerError(error: PlaybackException) {
@@ -504,35 +519,46 @@ class PlaybackService : MediaLibraryService() {
             onlineRetryCounts[trackId] = attempt + 1
             val resumePos = onlinePlayer.currentPosition.coerceAtLeast(0L)
             val resumeIndex = onlinePlayer.currentMediaItemIndex.coerceAtLeast(0)
+            val lastCtx = resolvedStreamContext.values.lastOrNull { it.track.id == track.id }
             val activeProvName = PlaybackRuntimeBus.onlineSnapshot.value.activeProviderLabel
-            val failedProvider = OnlineProviderType.entries.firstOrNull {
+            val failedProvider = lastCtx?.providerType ?: OnlineProviderType.entries.firstOrNull {
                 it.displayName.equals(activeProvName, ignoreCase = true)
             } ?: track.providerType
-            providerManager.recordStreamFailure(failedProvider)
+            val failedProviderId = lastCtx?.providerId ?: track.effectiveProviderId()
+            providerManager.recordStreamFailure(failedProvider, failedProviderId)
             providerManager.invalidateCachedStream(track.id)
             PlaybackRuntimeBus.updateOnlineSnapshot {
                 it.copy(isResolving = true, errorMessage = null)
             }
             serviceScope.launch {
-                val excluded = if (attempt >= 1) setOf(failedProvider) else emptySet()
+                val excludedIds = if (attempt >= 1) setOf(failedProviderId) else emptySet()
                 val reResolved = runCatching {
                     providerManager.resolveStream(
                         track = track,
                         forceRefresh = true,
-                        excludedProviders = excluded
+                        excludedProviders = emptySet(),
+                        excludedProviderIds = excludedIds
                     )
                 }.getOrNull() ?: runCatching {
-                    providerManager.resolveStream(track, forceRefresh = true, excludedProviders = emptySet())
+                    providerManager.resolveStream(
+                        track = track,
+                        forceRefresh = true,
+                        excludedProviders = emptySet(),
+                        excludedProviderIds = emptySet()
+                    )
                 }.getOrNull()
 
                 if (reResolved != null && ::onlinePlayer.isInitialized) {
+                    val rePid = reResolved.resolvedByProviderId.ifBlank { reResolved.resolvedBy.defaultProviderId() }
+                    val reLabel = reResolved.resolvedByLabel.ifBlank { reResolved.resolvedBy.displayName }
                     onlineTrackMap[track.id] = reResolved.track
-                    resolvedStreamContext[reResolved.selectedStream.url] = reResolved.track to reResolved.resolvedBy
+                    resolvedStreamContext[reResolved.selectedStream.url] =
+                        ResolvedStreamCtx(reResolved.track, reResolved.resolvedBy, rePid)
                     PlaybackRuntimeBus.updateOnlineSnapshot { snap ->
                         snap.copy(
                             isResolving = false,
                             activeStreamLabel = reResolved.selectedStream.formatLabel,
-                            activeProviderLabel = reResolved.resolvedBy.displayName,
+                            activeProviderLabel = reLabel,
                             relatedTracks = reResolved.relatedTracks,
                             errorMessage = null
                         )
@@ -940,7 +966,7 @@ class PlaybackService : MediaLibraryService() {
     private fun buildOnlineMediaItem(track: OnlineTrack): MediaItem {
         onlineTrackMap[track.id] = track
         val virtualUri = OnlineTrack.buildOnlineVirtualUri(
-            track.providerType,
+            track.effectiveProviderId(),
             track.sourceId,
             track.sourceUrl
         )

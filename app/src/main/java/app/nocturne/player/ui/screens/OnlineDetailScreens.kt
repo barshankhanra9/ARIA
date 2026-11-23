@@ -62,7 +62,7 @@ fun OnlineArtistDetailScreen(
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
     onOpenContextMenu: (OnlineTrack) -> Unit,
-    onOpenAlbum: (String, OnlineProviderType) -> Unit
+    onOpenAlbum: (String, OnlineProviderType, String?) -> Unit
 ) {
     BackHandler(onBack = onBack)
     val palette = AriaPaperTheme.palette
@@ -81,7 +81,9 @@ fun OnlineArtistDetailScreen(
                 }
                 Column(Modifier.weight(1f)) {
                     Text(
-                        text = state.page?.providerType?.displayName?.uppercase() ?: "ONLINE ARTIST",
+                        text = state.page?.providerLabel?.takeIf { it.isNotBlank() }?.uppercase()
+                            ?: state.page?.providerType?.displayName?.uppercase()
+                            ?: "ONLINE ARTIST",
                         style = MaterialTheme.typography.labelSmall,
                         color = palette.accent
                     )
@@ -171,7 +173,7 @@ fun OnlineArtistDetailScreen(
                                                 modifier = Modifier.width(136.dp),
                                                 containerColor = palette.paperElevated,
                                                 elevation = 2.dp,
-                                                onClick = { onOpenAlbum(al.url.ifBlank { al.id }, al.providerType) },
+                                                onClick = { onOpenAlbum(al.url.ifBlank { al.id }, al.providerType, al.providerId) },
                                                 contentPadding = PaddingValues(8.dp)
                                             ) {
                                                 PrintedArtwork(al.thumbnailUrl, al.thumbnailUrl, modifier = Modifier.fillMaxWidth().aspectRatio(1f), mattePadding = 2.dp, targetSizePx = 220)
@@ -236,7 +238,9 @@ fun OnlineAlbumDetailScreen(
                 }
                 Column(Modifier.weight(1f)) {
                     Text(
-                        text = state.page?.providerType?.displayName?.uppercase() ?: "ONLINE ALBUM",
+                        text = state.page?.providerLabel?.takeIf { it.isNotBlank() }?.uppercase()
+                            ?: state.page?.providerType?.displayName?.uppercase()
+                            ?: "ONLINE ALBUM",
                         style = MaterialTheme.typography.labelSmall,
                         color = palette.accent
                     )

@@ -46,6 +46,7 @@ import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.PlaybackMode
 import app.nocturne.player.data.model.Playlist
+import app.nocturne.player.data.model.RemoteConfigStatus
 import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.SmartPlaylistType
 import app.nocturne.player.data.model.SortField
@@ -134,6 +135,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .stateIn(viewModelScope, SharingStarted.Eagerly, UserSettings())
 
     val remoteConfig: StateFlow<RemoteProvidersConfig> = remoteConfigRepo.activeConfig
+    val remoteConfigStatus: StateFlow<RemoteConfigStatus> = remoteConfigRepo.status
     val isRefreshingRemoteConfig: StateFlow<Boolean> = remoteConfigRepo.isRefreshing
     val lastRemoteConfigError: StateFlow<String?> = remoteConfigRepo.lastFetchError
 
@@ -961,16 +963,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ?: OnlineTrack(
                     id = track.onlineTrackId,
                     sourceId = track.onlineSourceId,
-                    providerType = runCatching {
-                        OnlineProviderType.valueOf(track.onlineProvider.uppercase())
-                    }.getOrDefault(OnlineProviderType.YOUTUBE),
+                    providerType = OnlineProviderType.fromProviderId(track.onlineProvider),
                     providerLabel = track.onlineProvider,
                     sourceUrl = "",
                     title = track.title,
                     artist = track.artist,
                     album = track.album,
                     durationMs = track.durationMs,
-                    thumbnailUrl = track.artworkUrl ?: track.customCoverUri
+                    thumbnailUrl = track.artworkUrl ?: track.customCoverUri,
+                    providerId = track.onlineProvider.lowercase().ifBlank { "youtube" }
                 )
             online.toggleFavorite(onlineTrack)
         } else {
@@ -1190,12 +1191,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (validatedUrl != null) {
                 settingsRepo.updateSettings { it.copy(remoteProviderConfigUrl = validatedUrl) }
             }
-            remoteConfigRepo.refreshNow(validatedUrl)
+            val updated = remoteConfigRepo.refreshNow(validatedUrl, force = true)
+            online.refreshProviderHealth()
+            val status = remoteConfigRepo.status.value
             val err = remoteConfigRepo.lastFetchError.value
-            if (err.isNullOrBlank()) {
-                emitMessage("Remote providers config updated")
+            when {
+                !err.isNullOrBlank() -> emitMessage("Using cached providers ($err)")
+                status.wasNotModified304 -> emitMessage("Provider config up to date (${updated.enabledProviders().size} enabled)")
+                else -> emitMessage("Synced ${updated.enabledProviders().size} active providers (v${updated.configVersion})")
+            }
+        }
+    }
+
+    fun rollbackRemoteConfig() {
+        viewModelScope.launch {
+            val restored = remoteConfigRepo.rollbackToPreviousConfig()
+            online.refreshProviderHealth()
+            if (restored != null) {
+                emitMessage("Rolled back to config v${restored.configVersion}")
             } else {
-                emitMessage("Using cached endpoints ($err)")
+                emitMessage("No previous working configuration to roll back to")
             }
         }
     }

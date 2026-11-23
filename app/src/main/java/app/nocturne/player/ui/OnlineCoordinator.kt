@@ -14,7 +14,10 @@ import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSmartPlaylistType
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.ProviderConnectivityTestResult
+import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.ProviderHealthSnapshot
+import app.nocturne.player.data.model.RemoteConfigStatus
 import app.nocturne.player.data.online.OnlineDependencies
 import app.nocturne.player.data.online.OnlineProviderManager
 import app.nocturne.player.data.security.InputAndUrlSecurity
@@ -46,6 +49,8 @@ data class OnlineSearchUiState(
     val nextPageToken: String? = null,
     val hasMore: Boolean = false,
     val providerUsed: OnlineProviderType? = null,
+    val providerUsedId: String? = null,
+    val providerUsedLabel: String? = null,
     val isLoading: Boolean = false,
     val isLoadingMore: Boolean = false,
     val errorMessage: String? = null,
@@ -55,6 +60,8 @@ data class OnlineSearchUiState(
 data class OnlineTrendingUiState(
     val tracks: List<OnlineTrack> = emptyList(),
     val providerUsed: OnlineProviderType? = null,
+    val providerUsedId: String? = null,
+    val providerUsedLabel: String? = null,
     val selectedCategory: OnlineDiscoveryCategory = OnlineDiscoveryCategory.TRENDING,
     val popularArtists: List<OnlineArtistSummary> = emptyList(),
     val isArtistsLoading: Boolean = false,
@@ -79,8 +86,11 @@ class OnlineCoordinator(
     private val scope: CoroutineScope,
     private val emitMessage: (String) -> Unit
 ) {
+    private val remoteConfigRepo = OnlineDependencies.getRemoteConfigRepository(app)
     private val providerManager = OnlineDependencies.getProviderManager(app)
     private val repository = OnlineDependencies.getRepository(app)
+
+    val remoteConfigStatus: StateFlow<RemoteConfigStatus> = remoteConfigRepo.status
 
     val allTracks: StateFlow<List<OnlineTrack>> = repository.allTracks
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -151,14 +161,67 @@ class OnlineCoordinator(
     private val _providerHealth = MutableStateFlow<List<ProviderHealthSnapshot>>(emptyList())
     val providerHealth: StateFlow<List<ProviderHealthSnapshot>> = _providerHealth.asStateFlow()
 
+    private val _providerDiagnostics = MutableStateFlow<List<ProviderDiagnosticsSnapshot>>(emptyList())
+    val providerDiagnostics: StateFlow<List<ProviderDiagnosticsSnapshot>> = _providerDiagnostics.asStateFlow()
+
+    private val _providerTestResults = MutableStateFlow<Map<String, ProviderConnectivityTestResult>>(emptyMap())
+    val providerTestResults: StateFlow<Map<String, ProviderConnectivityTestResult>> = _providerTestResults.asStateFlow()
+
+    private val _isTestingProviders = MutableStateFlow(false)
+    val isTestingProviders: StateFlow<Boolean> = _isTestingProviders.asStateFlow()
+
     private var suggestionJob: Job? = null
     private var searchJob: Job? = null
     private var trendingJob: Job? = null
     private var artistJob: Job? = null
     private var albumJob: Job? = null
 
+    init {
+        scope.launch {
+            remoteConfigRepo.activeConfig.collect {
+                refreshProviderHealth()
+            }
+        }
+    }
+
     fun refreshProviderHealth() {
         _providerHealth.value = providerManager.getHealthSnapshots()
+        _providerDiagnostics.value = providerManager.getProviderDiagnostics()
+    }
+
+    fun testProviderConnectivity(providerId: String) {
+        if (_isTestingProviders.value) return
+        scope.launch {
+            _isTestingProviders.value = true
+            try {
+                val res = providerManager.testProviderConnectivity(providerId)
+                _providerTestResults.update { it + (providerId.lowercase() to res) }
+                refreshProviderHealth()
+                if (res.success) {
+                    emitMessage("${res.displayName} healthy (${res.latencyMs} ms)")
+                } else {
+                    emitMessage("${res.displayName}: ${res.errorSummary ?: "Failed"}")
+                }
+            } finally {
+                _isTestingProviders.value = false
+            }
+        }
+    }
+
+    fun testAllProvidersConnectivity() {
+        if (_isTestingProviders.value) return
+        scope.launch {
+            _isTestingProviders.value = true
+            try {
+                val results = providerManager.testAllProvidersConnectivity()
+                _providerTestResults.value = results.associateBy { it.providerId.lowercase() }
+                refreshProviderHealth()
+                val okCount = results.count { it.success }
+                emitMessage("Tested ${results.size} providers: $okCount reachable")
+            } finally {
+                _isTestingProviders.value = false
+            }
+        }
     }
 
     fun loadTrendingIfNeeded() {
@@ -212,11 +275,24 @@ class OnlineCoordinator(
                     val err = tracksResult.exceptionOrNull() ?: artistsResult.exceptionOrNull()
 
                     _trendingState.update { cur ->
+                        val firstTrack = tracksPair?.first?.firstOrNull()
+                        val firstArtist = artistsPair?.first?.firstOrNull()
+                        val resolvedProv = tracksPair?.second ?: artistsPair?.second ?: cur.providerUsed
+                        val resolvedId = firstTrack?.effectiveProviderId()
+                            ?: firstArtist?.providerId
+                            ?: resolvedProv?.defaultProviderId()
+                            ?: cur.providerUsedId
+                        val resolvedLabel = firstTrack?.providerLabel?.takeIf { it.isNotBlank() }
+                            ?: resolvedId?.let { remoteConfigRepo.activeConfig.value.providerById(it)?.displayName }
+                            ?: resolvedProv?.displayName
+                            ?: cur.providerUsedLabel
                         cur.copy(
                             selectedCategory = category,
                             tracks = tracksPair?.first ?: cur.tracks,
                             popularArtists = artistsPair?.first ?: cur.popularArtists,
-                            providerUsed = tracksPair?.second ?: artistsPair?.second ?: cur.providerUsed,
+                            providerUsed = resolvedProv,
+                            providerUsedId = resolvedId,
+                            providerUsedLabel = resolvedLabel,
                             isLoading = false,
                             isArtistsLoading = false,
                             errorMessage = if ((tracksPair?.first.isNullOrEmpty()) && (artistsPair?.first.isNullOrEmpty())) {
@@ -239,11 +315,18 @@ class OnlineCoordinator(
                     )
                 }
             }.onSuccess { (tracks, provider) ->
+                val firstTrack = tracks.firstOrNull()
+                val resolvedId = firstTrack?.effectiveProviderId() ?: provider?.defaultProviderId()
+                val resolvedLabel = firstTrack?.providerLabel?.takeIf { it.isNotBlank() }
+                    ?: resolvedId?.let { remoteConfigRepo.activeConfig.value.providerById(it)?.displayName }
+                    ?: provider?.displayName
                 _trendingState.update { cur ->
                     cur.copy(
                         selectedCategory = category,
                         tracks = tracks,
                         providerUsed = provider,
+                        providerUsedId = resolvedId,
+                        providerUsedLabel = resolvedLabel,
                         isLoading = false,
                         isArtistsLoading = false,
                         errorMessage = null
@@ -326,6 +409,8 @@ class OnlineCoordinator(
                         nextPageToken = page.nextPageToken,
                         hasMore = page.hasMore,
                         providerUsed = page.providerUsed,
+                        providerUsedId = page.providerUsedId,
+                        providerUsedLabel = page.providerUsedLabel,
                         isLoading = false,
                         errorMessage = null
                     )
@@ -355,7 +440,8 @@ class OnlineCoordinator(
                     query = cur.query.trim(),
                     filter = cur.filter,
                     pageToken = token,
-                    preferredProvider = cur.providerUsed
+                    preferredProvider = cur.providerUsed,
+                    preferredProviderId = cur.providerUsedId
                 )
             }.onSuccess { page ->
                 _searchState.update { state ->
@@ -392,14 +478,14 @@ class OnlineCoordinator(
         scope.launch { repository.clearSearchHistory() }
     }
 
-    fun openArtist(idOrUrl: String, providerType: OnlineProviderType) {
+    fun openArtist(idOrUrl: String, providerType: OnlineProviderType, providerId: String? = null) {
         val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(idOrUrl, 300)
         if (cleanTarget.isBlank()) return
         artistJob?.cancel()
         _artistDetailState.value = OnlineArtistDetailState(isLoading = true)
         artistJob = scope.launch {
             runCatching {
-                providerManager.fetchArtist(cleanTarget, providerType)
+                providerManager.fetchArtist(cleanTarget, providerType, hintProviderId = providerId)
             }.onSuccess { page ->
                 _artistDetailState.value = OnlineArtistDetailState(isLoading = false, page = page)
                 refreshProviderHealth()
@@ -417,14 +503,14 @@ class OnlineCoordinator(
         _artistDetailState.value = OnlineArtistDetailState()
     }
 
-    fun openAlbum(idOrUrl: String, providerType: OnlineProviderType) {
+    fun openAlbum(idOrUrl: String, providerType: OnlineProviderType, providerId: String? = null) {
         val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(idOrUrl, 300)
         if (cleanTarget.isBlank()) return
         albumJob?.cancel()
         _albumDetailState.value = OnlineAlbumDetailState(isLoading = true)
         albumJob = scope.launch {
             runCatching {
-                providerManager.fetchAlbumOrPlaylist(cleanTarget, providerType)
+                providerManager.fetchAlbumOrPlaylist(cleanTarget, providerType, hintProviderId = providerId)
             }.onSuccess { page ->
                 _albumDetailState.value = OnlineAlbumDetailState(isLoading = false, page = page)
                 refreshProviderHealth()

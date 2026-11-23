@@ -240,6 +240,11 @@ class OnlineLibraryRepository(private val db: AriaDatabase) {
 private fun OnlineTrackEntity.toDomain(): OnlineTrack {
     val pType = runCatching { OnlineProviderType.valueOf(providerType) }
         .getOrDefault(OnlineProviderType.YOUTUBE)
+    val reconstructedProviderId = if (pType == OnlineProviderType.DYNAMIC && id.startsWith("DYNAMIC:")) {
+        id.removePrefix("DYNAMIC:").substringBefore(":").ifBlank { pType.defaultProviderId() }
+    } else {
+        pType.defaultProviderId()
+    }
     return OnlineTrack(
         id = id,
         sourceId = sourceId,
@@ -260,7 +265,8 @@ private fun OnlineTrackEntity.toDomain(): OnlineTrack {
         isFavorite = isFavorite,
         playCount = playCount,
         lastPlayedAt = lastPlayedAt,
-        totalListenMs = totalListenMs
+        totalListenMs = totalListenMs,
+        providerId = reconstructedProviderId
     )
 }
 

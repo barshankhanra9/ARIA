@@ -1,6 +1,7 @@
 package app.nocturne.player.data.online
 
 import android.net.Uri
+import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -12,40 +13,52 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
 
 class AudiusProvider(
     private val client: OkHttpClient = OnlineHttpClient.client,
-    private val baseUrlsOverride: List<String>? = null
+    private val baseUrlsOverride: List<String>? = null,
+    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null,
+    private val healthTracker: ProviderHealthTracker = ProviderHealthTracker(),
+    private val dynamicConfigProvider: (() -> DynamicProviderConfig?)? = null,
+    executorOverride: DynamicHttpExecutor? = null
 ) : OnlineMusicProvider {
 
     override val providerType: OnlineProviderType = OnlineProviderType.AUDIUS
+    override val providerId: String
+        get() = currentConfig()?.id ?: "audius"
+    override val displayName: String
+        get() = currentConfig()?.displayName ?: OnlineProviderType.AUDIUS.displayName
     override val supportsPagination: Boolean = false
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val discoveryMutex = Mutex()
-    private var discoveredHosts: List<String> = emptyList()
-    private var lastDiscoveryAtMs: Long = 0L
-    private val hostCooldowns = ConcurrentHashMap<String, Long>()
+    private val executor: DynamicHttpExecutor = executorOverride ?: DynamicHttpExecutor(
+        baseClient = client,
+        healthTracker = healthTracker,
+        allowLoopbackForTests = baseUrlsOverride != null
+    )
 
     @Volatile
     var lastWorkingInstance: String? = null
         private set
+
+    override fun currentConfig(): DynamicProviderConfig? = dynamicConfigProvider?.invoke()
+
+    override fun supportsCapability(capability: String): Boolean =
+        currentConfig()?.supportsCapability(capability) ?: true
+
+    override fun activeEndpointFor(operation: OperationType): String? =
+        healthTracker.activeEndpointFor(providerId, operation) ?: lastWorkingInstance
 
     override suspend fun search(
         query: String,
@@ -55,36 +68,39 @@ class AudiusProvider(
         val encodedQ = Uri.encode(InputAndUrlSecurity.sanitizeSearchQuery(query))
         when (filter) {
             OnlineSearchFilter.ARTISTS -> {
-                val (host, body) = executeWithHostFallback("/v1/users/search?query=$encodedQ&app_name=$APP_NAME")
-                val data = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray.orEmpty()
+                val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/users/search?query=$encodedQ&app_name=$APP_NAME")
+                val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
                 val artists = data.mapNotNull { parseUserItem(it.jsonObject) }
-                lastWorkingInstance = host
                 OnlineSearchPage(
                     query = query,
                     artists = artists,
-                    providerUsed = OnlineProviderType.AUDIUS
+                    providerUsed = OnlineProviderType.AUDIUS,
+                    providerUsedId = providerId,
+                    providerUsedLabel = displayName
                 )
             }
             OnlineSearchFilter.ALBUMS -> {
-                val (host, body) = executeWithHostFallback("/v1/playlists/search?query=$encodedQ&app_name=$APP_NAME")
-                val data = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray.orEmpty()
+                val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/playlists/search?query=$encodedQ&app_name=$APP_NAME")
+                val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
                 val albums = data.mapNotNull { parsePlaylistItem(it.jsonObject) }
-                lastWorkingInstance = host
                 OnlineSearchPage(
                     query = query,
                     albums = albums,
-                    providerUsed = OnlineProviderType.AUDIUS
+                    providerUsed = OnlineProviderType.AUDIUS,
+                    providerUsedId = providerId,
+                    providerUsedLabel = displayName
                 )
             }
             else -> {
-                val (host, body) = executeWithHostFallback("/v1/tracks/search?query=$encodedQ&app_name=$APP_NAME")
-                val data = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray.orEmpty()
+                val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/tracks/search?query=$encodedQ&app_name=$APP_NAME")
+                val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
                 val tracks = data.mapNotNull { parseTrackItem(it.jsonObject) }
-                lastWorkingInstance = host
                 OnlineSearchPage(
                     query = query,
                     tracks = tracks,
-                    providerUsed = OnlineProviderType.AUDIUS
+                    providerUsed = OnlineProviderType.AUDIUS,
+                    providerUsedId = providerId,
+                    providerUsedLabel = displayName
                 )
             }
         }
@@ -93,14 +109,14 @@ class AudiusProvider(
     override suspend fun suggestions(query: String): List<String> = withContext(Dispatchers.IO) {
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (safeQuery.isBlank()) return@withContext emptyList()
-        val (_, body) = executeWithHostFallback("/v1/tracks/search?query=${Uri.encode(safeQuery)}&app_name=$APP_NAME")
-        val data = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray.orEmpty()
+        val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/tracks/search?query=${Uri.encode(safeQuery)}&app_name=$APP_NAME")
+        val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
         data.mapNotNull { it.jsonObject.str("title") }.distinct().take(8)
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
-        val (_, body) = executeWithHostFallback("/v1/tracks/trending?app_name=$APP_NAME")
-        val data = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray.orEmpty()
+        val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/tracks/trending?app_name=$APP_NAME")
+        val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
         data.mapNotNull { parseTrackItem(it.jsonObject) }
     }
 
@@ -108,46 +124,33 @@ class AudiusProvider(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
-        val hosts = getCandidateHosts()
-        if (hosts.isEmpty()) throw IOException("No valid Audius endpoints available")
         val safeSourceId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Audius track ID")
+        val endpoints = getEndpointConfigs(OperationType.PLAYBACK)
+        if (endpoints.isEmpty()) throw IOException("No valid $displayName endpoints configured")
         val trackId = Uri.encode(safeSourceId)
 
         var resolvedTrack = track
-        var activeHost = lastWorkingInstance?.takeIf { it in hosts } ?: hosts.first()
+        val infoResp = runCatching {
+            executeRawWithFallback(OperationType.PLAYBACK, "/v1/tracks/$trackId?app_name=$APP_NAME")
+        }.getOrNull()
 
-        // Verify metadata and discover working host via lightweight track info call when possible
-        for (host in hosts) {
-            val clean = host.trimEnd('/')
-            val infoResp = runCatching {
-                val req = Request.Builder()
-                    .url("$clean/v1/tracks/$trackId?app_name=$APP_NAME")
-                    .header("User-Agent", OnlineHttpClient.USER_AGENT)
-                    .header("Accept", "application/json")
-                    .build()
-                client.newCall(req).execute().use { r ->
-                    if (!r.isSuccessful) null else InputAndUrlSecurity.readBodyBounded(r.body)
-                }
-            }.getOrNull()
+        val activeHost = infoResp?.endpointUrl
+            ?: healthTracker.selectOrderedEndpoints(providerId, OperationType.PLAYBACK, endpoints.map { it.url }).first()
 
-            if (!infoResp.isNullOrBlank() && !infoResp.trimStart().startsWith("<")) {
-                activeHost = clean
-                lastWorkingInstance = clean
-                runCatching {
-                    val dataObj = json.parseToJsonElement(infoResp).jsonObject["data"]?.jsonObject
-                    if (dataObj != null) {
-                        parseTrackItem(dataObj)?.let { updated ->
-                            resolvedTrack = updated.copy(
-                                isFavorite = track.isFavorite,
-                                playCount = track.playCount,
-                                lastPlayedAt = track.lastPlayedAt,
-                                totalListenMs = track.totalListenMs
-                            )
-                        }
+        if (infoResp != null) {
+            runCatching {
+                val dataObj = json.parseToJsonElement(infoResp.body).jsonObject["data"]?.jsonObject
+                if (dataObj != null) {
+                    parseTrackItem(dataObj)?.let { updated ->
+                        resolvedTrack = updated.copy(
+                            isFavorite = track.isFavorite,
+                            playCount = track.playCount,
+                            lastPlayedAt = track.lastPlayedAt,
+                            totalListenMs = track.totalListenMs
+                        )
                     }
                 }
-                break
             }
         }
 
@@ -177,7 +180,9 @@ class AudiusProvider(
             streams = listOf(selected),
             selectedStream = selected,
             relatedTracks = emptyList(),
-            resolvedBy = OnlineProviderType.AUDIUS
+            resolvedBy = OnlineProviderType.AUDIUS,
+            resolvedByProviderId = providerId,
+            resolvedByLabel = displayName
         )
     }
 
@@ -186,12 +191,12 @@ class AudiusProvider(
         val userId = InputAndUrlSecurity.sanitizePathSegment(rawId)
             ?: throw IllegalArgumentException("Invalid Audius artist ID")
         val encodedUserId = Uri.encode(userId)
-        val (_, tracksBody) = executeWithHostFallback("/v1/users/$encodedUserId/tracks?app_name=$APP_NAME")
-        val tracksData = json.parseToJsonElement(tracksBody).jsonObject["data"]?.jsonArray.orEmpty()
+        val tracksResp = executeRawWithFallback(OperationType.METADATA, "/v1/users/$encodedUserId/tracks?app_name=$APP_NAME")
+        val tracksData = json.parseToJsonElement(tracksResp.body).jsonObject["data"]?.jsonArray.orEmpty()
         val tracks = tracksData.mapNotNull { parseTrackItem(it.jsonObject) }
         val userObj = runCatching {
-            val (_, uBody) = executeWithHostFallback("/v1/users/$encodedUserId?app_name=$APP_NAME")
-            json.parseToJsonElement(uBody).jsonObject["data"]?.jsonObject
+            val uResp = executeRawWithFallback(OperationType.METADATA, "/v1/users/$encodedUserId?app_name=$APP_NAME")
+            json.parseToJsonElement(uResp.body).jsonObject["data"]?.jsonObject
         }.getOrNull()
 
         OnlineArtistPage(
@@ -203,7 +208,8 @@ class AudiusProvider(
             description = userObj?.str("bio").orEmpty(),
             tracks = tracks,
             playlists = emptyList(),
-            providerType = OnlineProviderType.AUDIUS
+            providerType = OnlineProviderType.AUDIUS,
+            providerId = providerId
         )
     }
 
@@ -211,86 +217,58 @@ class AudiusProvider(
         val rawId = albumIdOrUrl.substringAfterLast("/").substringBefore("?")
         val plId = InputAndUrlSecurity.sanitizePathSegment(rawId)
             ?: throw IllegalArgumentException("Invalid Audius playlist ID")
-        val (_, body) = executeWithHostFallback("/v1/playlists/${Uri.encode(plId)}/tracks?app_name=$APP_NAME")
-        val data = json.parseToJsonElement(body).jsonObject["data"]?.jsonArray.orEmpty()
+        val resp = executeRawWithFallback(OperationType.METADATA, "/v1/playlists/${Uri.encode(plId)}/tracks?app_name=$APP_NAME")
+        val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
         val tracks = data.mapNotNull { parseTrackItem(it.jsonObject) }
         OnlineAlbumPage(
             id = plId,
-            title = "Audius Collection",
-            artist = tracks.firstOrNull()?.artist ?: "Audius",
+            title = "$displayName Collection",
+            artist = tracks.firstOrNull()?.artist ?: displayName,
             url = albumIdOrUrl,
             thumbnailUrl = tracks.firstOrNull()?.thumbnailUrl,
             description = "",
             tracks = tracks,
-            providerType = OnlineProviderType.AUDIUS
+            providerType = OnlineProviderType.AUDIUS,
+            providerId = providerId
         )
     }
 
-    private suspend fun getCandidateHosts(): List<String> {
+    private fun getEndpointConfigs(operation: OperationType): List<ProviderEndpointConfig> {
         if (baseUrlsOverride != null) {
-            return baseUrlsOverride.mapNotNull {
-                InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = true)
-            }
-        }
-        discoveryMutex.withLock {
-            val now = System.currentTimeMillis()
-            if (discoveredHosts.isEmpty() || now - lastDiscoveryAtMs > DISCOVERY_TTL_MS) {
-                val fresh = runCatching { fetchDiscoveryHosts() }.getOrDefault(emptyList())
-                discoveredHosts = (fresh + DEFAULT_HOSTS).distinct()
-                lastDiscoveryAtMs = now
-            }
-        }
-        val now = System.currentTimeMillis()
-        val ready = discoveredHosts.filter { (hostCooldowns[it] ?: 0L) <= now }
-        return ready.ifEmpty { discoveredHosts }
-    }
-
-    private fun fetchDiscoveryHosts(): List<String> {
-        val req = Request.Builder()
-            .url("https://api.audius.co")
-            .header("User-Agent", OnlineHttpClient.USER_AGENT)
-            .header("Accept", "application/json")
-            .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val body = InputAndUrlSecurity.readBodyBounded(resp.body, 1024L * 1024L)
-            val data = json.parseToJsonElement(body).jsonObject["data"] as? JsonArray ?: return emptyList()
-            return data.mapNotNull { el ->
-                InputAndUrlSecurity.validateRemoteBaseUrl(el.jsonPrimitive.contentOrNull, allowLoopback = false)
-            }.take(8)
-        }
-    }
-
-    private suspend fun executeWithHostFallback(path: String): Pair<String, String> {
-        val hosts = getCandidateHosts()
-        var lastErr: Throwable? = null
-        for (host in hosts) {
-            val clean = host.trimEnd('/')
-            try {
-                val req = Request.Builder()
-                    .url("$clean$path")
-                    .header("User-Agent", OnlineHttpClient.USER_AGENT)
-                    .header("Accept", "application/json")
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        throw IOException("HTTP ${resp.code} from $clean")
-                    }
-                    val body = InputAndUrlSecurity.readBodyBounded(resp.body)
-                    val trimmed = body.trimStart()
-                    if (trimmed.isBlank() || trimmed.startsWith("<")) {
-                        throw IOException("Invalid JSON payload from $clean")
-                    }
-                    lastWorkingInstance = clean
-                    hostCooldowns.remove(clean)
-                    return clean to body
+            return baseUrlsOverride.mapIndexedNotNull { idx, raw ->
+                InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = true)?.let { clean ->
+                    ProviderEndpointConfig(url = clean, priority = idx + 1)
                 }
-            } catch (t: Throwable) {
-                lastErr = t
-                hostCooldowns[clean] = System.currentTimeMillis() + HOST_COOLDOWN_MS
             }
         }
-        throw lastErr ?: IOException("All Audius endpoints unavailable")
+        val cfg = currentConfig()
+        if (cfg != null) {
+            return cfg.endpointsFor(operation)
+        }
+        return dynamicBaseUrlsProvider?.invoke().orEmpty()
+            .mapIndexedNotNull { idx, raw ->
+                InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = false)?.let { clean ->
+                    ProviderEndpointConfig(url = clean, priority = idx + 1)
+                }
+            }
+            .distinctBy { it.url }
+    }
+
+    private suspend fun executeRawWithFallback(operation: OperationType, path: String): ExecutedHttpResponse {
+        val endpoints = getEndpointConfigs(operation)
+        val cfg = currentConfig()
+        val resp = executor.executeRawGet(
+            providerId = providerId,
+            operation = operation,
+            configuredEndpoints = endpoints,
+            pathAndQuery = path,
+            headers = cfg?.headers ?: emptyMap(),
+            timeoutMs = cfg?.timeoutMs ?: 10_000L,
+            maxRetries = cfg?.maxRetries ?: 1,
+            cooldownMs = cfg?.cooldownMs ?: 60_000L
+        )
+        lastWorkingInstance = resp.endpointUrl
+        return resp
     }
 
     private fun parseTrackItem(obj: JsonObject): OnlineTrack? {
@@ -311,21 +289,22 @@ class AudiusProvider(
         }
 
         return OnlineTrack(
-            id = OnlineTrack.canonicalId(OnlineProviderType.AUDIUS, id),
+            id = OnlineTrack.canonicalId(providerId, id),
             sourceId = id,
             providerType = OnlineProviderType.AUDIUS,
-            providerLabel = OnlineProviderType.AUDIUS.displayName,
+            providerLabel = displayName,
             sourceUrl = sourceUrl,
             title = title,
             artist = artist,
             artistId = userId,
             artistUrl = handle?.let { "https://audius.co/$it" } ?: userId,
-            album = obj.str("genre").orEmpty().ifBlank { "Audius" },
+            album = obj.str("genre").orEmpty().ifBlank { displayName },
             durationMs = if (durationSec > 0L) durationSec * 1000L else 0L,
             thumbnailUrl = pickArtwork(obj["artwork"] as? JsonObject),
             viewCount = obj.long("play_count") ?: 0L,
             publishedText = obj.str("release_date").orEmpty(),
-            isLive = false
+            isLive = false,
+            providerId = providerId
         )
     }
 
@@ -338,7 +317,8 @@ class AudiusProvider(
             url = handle?.let { "https://audius.co/$it" } ?: id,
             thumbnailUrl = pickArtwork(obj["profile_picture"] as? JsonObject),
             subscriberText = obj.long("follower_count")?.takeIf { it > 0L }?.let { "${it / 1000}K" }.orEmpty(),
-            providerType = OnlineProviderType.AUDIUS
+            providerType = OnlineProviderType.AUDIUS,
+            providerId = providerId
         )
     }
 
@@ -348,11 +328,12 @@ class AudiusProvider(
         return OnlineAlbumSummary(
             id = id,
             title = obj.str("playlist_name") ?: obj.str("name") ?: "Playlist",
-            artist = user?.str("name") ?: "Audius",
+            artist = user?.str("name") ?: displayName,
             url = obj.str("permalink")?.let { if (it.startsWith("http")) it else "https://audius.co$it" } ?: id,
             thumbnailUrl = pickArtwork(obj["artwork"] as? JsonObject),
             trackCount = obj.int("track_count") ?: 0,
-            providerType = OnlineProviderType.AUDIUS
+            providerType = OnlineProviderType.AUDIUS,
+            providerId = providerId
         )
     }
 
@@ -364,13 +345,5 @@ class AudiusProvider(
 
     companion object {
         private const val APP_NAME = "ARIA"
-        private const val DISCOVERY_TTL_MS = 30 * 60_000L
-        private const val HOST_COOLDOWN_MS = 90_000L
-
-        private val DEFAULT_HOSTS = listOf(
-            "https://discoveryprovider.audius.co",
-            "https://discoveryprovider2.audius.co",
-            "https://audius.co"
-        )
     }
 }

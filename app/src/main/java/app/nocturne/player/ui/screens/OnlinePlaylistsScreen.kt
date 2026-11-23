@@ -282,7 +282,7 @@ fun OnlinePlaylistsScreen(
                     PaperEmptyState(
                         icon = Icons.AutoMirrored.Rounded.PlaylistAdd,
                         title = "No Online Playlists Yet",
-                        subtitle = "Create playlists to organize your favorite streams from YouTube, SoundCloud, and Bandcamp.",
+                        subtitle = "Create playlists to organize your favorite online streams across configured providers.",
                         actionLabel = "Create Playlist",
                         onAction = { showCreateDialog = true }
                     )

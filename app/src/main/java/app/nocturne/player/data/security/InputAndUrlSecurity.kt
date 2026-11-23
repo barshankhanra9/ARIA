@@ -25,6 +25,17 @@ object InputAndUrlSecurity {
 
     private val CONTROL_OR_BIDI_CHAR_REGEX = Regex("[\\p{Cc}\\p{Cf}\\u202A-\\u202E\\u2066-\\u2069]")
     private val IPV4_LITERAL_REGEX = Regex("""^\d{1,3}(?:\.\d{1,3}){3}$""")
+    private val PROVIDER_ID_REGEX = Regex("^[a-zA-Z0-9_-]{1,48}$")
+    private val FORBIDDEN_REMOTE_HEADERS = setOf(
+        "host", "cookie", "set-cookie", "connection", "keep-alive",
+        "transfer-encoding", "content-length", "upgrade", "te", "trailer",
+        "proxy-authorization", "proxy-authenticate", "x-forwarded-for",
+        "x-real-ip", "forwarded"
+    )
+    private val SENSITIVE_HEADER_KEYS = setOf(
+        "authorization", "x-api-key", "api-key", "apikey", "x-auth-token", "token", "secret"
+    )
+    private val TOKEN_REDACT_REGEX = Regex("(?i)(bearer\\s+[a-z0-9._\\-~+/=]+|token=[a-z0-9._\\-~+/=]+|key=[a-z0-9._\\-~+/=]+|api_key=[a-z0-9._\\-~+/=]+)")
     private val TRUSTED_YOUTUBE_DOMAINS = setOf(
         "youtube.com",
         "youtu.be",
@@ -92,6 +103,54 @@ object InputAndUrlSecurity {
             return null
         }
         return trimmed
+    }
+
+    fun sanitizeProviderId(raw: String?): String? {
+        val trimmed = raw?.trim()?.lowercase().orEmpty()
+        return trimmed.takeIf { PROVIDER_ID_REGEX.matches(it) }
+    }
+
+    fun sanitizeEndpointPathTemplate(raw: String?): String? {
+        val trimmed = raw?.trim().orEmpty()
+        if (hasControlChars(trimmed) || trimmed.length > 512) return null
+        if (trimmed.contains("..") || trimmed.contains("\\")) return null
+        val lower = trimmed.lowercase()
+        if (lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("javascript:") || lower.startsWith("file:")) {
+            return null
+        }
+        return trimmed
+    }
+
+    fun sanitizeRemoteHeaderMap(raw: Map<String, String>): Map<String, String> {
+        if (raw.isEmpty()) return emptyMap()
+        val result = linkedMapOf<String, String>()
+        for ((k, v) in raw) {
+            if (result.size >= 12) break
+            val cleanKey = k.trim()
+            if (cleanKey.isBlank() || cleanKey.length > 64) continue
+            if (cleanKey.any { it.isISOControl() || it == ':' || it.isWhitespace() }) continue
+            if (cleanKey.lowercase() in FORBIDDEN_REMOTE_HEADERS) continue
+            val cleanVal = v.trim()
+            if (cleanVal.length > 512 || cleanVal.any { it.isISOControl() }) continue
+            result[cleanKey] = cleanVal
+        }
+        return result
+    }
+
+    fun redactHeaderValuesForDiagnostics(headers: Map<String, String>): Map<String, String> {
+        return headers.mapValues { (k, v) ->
+            if (k.lowercase() in SENSITIVE_HEADER_KEYS || k.lowercase().contains("auth") || k.lowercase().contains("secret")) {
+                "***"
+            } else {
+                v.take(64)
+            }
+        }
+    }
+
+    fun sanitizeErrorForDiagnostics(raw: String?): String? {
+        if (raw.isNullOrBlank()) return null
+        val redacted = TOKEN_REDACT_REGEX.replace(raw, "[REDACTED]")
+        return sanitizeSingleLineText(redacted, 200)
     }
 
     fun isTrustedYouTubeHost(host: String?): Boolean = isExactOrSubdomain(host, TRUSTED_YOUTUBE_DOMAINS)
@@ -349,7 +408,12 @@ object InputAndUrlSecurity {
     }
 
     fun sanitizeUserSettings(raw: UserSettings): UserSettings {
-        val validatedConfigUrl = validateRemoteHttpsUrl(raw.remoteProviderConfigUrl)
+        val migratedRawUrl = if (raw.remoteProviderConfigUrl.trim() == UserSettings.LEGACY_REMOTE_CONFIG_URL) {
+            UserSettings.DEFAULT_REMOTE_CONFIG_URL
+        } else {
+            raw.remoteProviderConfigUrl
+        }
+        val validatedConfigUrl = validateRemoteHttpsUrl(migratedRawUrl)
             ?: UserSettings.DEFAULT_REMOTE_CONFIG_URL
 
         val safeSafUris = raw.includedSafFolderUris

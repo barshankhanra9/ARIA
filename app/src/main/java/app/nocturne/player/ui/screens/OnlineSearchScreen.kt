@@ -82,8 +82,8 @@ fun OnlineSearchScreen(
     onPlayTracks: (List<OnlineTrack>, Int) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
     onOpenContextMenu: (OnlineTrack) -> Unit,
-    onOpenArtist: (String, OnlineProviderType) -> Unit,
-    onOpenAlbum: (String, OnlineProviderType) -> Unit
+    onOpenArtist: (String, OnlineProviderType, String?) -> Unit,
+    onOpenAlbum: (String, OnlineProviderType, String?) -> Unit
 ) {
     val palette = AriaPaperTheme.palette
     val keyboard = LocalSoftwareKeyboardController.current
@@ -106,8 +106,9 @@ fun OnlineSearchScreen(
             .fillMaxSize()
             .padding(horizontal = 18.dp, vertical = 14.dp)
     ) {
+        val activeProviderName = state.providerUsedLabel?.takeIf { it.isNotBlank() } ?: state.providerUsed?.displayName
         EditorialSectionHeader(
-            eyebrow = state.providerUsed?.let { "ONLINE DISCOVERY · ${it.displayName.uppercase()}" } ?: "ONLINE DISCOVERY",
+            eyebrow = activeProviderName?.let { "ONLINE DISCOVERY · ${it.uppercase()}" } ?: "ONLINE DISCOVERY",
             title = "Search Streams"
         )
         Spacer(Modifier.height(12.dp))
@@ -115,7 +116,7 @@ fun OnlineSearchScreen(
         OutlinedTextField(
             value = state.query,
             onValueChange = onQueryChange,
-            placeholder = { Text("Search songs, artists, albums, SoundCloud, Bandcamp…") },
+            placeholder = { Text("Search songs, artists, albums, collections…") },
             leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null, tint = palette.accent) },
             trailingIcon = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -224,7 +225,7 @@ fun OnlineSearchScreen(
                         PaperEmptyState(
                             icon = Icons.Rounded.Search,
                             title = "Discover Online Music",
-                            subtitle = "Search YouTube, SoundCloud, Bandcamp, Piped, and Invidious with automatic failover and zero setup."
+                            subtitle = "Search songs, artists, and collections across configured providers with automatic failover."
                         )
                     }
                 } else {
@@ -310,13 +311,14 @@ fun OnlineSearchScreen(
                                             onClick = {
                                                 val target = if (
                                                     artist.providerType == OnlineProviderType.JIOSAAVN ||
-                                                    artist.providerType == OnlineProviderType.AUDIUS
+                                                    artist.providerType == OnlineProviderType.AUDIUS ||
+                                                    artist.providerId.lowercase() in setOf("jiosaavn", "audius")
                                                 ) {
                                                     artist.id.ifBlank { artist.url }
                                                 } else {
                                                     artist.url.ifBlank { artist.id }
                                                 }
-                                                onOpenArtist(target, artist.providerType)
+                                                onOpenArtist(target, artist.providerType, artist.providerId)
                                             }
                                         )
                                     }
@@ -336,7 +338,7 @@ fun OnlineSearchScreen(
                                     items(state.albums, key = { it.id }) { album ->
                                         OnlineAlbumCard(
                                             album = album,
-                                            onClick = { onOpenAlbum(album.url.ifBlank { album.id }, album.providerType) }
+                                            onClick = { onOpenAlbum(album.url.ifBlank { album.id }, album.providerType, album.providerId) }
                                         )
                                     }
                                 }
@@ -358,8 +360,9 @@ fun OnlineSearchScreen(
                                     style = MaterialTheme.typography.labelSmall,
                                     color = palette.accent
                                 )
-                                state.providerUsed?.let {
-                                    InkStampTag(text = it.badge, accented = false)
+                                val activeBadge = (state.providerUsedLabel?.takeIf { it.isNotBlank() } ?: state.providerUsed?.badge)?.uppercase()
+                                activeBadge?.let {
+                                    InkStampTag(text = it, accented = false)
                                 }
                             }
                         }

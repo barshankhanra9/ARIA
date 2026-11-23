@@ -10,7 +10,17 @@ enum class OnlineProviderType(val displayName: String, val badge: String) {
     INVIDIOUS("Invidious", "INVIDIOUS"),
     AUDIUS("Audius", "AUDIUS"),
     SOUNDCLOUD("SoundCloud", "SOUNDCLOUD"),
-    BANDCAMP("Bandcamp", "BANDCAMP")
+    BANDCAMP("Bandcamp", "BANDCAMP"),
+    DYNAMIC("Online", "STREAM");
+
+    fun defaultProviderId(): String = name.lowercase()
+
+    companion object {
+        fun fromProviderId(id: String?): OnlineProviderType {
+            val clean = id?.trim()?.lowercase().orEmpty()
+            return entries.firstOrNull { it.name.equals(clean, ignoreCase = true) } ?: DYNAMIC
+        }
+    }
 }
 
 @Serializable
@@ -83,10 +93,22 @@ data class OnlineTrack(
     val isFavorite: Boolean = false,
     val playCount: Int = 0,
     val lastPlayedAt: Long = 0L,
-    val totalListenMs: Long = 0L
+    val totalListenMs: Long = 0L,
+    val providerId: String = providerType.name.lowercase()
 ) {
+    fun effectiveProviderId(): String =
+        providerId.ifBlank { providerType.name.lowercase() }
+
+    fun effectiveBadge(): String =
+        if (providerType == OnlineProviderType.DYNAMIC) {
+            providerLabel.ifBlank { providerId }.uppercase()
+        } else {
+            providerLabel.ifBlank { providerType.badge }.uppercase()
+        }
+
     fun toUiTrack(formatTag: String? = null): Track {
-        val virtualUri = buildOnlineVirtualUri(providerType, sourceId, sourceUrl)
+        val effProviderId = effectiveProviderId()
+        val virtualUri = buildOnlineVirtualUri(effProviderId, sourceId, sourceUrl)
         return Track(
             id = id.hashCode().toLong(),
             uriString = virtualUri,
@@ -106,7 +128,7 @@ data class OnlineTrack(
             dateAddedSec = 0L,
             dateModifiedSec = 0L,
             mimeType = "audio/*",
-            formatLabel = formatTag ?: providerType.badge,
+            formatLabel = formatTag ?: effectiveBadge(),
             bitrateKbps = 0,
             sampleRateHz = 0,
             channelCount = 0,
@@ -134,10 +156,17 @@ data class OnlineTrack(
             providerType: OnlineProviderType,
             sourceId: String,
             sourceUrl: String
+        ): String = buildOnlineVirtualUri(providerType.name.lowercase(), sourceId, sourceUrl)
+
+        fun buildOnlineVirtualUri(
+            providerId: String,
+            sourceId: String,
+            sourceUrl: String
         ): String {
+            val cleanPid = providerId.trim().lowercase().ifBlank { "youtube" }
             val encodedId = android.net.Uri.encode(sourceId)
             val encodedUrl = android.net.Uri.encode(sourceUrl)
-            return "$ONLINE_SCHEME://${providerType.name.lowercase()}/$encodedId?src=$encodedUrl"
+            return "$ONLINE_SCHEME://$cleanPid/$encodedId?src=$encodedUrl"
         }
 
         fun canonicalId(providerType: OnlineProviderType, sourceId: String): String {
@@ -146,6 +175,17 @@ data class OnlineTrack(
                 else -> providerType
             }
             return "${normalizedProvider.name}:$sourceId"
+        }
+
+        fun canonicalId(providerId: String, sourceId: String): String =
+            canonicalId(providerId, OnlineProviderType.fromProviderId(providerId), sourceId)
+
+        fun canonicalId(providerId: String, providerType: OnlineProviderType, sourceId: String): String {
+            return if (providerType == OnlineProviderType.DYNAMIC) {
+                "DYNAMIC:${providerId.trim().lowercase()}:$sourceId"
+            } else {
+                canonicalId(providerType, sourceId)
+            }
         }
     }
 }
@@ -165,7 +205,10 @@ data class OnlineStreamResolution(
     val streams: List<OnlineAudioStream>,
     val selectedStream: OnlineAudioStream,
     val relatedTracks: List<OnlineTrack> = emptyList(),
-    val resolvedBy: OnlineProviderType
+    val resolvedBy: OnlineProviderType,
+    val resolvedByProviderId: String = resolvedBy.name.lowercase(),
+    val resolvedByLabel: String = resolvedBy.displayName,
+    val resolvedEndpointUrl: String? = null
 )
 
 data class OnlineArtistSummary(
@@ -174,7 +217,8 @@ data class OnlineArtistSummary(
     val url: String,
     val thumbnailUrl: String? = null,
     val subscriberText: String = "",
-    val providerType: OnlineProviderType
+    val providerType: OnlineProviderType,
+    val providerId: String = providerType.name.lowercase()
 )
 
 data class OnlineAlbumSummary(
@@ -184,7 +228,8 @@ data class OnlineAlbumSummary(
     val url: String,
     val thumbnailUrl: String? = null,
     val trackCount: Int = 0,
-    val providerType: OnlineProviderType
+    val providerType: OnlineProviderType,
+    val providerId: String = providerType.name.lowercase()
 )
 
 data class OnlineArtistPage(
@@ -197,7 +242,9 @@ data class OnlineArtistPage(
     val description: String = "",
     val tracks: List<OnlineTrack> = emptyList(),
     val playlists: List<OnlineAlbumSummary> = emptyList(),
-    val providerType: OnlineProviderType
+    val providerType: OnlineProviderType,
+    val providerId: String = providerType.name.lowercase(),
+    val providerLabel: String = providerType.displayName
 )
 
 data class OnlineAlbumPage(
@@ -208,7 +255,9 @@ data class OnlineAlbumPage(
     val thumbnailUrl: String? = null,
     val description: String = "",
     val tracks: List<OnlineTrack> = emptyList(),
-    val providerType: OnlineProviderType
+    val providerType: OnlineProviderType,
+    val providerId: String = providerType.name.lowercase(),
+    val providerLabel: String = providerType.displayName
 )
 
 data class OnlineSearchPage(
@@ -218,7 +267,9 @@ data class OnlineSearchPage(
     val albums: List<OnlineAlbumSummary> = emptyList(),
     val nextPageToken: String? = null,
     val hasMore: Boolean = false,
-    val providerUsed: OnlineProviderType
+    val providerUsed: OnlineProviderType,
+    val providerUsedId: String = providerUsed.name.lowercase(),
+    val providerUsedLabel: String = providerUsed.displayName
 )
 
 data class OnlinePlaylist(
@@ -243,7 +294,9 @@ data class ProviderHealthSnapshot(
     val ewmaLatencyMs: Long,
     val consecutiveFailures: Int,
     val cooldownRemainingMs: Long,
-    val activeInstanceUrl: String? = null
+    val activeInstanceUrl: String? = null,
+    val providerId: String = providerType.name.lowercase(),
+    val displayName: String = providerType.displayName
 )
 
 enum class NetworkSpeedTier {

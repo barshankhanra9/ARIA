@@ -189,42 +189,60 @@ data class UserSettings(
     val remoteProviderConfigUrl: String = DEFAULT_REMOTE_CONFIG_URL
 ) {
     companion object {
-        const val DEFAULT_REMOTE_CONFIG_URL =
+        const val LEGACY_REMOTE_CONFIG_URL =
             "https://raw.githubusercontent.com/nocturne-player/aria-providers/main/providers.json"
+        const val DEFAULT_REMOTE_CONFIG_URL =
+            "https://raw.githubusercontent.com/barshankhanra9/aria-providers/refs/heads/main/providers.json"
     }
 }
 
 @Serializable
 data class RemoteProvidersConfig(
-    val jiosaavn: List<String> = DEFAULT_JIOSAAVN_URLS,
-    val piped: List<String> = DEFAULT_PIPED_URLS,
-    val invidious: List<String> = DEFAULT_INVIDIOUS_URLS,
-    val lrclib: List<String> = DEFAULT_LRCLIB_URLS,
+    val schemaVersion: Int = 2,
+    val configVersion: String = "0",
+    val refreshIntervalSeconds: Int = 1800,
+    val providers: List<DynamicProviderConfig> = emptyList(),
+    val lyricsProviders: List<DynamicLyricsProviderConfig> = emptyList(),
+    val etag: String? = null,
+    val lastModified: String? = null,
     val updatedAtMs: Long = 0L
 ) {
+    val jiosaavn: List<String>
+        get() = endpointsForProvider("jiosaavn")
+
+    val piped: List<String>
+        get() = endpointsForProvider("piped")
+
+    val invidious: List<String>
+        get() = endpointsForProvider("invidious")
+
+    val audius: List<String>
+        get() = endpointsForProvider("audius")
+
+    val lrclib: List<String>
+        get() = lyricsProviders
+            .filter { it.enabled }
+            .sortedBy { it.priority }
+            .flatMap { lp -> lp.endpoints.filter { it.enabled }.sortedBy { it.priority }.map { it.url } }
+            .distinct()
+
+    fun providerById(id: String): DynamicProviderConfig? =
+        providers.firstOrNull { it.id.equals(id, ignoreCase = true) }
+
+    fun enabledProviders(): List<DynamicProviderConfig> =
+        providers.filter { it.enabled }.sortedBy { it.priority }
+
+    fun endpointsForProvider(id: String): List<String> =
+        providerById(id)
+            ?.takeIf { it.enabled }
+            ?.endpoints
+            ?.filter { it.enabled }
+            ?.sortedBy { it.priority }
+            ?.map { it.url }
+            ?.distinct()
+            .orEmpty()
+
     companion object {
-        val DEFAULT_JIOSAAVN_URLS = listOf(
-            "https://saavn.dev/api",
-            "https://jiosaavn-api-privatecvc2.vercel.app/api",
-            "https://jiosaavn-api-2-harsh-patel.vercel.app/api"
-        )
-        val DEFAULT_PIPED_URLS = listOf(
-            "https://pipedapi.kavin.rocks",
-            "https://pipedapi.adminforge.de",
-            "https://pipedapi.r4fo.com",
-            "https://api.piped.private.coffee",
-            "https://pipedapi.darkness.services"
-        )
-        val DEFAULT_INVIDIOUS_URLS = listOf(
-            "https://inv.nadeko.net",
-            "https://invidious.nerdvpn.de",
-            "https://invidious.jing.rocks",
-            "https://yt.artemislena.eu",
-            "https://invidious.privacyredirect.com"
-        )
-        val DEFAULT_LRCLIB_URLS = listOf(
-            "https://lrclib.net"
-        )
         val DEFAULT = RemoteProvidersConfig()
     }
 }

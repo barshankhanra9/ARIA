@@ -55,6 +55,10 @@ class SettingsRepository(private val context: Context) {
         val ONLINE_QUEUE_SHUFFLE = intPreferencesKey("online_queue_shuffle")
         val ONLINE_QUEUE_REPEAT = intPreferencesKey("online_queue_repeat")
         val REMOTE_PROVIDERS_CONFIG_JSON = stringPreferencesKey("remote_providers_config_json")
+        val REMOTE_PROVIDERS_PREVIOUS_JSON = stringPreferencesKey("remote_providers_previous_json")
+        val REMOTE_CONFIG_ETAG = stringPreferencesKey("remote_config_etag")
+        val REMOTE_CONFIG_LAST_MODIFIED = stringPreferencesKey("remote_config_last_modified")
+        val REMOTE_CONFIG_LAST_SYNC_MS = longPreferencesKey("remote_config_last_sync_ms")
     }
 
     val settingsFlow: Flow<UserSettings> = context.ariaDataStore.data.map { prefs ->
@@ -62,7 +66,12 @@ class SettingsRepository(private val context: Context) {
         if (raw.isNullOrBlank()) {
             UserSettings()
         } else {
-            runCatching { json.decodeFromString<UserSettings>(raw) }.getOrDefault(UserSettings())
+            val decoded = runCatching { json.decodeFromString<UserSettings>(raw) }.getOrDefault(UserSettings())
+            if (decoded.remoteProviderConfigUrl.trim() == UserSettings.LEGACY_REMOTE_CONFIG_URL) {
+                decoded.copy(remoteProviderConfigUrl = UserSettings.DEFAULT_REMOTE_CONFIG_URL)
+            } else {
+                decoded
+            }
         }
     }
 
@@ -85,9 +94,68 @@ class SettingsRepository(private val context: Context) {
         return runCatching { json.decodeFromString<RemoteProvidersConfig>(raw) }.getOrNull()
     }
 
+    suspend fun getPreviousRemoteProvidersConfig(): RemoteProvidersConfig? {
+        val prefs = context.ariaDataStore.data.first()
+        val raw = prefs[Keys.REMOTE_PROVIDERS_PREVIOUS_JSON]
+        if (raw.isNullOrBlank()) return null
+        return runCatching { json.decodeFromString<RemoteProvidersConfig>(raw) }.getOrNull()
+    }
+
     suspend fun saveRemoteProvidersConfig(config: RemoteProvidersConfig) {
         context.ariaDataStore.edit { prefs ->
-            prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON] = json.encodeToString(config)
+            val currentRaw = prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON]
+            val encodedNew = json.encodeToString(config)
+            if (!currentRaw.isNullOrBlank() && currentRaw != encodedNew) {
+                val currentCfg = runCatching { json.decodeFromString<RemoteProvidersConfig>(currentRaw) }.getOrNull()
+                if (currentCfg != null && currentCfg.providers.isNotEmpty()) {
+                    prefs[Keys.REMOTE_PROVIDERS_PREVIOUS_JSON] = currentRaw
+                }
+            }
+            prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON] = encodedNew
+            if (!config.etag.isNullOrBlank()) {
+                prefs[Keys.REMOTE_CONFIG_ETAG] = config.etag
+            }
+            if (!config.lastModified.isNullOrBlank()) {
+                prefs[Keys.REMOTE_CONFIG_LAST_MODIFIED] = config.lastModified
+            }
+            if (config.updatedAtMs > 0L) {
+                prefs[Keys.REMOTE_CONFIG_LAST_SYNC_MS] = config.updatedAtMs
+            }
+        }
+    }
+
+    suspend fun rollbackRemoteProvidersConfig(): RemoteProvidersConfig? {
+        var restored: RemoteProvidersConfig? = null
+        context.ariaDataStore.edit { prefs ->
+            val prevRaw = prefs[Keys.REMOTE_PROVIDERS_PREVIOUS_JSON] ?: return@edit
+            val prevCfg = runCatching { json.decodeFromString<RemoteProvidersConfig>(prevRaw) }.getOrNull()
+                ?: return@edit
+            val currentRaw = prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON]
+            prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON] = prevRaw
+            if (!currentRaw.isNullOrBlank()) {
+                prefs[Keys.REMOTE_PROVIDERS_PREVIOUS_JSON] = currentRaw
+            } else {
+                prefs.remove(Keys.REMOTE_PROVIDERS_PREVIOUS_JSON)
+            }
+            restored = prevCfg
+        }
+        return restored
+    }
+
+    suspend fun getRemoteConfigHttpMetadata(): Triple<String?, String?, Long> {
+        val prefs = context.ariaDataStore.data.first()
+        return Triple(
+            prefs[Keys.REMOTE_CONFIG_ETAG],
+            prefs[Keys.REMOTE_CONFIG_LAST_MODIFIED],
+            prefs[Keys.REMOTE_CONFIG_LAST_SYNC_MS] ?: 0L
+        )
+    }
+
+    suspend fun saveRemoteConfigHttpMetadata(etag: String?, lastModified: String?, syncedAtMs: Long) {
+        context.ariaDataStore.edit { prefs ->
+            if (!etag.isNullOrBlank()) prefs[Keys.REMOTE_CONFIG_ETAG] = etag
+            if (!lastModified.isNullOrBlank()) prefs[Keys.REMOTE_CONFIG_LAST_MODIFIED] = lastModified
+            prefs[Keys.REMOTE_CONFIG_LAST_SYNC_MS] = syncedAtMs
         }
     }
 

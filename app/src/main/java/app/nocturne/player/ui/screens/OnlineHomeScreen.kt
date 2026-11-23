@@ -81,7 +81,7 @@ fun OnlineHomeScreen(
     onRefreshTrending: () -> Unit,
     onOpenSearch: () -> Unit,
     onSelectCategory: (OnlineDiscoveryCategory) -> Unit,
-    onOpenArtist: (String, OnlineProviderType) -> Unit,
+    onOpenArtist: (String, OnlineProviderType, String?) -> Unit,
     onOpenPlayer: () -> Unit,
     onOpenQueue: () -> Unit,
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
@@ -108,9 +108,10 @@ fun OnlineHomeScreen(
             ?: trendingState.tracks.firstOrNull()
             ?: recentlyPlayed.firstOrNull()
     }
-    val activeFeedProvider = heroTrack?.providerType
-        ?: trendingState.tracks.firstOrNull()?.providerType
-        ?: trendingState.providerUsed
+    val activeFeedLabel = heroTrack?.providerLabel?.takeIf { it.isNotBlank() }
+        ?: trendingState.tracks.firstOrNull()?.providerLabel?.takeIf { it.isNotBlank() }
+        ?: trendingState.providerUsedLabel
+        ?: trendingState.providerUsed?.displayName
 
     LazyColumn(
         modifier = Modifier
@@ -162,8 +163,8 @@ fun OnlineHomeScreen(
                         Spacer(Modifier.height(4.dp))
                         val subtitleText = buildString {
                             append("Zero-Config Online Radio")
-                            activeFeedProvider?.let { p ->
-                                append(" · Active Feed: ${p.displayName}")
+                            activeFeedLabel?.let { label ->
+                                append(" · Active Feed: $label")
                             }
                         }
                         Text(
@@ -332,13 +333,14 @@ fun OnlineHomeScreen(
                                         onClick = {
                                             val target = if (
                                                 artist.providerType == OnlineProviderType.JIOSAAVN ||
-                                                artist.providerType == OnlineProviderType.AUDIUS
+                                                artist.providerType == OnlineProviderType.AUDIUS ||
+                                                artist.providerId.lowercase() in setOf("jiosaavn", "audius")
                                             ) {
                                                 artist.id.ifBlank { artist.url }
                                             } else {
                                                 artist.url.ifBlank { artist.id }
                                             }
-                                            onOpenArtist(target, artist.providerType)
+                                            onOpenArtist(target, artist.providerType, artist.providerId)
                                         }
                                     )
                                 }
@@ -361,10 +363,12 @@ fun OnlineHomeScreen(
         // Trending & Selected Category Single-Track Shelf
         item(key = "online_trending") {
             val isDefaultTrending = trendingState.selectedCategory == OnlineDiscoveryCategory.TRENDING
-            val shelfProvider = trendingState.tracks.firstOrNull()?.providerType ?: trendingState.providerUsed
+            val shelfLabel = trendingState.tracks.firstOrNull()?.providerLabel?.takeIf { it.isNotBlank() }
+                ?: trendingState.providerUsedLabel
+                ?: trendingState.providerUsed?.displayName
             val shelfEyebrow = buildString {
                 append(if (isDefaultTrending) "TOP CHARTS" else trendingState.selectedCategory.label.uppercase())
-                shelfProvider?.let { append(" · ${it.displayName.uppercase()}") }
+                shelfLabel?.let { append(" · ${it.uppercase()}") }
             }
             val shelfTitle = when (trendingState.selectedCategory) {
                 OnlineDiscoveryCategory.TRENDING -> "Trending & Popular"
@@ -615,7 +619,7 @@ private fun OnlineContinueCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    InkStampTag(text = track.providerType.badge, accented = isPlaying)
+                    InkStampTag(text = track.effectiveBadge(), accented = isPlaying)
                     if (track.durationMs > 0L) {
                         Text(
                             text = formatDuration(track.durationMs),
@@ -690,7 +694,12 @@ private fun OnlinePopularArtistCard(
                 )
             }
             Spacer(Modifier.height(4.dp))
-            InkStampTag(text = artist.providerType.badge, accented = false)
+            val artistBadge = if (artist.providerType == OnlineProviderType.DYNAMIC) {
+                artist.providerId.ifBlank { artist.providerType.badge }.uppercase()
+            } else {
+                artist.providerType.badge
+            }
+            InkStampTag(text = artistBadge, accented = false)
         }
     }
 }
@@ -755,7 +764,7 @@ private fun OnlineTrackShelfCard(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            InkStampTag(text = track.providerType.badge, accented = false)
+            InkStampTag(text = track.effectiveBadge(), accented = false)
             if (track.durationMs > 0L) {
                 Text(
                     text = formatDuration(track.durationMs),

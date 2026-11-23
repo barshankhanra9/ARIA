@@ -2,6 +2,7 @@ package app.nocturne.player.data.online
 
 import android.net.Uri
 import android.util.LruCache
+import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -13,7 +14,8 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
-import app.nocturne.player.data.model.RemoteProvidersConfig
+import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -25,28 +27,44 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
-import okhttp3.Request
 import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
 
 class JioSaavnProvider(
     private val client: OkHttpClient = OnlineHttpClient.client,
     private val baseUrlsOverride: List<String>? = null,
-    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null
+    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null,
+    private val healthTracker: ProviderHealthTracker = ProviderHealthTracker(),
+    private val dynamicConfigProvider: (() -> DynamicProviderConfig?)? = null,
+    executorOverride: DynamicHttpExecutor? = null
 ) : OnlineMusicProvider {
 
     override val providerType: OnlineProviderType = OnlineProviderType.JIOSAAVN
+    override val providerId: String
+        get() = currentConfig()?.id ?: "jiosaavn"
+    override val displayName: String
+        get() = currentConfig()?.displayName ?: OnlineProviderType.JIOSAAVN.displayName
     override val supportsPagination: Boolean = true
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val instanceCooldowns = ConcurrentHashMap<String, Long>()
     private val parsedStreamsCache = LruCache<String, List<OnlineAudioStream>>(160)
+    private val executor: DynamicHttpExecutor = executorOverride ?: DynamicHttpExecutor(
+        baseClient = client,
+        healthTracker = healthTracker,
+        allowLoopbackForTests = baseUrlsOverride != null
+    )
 
     @Volatile
     var lastWorkingInstance: String? = null
         private set
+
+    override fun currentConfig(): DynamicProviderConfig? = dynamicConfigProvider?.invoke()
+
+    override fun supportsCapability(capability: String): Boolean =
+        currentConfig()?.supportsCapability(capability) ?: true
+
+    override fun activeEndpointFor(operation: OperationType): String? =
+        healthTracker.activeEndpointFor(providerId, operation) ?: lastWorkingInstance
 
     override suspend fun search(
         query: String,
@@ -56,42 +74,64 @@ class JioSaavnProvider(
         val page = pageToken?.toIntOrNull()?.coerceIn(1, 100) ?: 1
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         val encodedQ = Uri.encode(safeQuery)
+        val cfg = currentConfig()
 
         when (filter) {
             OnlineSearchFilter.ALBUMS -> {
-                val body = executeWithInstanceFallback("/search/albums?query=$encodedQ&page=$page&limit=20")
-                val results = extractResultsArray(body)
+                val resp = executeConfiguredOrPath(
+                    operation = OperationType.SEARCH,
+                    template = cfg?.routes?.searchAlbums,
+                    variables = mapOf("query" to safeQuery, "page" to page.toString(), "limit" to "20"),
+                    fallbackPath = "/search/albums?query=$encodedQ&page=$page&limit=20"
+                )
+                val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
                 val albums = results.mapNotNull { parseAlbumItem(it.jsonObject) }
-                return@withContext OnlineSearchPage(
+                OnlineSearchPage(
                     query = query,
                     albums = albums,
                     nextPageToken = if (albums.size >= 15) (page + 1).toString() else null,
                     hasMore = albums.size >= 15,
-                    providerUsed = OnlineProviderType.JIOSAAVN
+                    providerUsed = OnlineProviderType.JIOSAAVN,
+                    providerUsedId = providerId,
+                    providerUsedLabel = displayName
                 )
             }
             OnlineSearchFilter.ARTISTS -> {
-                val body = executeWithInstanceFallback("/search/artists?query=$encodedQ&page=$page&limit=20")
-                val results = extractResultsArray(body)
+                val resp = executeConfiguredOrPath(
+                    operation = OperationType.SEARCH,
+                    template = cfg?.routes?.searchArtists,
+                    variables = mapOf("query" to safeQuery, "page" to page.toString(), "limit" to "20"),
+                    fallbackPath = "/search/artists?query=$encodedQ&page=$page&limit=20"
+                )
+                val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
                 val artists = results.mapNotNull { parseArtistItem(it.jsonObject) }
-                return@withContext OnlineSearchPage(
+                OnlineSearchPage(
                     query = query,
                     artists = artists,
                     nextPageToken = if (artists.size >= 15) (page + 1).toString() else null,
                     hasMore = artists.size >= 15,
-                    providerUsed = OnlineProviderType.JIOSAAVN
+                    providerUsed = OnlineProviderType.JIOSAAVN,
+                    providerUsedId = providerId,
+                    providerUsedLabel = displayName
                 )
             }
             else -> {
-                val body = executeWithInstanceFallback("/search/songs?query=$encodedQ&page=$page&limit=20")
-                val results = extractResultsArray(body)
+                val resp = executeConfiguredOrPath(
+                    operation = OperationType.SEARCH,
+                    template = cfg?.routes?.searchSongs ?: cfg?.routes?.searchAll,
+                    variables = mapOf("query" to safeQuery, "page" to page.toString(), "limit" to "20"),
+                    fallbackPath = "/search/songs?query=$encodedQ&page=$page&limit=20"
+                )
+                val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
                 val tracks = results.mapNotNull { parseSongItem(it.jsonObject) }
-                return@withContext OnlineSearchPage(
+                OnlineSearchPage(
                     query = query,
                     tracks = tracks,
                     nextPageToken = if (tracks.size >= 15) (page + 1).toString() else null,
                     hasMore = tracks.size >= 15,
-                    providerUsed = OnlineProviderType.JIOSAAVN
+                    providerUsed = OnlineProviderType.JIOSAAVN,
+                    providerUsedId = providerId,
+                    providerUsedLabel = displayName
                 )
             }
         }
@@ -100,8 +140,14 @@ class JioSaavnProvider(
     override suspend fun suggestions(query: String): List<String> = withContext(Dispatchers.IO) {
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (safeQuery.isBlank()) return@withContext emptyList()
-        val body = executeWithInstanceFallback("/search/songs?query=${Uri.encode(safeQuery)}&page=1&limit=8")
-        extractResultsArray(body)
+        val cfg = currentConfig()
+        val resp = executeConfiguredOrPath(
+            operation = OperationType.SEARCH,
+            template = cfg?.routes?.suggestions ?: cfg?.routes?.searchSongs,
+            variables = mapOf("query" to safeQuery, "page" to "1", "limit" to "8"),
+            fallbackPath = "/search/songs?query=${Uri.encode(safeQuery)}&page=1&limit=8"
+        )
+        extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
             .mapNotNull { el ->
                 val obj = el.jsonObject
                 (obj.str("name") ?: obj.str("title"))?.let(::decodeHtmlEntities)
@@ -111,8 +157,15 @@ class JioSaavnProvider(
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
-        val body = executeWithInstanceFallback("/search/songs?query=${Uri.encode("latest trending songs")}&page=1&limit=20")
-        extractResultsArray(body).mapNotNull { parseSongItem(it.jsonObject) }
+        val cfg = currentConfig()
+        val resp = executeConfiguredOrPath(
+            operation = OperationType.SEARCH,
+            template = cfg?.routes?.trending ?: cfg?.routes?.searchSongs,
+            variables = mapOf("query" to "latest trending songs", "page" to "1", "limit" to "20"),
+            fallbackPath = "/search/songs?query=${Uri.encode("latest trending songs")}&page=1&limit=20"
+        )
+        extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
+            .mapNotNull { parseSongItem(it.jsonObject) }
     }
 
     override suspend fun resolveStream(
@@ -123,15 +176,25 @@ class JioSaavnProvider(
             ?: throw IllegalArgumentException("Invalid JioSaavn track ID")
         var streams = parsedStreamsCache.get(safeSourceId).orEmpty()
         var resolvedTrack = track
+        val cfg = currentConfig()
 
         if (streams.isEmpty()) {
             val encodedId = Uri.encode(safeSourceId)
-            val body = runCatching {
-                executeWithInstanceFallback("/songs/$encodedId")
-            }.getOrElse {
-                executeWithInstanceFallback("/songs?ids=$encodedId")
+            val resp = if (cfg?.routes?.resolveStream != null) {
+                executeConfiguredOrPath(
+                    operation = OperationType.PLAYBACK,
+                    template = cfg.routes.resolveStream,
+                    variables = mapOf("id" to safeSourceId, "trackId" to safeSourceId),
+                    fallbackPath = "/songs/$encodedId"
+                )
+            } else {
+                runCatching {
+                    executeRawWithFallback(OperationType.PLAYBACK, "/songs/$encodedId")
+                }.getOrElse {
+                    executeRawWithFallback(OperationType.PLAYBACK, "/songs?ids=$encodedId")
+                }
             }
-            val parsedObj = extractSongObject(body)
+            val parsedObj = extractSongObject(resp.body)
             if (parsedObj != null) {
                 parseSongItem(parsedObj)?.let { updated ->
                     resolvedTrack = updated.copy(
@@ -145,12 +208,20 @@ class JioSaavnProvider(
             }
         }
 
-        val selected = StreamQualitySelector.selectBestAudioStream(streams, speedTier)
-            ?: throw IOException("No playable audio streams returned by JioSaavn for ${track.title}")
+        val allowedOrigin = lastWorkingInstance?.takeIf { baseUrlsOverride != null }
+        val selected = StreamQualitySelector.selectBestAudioStream(
+            streams = streams,
+            speedTier = speedTier,
+            allowedLoopbackOrigin = allowedOrigin
+        ) ?: throw IOException("No playable audio streams returned by $displayName for ${track.title}")
 
         val related = runCatching {
-            val sugBody = executeWithInstanceFallback("/songs/${Uri.encode(safeSourceId)}/suggestions?limit=10")
-            extractResultsArray(sugBody).mapNotNull { parseSongItem(it.jsonObject) }
+            val sugResp = executeRawWithFallback(
+                OperationType.METADATA,
+                "/songs/${Uri.encode(safeSourceId)}/suggestions?limit=10"
+            )
+            extractResultsArray(sugResp.body, cfg?.mapping?.resultsPath)
+                .mapNotNull { parseSongItem(it.jsonObject) }
         }.getOrDefault(emptyList())
 
         OnlineStreamResolution(
@@ -158,7 +229,9 @@ class JioSaavnProvider(
             streams = streams,
             selectedStream = selected,
             relatedTracks = related,
-            resolvedBy = OnlineProviderType.JIOSAAVN
+            resolvedBy = OnlineProviderType.JIOSAAVN,
+            resolvedByProviderId = providerId,
+            resolvedByLabel = displayName
         )
     }
 
@@ -166,8 +239,14 @@ class JioSaavnProvider(
         val rawId = artistIdOrUrl.trimEnd('/').substringAfterLast("/").substringBefore("?")
         val id = InputAndUrlSecurity.sanitizePathSegment(rawId)
             ?: throw IllegalArgumentException("Invalid JioSaavn artist ID")
-        val body = executeWithInstanceFallback("/artists/${Uri.encode(id)}")
-        val dataObj = extractDataObject(body)
+        val cfg = currentConfig()
+        val resp = executeConfiguredOrPath(
+            operation = OperationType.METADATA,
+            template = cfg?.routes?.artistDetails,
+            variables = mapOf("id" to id, "artistId" to id),
+            fallbackPath = "/artists/${Uri.encode(id)}"
+        )
+        val dataObj = extractDataObject(resp.body)
         val topSongs = (dataObj?.get("topSongs") as? JsonArray).orEmpty()
             .mapNotNull { parseSongItem(it.jsonObject) }
         val topAlbums = (dataObj?.get("topAlbums") as? JsonArray).orEmpty()
@@ -182,18 +261,31 @@ class JioSaavnProvider(
             description = "",
             tracks = topSongs,
             playlists = topAlbums,
-            providerType = OnlineProviderType.JIOSAAVN
+            providerType = OnlineProviderType.JIOSAAVN,
+            providerId = providerId
         )
     }
 
     override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
-        val id = albumIdOrUrl.substringAfterLast("/").substringBefore("?")
-        val body = runCatching {
-            executeWithInstanceFallback("/albums?id=${Uri.encode(id)}")
-        }.getOrElse {
-            executeWithInstanceFallback("/playlists?id=${Uri.encode(id)}")
+        val rawId = albumIdOrUrl.trimEnd('/').substringAfterLast("/").substringBefore("?")
+        val id = InputAndUrlSecurity.sanitizePathSegment(rawId)
+            ?: throw IllegalArgumentException("Invalid JioSaavn album ID")
+        val cfg = currentConfig()
+        val resp = if (cfg?.routes?.albumDetails != null) {
+            executeConfiguredOrPath(
+                operation = OperationType.METADATA,
+                template = cfg.routes.albumDetails,
+                variables = mapOf("id" to id, "albumId" to id),
+                fallbackPath = "/albums?id=${Uri.encode(id)}"
+            )
+        } else {
+            runCatching {
+                executeRawWithFallback(OperationType.METADATA, "/albums?id=${Uri.encode(id)}")
+            }.getOrElse {
+                executeRawWithFallback(OperationType.METADATA, "/playlists?id=${Uri.encode(id)}")
+            }
         }
-        val dataObj = extractDataObject(body)
+        val dataObj = extractDataObject(resp.body)
         val songs = (dataObj?.get("songs") as? JsonArray).orEmpty()
             .mapNotNull { parseSongItem(it.jsonObject) }
 
@@ -201,66 +293,82 @@ class JioSaavnProvider(
             id = id,
             title = decodeHtmlEntities(dataObj?.str("name") ?: dataObj?.str("title") ?: "Album"),
             artist = decodeHtmlEntities(
-                extractPrimaryArtists(dataObj).ifBlank { "JioSaavn" }
+                extractPrimaryArtists(dataObj).ifBlank { displayName }
             ),
             url = dataObj?.str("url") ?: albumIdOrUrl,
             thumbnailUrl = pickBestImageUrl(dataObj?.get("image")) ?: songs.firstOrNull()?.thumbnailUrl,
             description = decodeHtmlEntities(dataObj?.str("description").orEmpty()),
             tracks = songs,
-            providerType = OnlineProviderType.JIOSAAVN
+            providerType = OnlineProviderType.JIOSAAVN,
+            providerId = providerId
         )
     }
 
-    private fun getCandidateInstances(): List<String> {
+    private fun getEndpointConfigs(operation: OperationType): List<ProviderEndpointConfig> {
         if (baseUrlsOverride != null) {
-            return baseUrlsOverride.mapNotNull {
-                InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = true)
-            }
-        }
-        val configured = dynamicBaseUrlsProvider?.invoke().orEmpty()
-        val all = (configured + RemoteProvidersConfig.DEFAULT_JIOSAAVN_URLS)
-            .mapNotNull { InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = false) }
-            .distinct()
-        val now = System.currentTimeMillis()
-        val ready = all.filter { (instanceCooldowns[it] ?: 0L) <= now }
-        return ready.ifEmpty { all }
-    }
-
-    private fun executeWithInstanceFallback(path: String): String {
-        val candidates = getCandidateInstances()
-        var lastErr: Throwable? = null
-        for (base in candidates) {
-            val cleanBase = base.trimEnd('/')
-            val url = "$cleanBase$path"
-            try {
-                val req = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", OnlineHttpClient.USER_AGENT)
-                    .header("Accept", "application/json")
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        throw IOException("HTTP ${resp.code} from $cleanBase")
-                    }
-                    val body = InputAndUrlSecurity.readBodyBounded(resp.body)
-                    val trimmed = body.trimStart()
-                    if (trimmed.isBlank() || trimmed.startsWith("<")) {
-                        throw IOException("Invalid JSON payload from $cleanBase")
-                    }
-                    lastWorkingInstance = cleanBase
-                    instanceCooldowns.remove(cleanBase)
-                    return body
+            return baseUrlsOverride.mapIndexedNotNull { idx, raw ->
+                InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = true)?.let { clean ->
+                    ProviderEndpointConfig(url = clean, priority = idx + 1)
                 }
-            } catch (t: Throwable) {
-                lastErr = t
-                instanceCooldowns[cleanBase] = System.currentTimeMillis() + INSTANCE_COOLDOWN_MS
             }
         }
-        throw lastErr ?: IOException("All JioSaavn endpoints unavailable")
+        val cfg = currentConfig()
+        if (cfg != null) {
+            return cfg.endpointsFor(operation)
+        }
+        return dynamicBaseUrlsProvider?.invoke().orEmpty()
+            .mapIndexedNotNull { idx, raw ->
+                InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = false)?.let { clean ->
+                    ProviderEndpointConfig(url = clean, priority = idx + 1)
+                }
+            }
+            .distinctBy { it.url }
     }
 
-    private fun extractResultsArray(body: String): JsonArray {
+    private suspend fun executeConfiguredOrPath(
+        operation: OperationType,
+        template: app.nocturne.player.data.model.EndpointOperationTemplate?,
+        variables: Map<String, String>,
+        fallbackPath: String
+    ): ExecutedHttpResponse {
+        val cfg = currentConfig()
+        val resp = if (template != null && cfg != null && baseUrlsOverride == null) {
+            executor.executeTemplated(
+                config = cfg,
+                operation = operation,
+                template = template,
+                variables = variables
+            )
+        } else {
+            executeRawWithFallback(operation, fallbackPath)
+        }
+        lastWorkingInstance = resp.endpointUrl
+        return resp
+    }
+
+    private suspend fun executeRawWithFallback(operation: OperationType, path: String): ExecutedHttpResponse {
+        val endpoints = getEndpointConfigs(operation)
+        val cfg = currentConfig()
+        val resp = executor.executeRawGet(
+            providerId = providerId,
+            operation = operation,
+            configuredEndpoints = endpoints,
+            pathAndQuery = path,
+            headers = cfg?.headers ?: emptyMap(),
+            timeoutMs = cfg?.timeoutMs ?: 10_000L,
+            maxRetries = cfg?.maxRetries ?: 1,
+            cooldownMs = cfg?.cooldownMs ?: 60_000L
+        )
+        lastWorkingInstance = resp.endpointUrl
+        return resp
+    }
+
+    private fun extractResultsArray(body: String, configuredPath: String? = null): JsonArray {
         val root = json.parseToJsonElement(body)
+        if (!configuredPath.isNullOrBlank()) {
+            val extracted = JsonPathExtractor.extractArray(root, configuredPath)
+            if (extracted.isNotEmpty()) return JsonArray(extracted)
+        }
         if (root is JsonArray) return root
         val obj = root.jsonObject
         val data = obj["data"]
@@ -296,7 +404,7 @@ class JioSaavnProvider(
             ?.firstOrNull()?.let { it as? JsonObject }?.str("url")
         val albumObj = obj["album"] as? JsonObject
         val albumName = decodeHtmlEntities(
-            albumObj?.str("name") ?: obj.str("album").takeIf { !it.isNullOrBlank() } ?: "JioSaavn"
+            albumObj?.str("name") ?: obj.str("album").takeIf { !it.isNullOrBlank() } ?: displayName
         )
         val albumUrl = albumObj?.str("url")
         val durationSec = parseFlexibleLong(obj["duration"])
@@ -308,10 +416,10 @@ class JioSaavnProvider(
         }
 
         return OnlineTrack(
-            id = OnlineTrack.canonicalId(OnlineProviderType.JIOSAAVN, id),
+            id = OnlineTrack.canonicalId(providerId, id),
             sourceId = id,
             providerType = OnlineProviderType.JIOSAAVN,
-            providerLabel = OnlineProviderType.JIOSAAVN.displayName,
+            providerLabel = displayName,
             sourceUrl = sourceUrl,
             title = title,
             artist = artist,
@@ -323,7 +431,8 @@ class JioSaavnProvider(
             thumbnailUrl = thumb,
             viewCount = parseFlexibleLong(obj["playCount"]),
             publishedText = obj.str("year").orEmpty(),
-            isLive = false
+            isLive = false,
+            providerId = providerId
         )
     }
 
@@ -332,11 +441,12 @@ class JioSaavnProvider(
         return OnlineAlbumSummary(
             id = id,
             title = decodeHtmlEntities(obj.str("name") ?: obj.str("title") ?: "Album"),
-            artist = decodeHtmlEntities(extractPrimaryArtists(obj).ifBlank { "JioSaavn" }),
+            artist = decodeHtmlEntities(extractPrimaryArtists(obj).ifBlank { displayName }),
             url = obj.str("url") ?: id,
             thumbnailUrl = pickBestImageUrl(obj["image"]),
             trackCount = obj.int("songCount") ?: 0,
-            providerType = OnlineProviderType.JIOSAAVN
+            providerType = OnlineProviderType.JIOSAAVN,
+            providerId = providerId
         )
     }
 
@@ -348,7 +458,8 @@ class JioSaavnProvider(
             url = obj.str("url") ?: id,
             thumbnailUrl = pickBestImageUrl(obj["image"]),
             subscriberText = obj.str("role").orEmpty(),
-            providerType = OnlineProviderType.JIOSAAVN
+            providerType = OnlineProviderType.JIOSAAVN,
+            providerId = providerId
         )
     }
 
@@ -356,7 +467,9 @@ class JioSaavnProvider(
         val arr = el as? JsonArray ?: return emptyList()
         return arr.mapNotNull { item ->
             val obj = item as? JsonObject ?: return@mapNotNull null
-            val url = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("url") ?: obj.str("link"))
+            val rawUrl = obj.str("url") ?: obj.str("link")
+            val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
+            val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
                 ?: return@mapNotNull null
             val qualityStr = obj.str("quality").orEmpty()
             val kbps = Regex("""(\d+)""").find(qualityStr)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 160
@@ -399,18 +512,6 @@ class JioSaavnProvider(
         return prim.contentOrNull?.trim()?.toLongOrNull() ?: 0L
     }
 
-    private fun decodeHtmlEntities(input: String): String {
-        return input
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
-            .replace("&#039;", "'")
-            .replace("&#39;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .trim()
-    }
-
-    companion object {
-        private const val INSTANCE_COOLDOWN_MS = 90_000L
-    }
+    private fun decodeHtmlEntities(input: String): String =
+        JsonPathExtractor.decodeHtmlEntities(input).trim()
 }

@@ -1,6 +1,7 @@
 package app.nocturne.player.data.online
 
 import android.net.Uri
+import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -12,10 +13,10 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -24,27 +25,41 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.io.IOException
-import java.util.concurrent.ConcurrentHashMap
 
 class PipedProvider(
     private val client: OkHttpClient = OnlineHttpClient.client,
     private val baseUrlsOverride: List<String>? = null,
-    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null
+    private val dynamicBaseUrlsProvider: (() -> List<String>)? = null,
+    private val healthTracker: ProviderHealthTracker = ProviderHealthTracker(),
+    private val dynamicConfigProvider: (() -> DynamicProviderConfig?)? = null,
+    executorOverride: DynamicHttpExecutor? = null
 ) : OnlineMusicProvider {
 
     override val providerType: OnlineProviderType = OnlineProviderType.PIPED
+    override val providerId: String
+        get() = currentConfig()?.id ?: "piped"
+    override val displayName: String
+        get() = currentConfig()?.displayName ?: OnlineProviderType.PIPED.displayName
     override val supportsPagination: Boolean = true
 
     private val json = Json { ignoreUnknownKeys = true }
-    private val discoveryMutex = Mutex()
-    private var discoveredInstances: List<String> = emptyList()
-    private var lastDiscoveryAtMs: Long = 0L
-    private val instanceCooldowns = ConcurrentHashMap<String, Long>()
+    private val executor: DynamicHttpExecutor = executorOverride ?: DynamicHttpExecutor(
+        baseClient = client,
+        healthTracker = healthTracker,
+        allowLoopbackForTests = baseUrlsOverride != null
+    )
+
     @Volatile
     var lastWorkingInstance: String? = null
         private set
+
+    override fun currentConfig(): DynamicProviderConfig? = dynamicConfigProvider?.invoke()
+
+    override fun supportsCapability(capability: String): Boolean =
+        currentConfig()?.supportsCapability(capability) ?: true
+
+    override fun activeEndpointFor(operation: OperationType): String? =
+        healthTracker.activeEndpointFor(providerId, operation) ?: lastWorkingInstance
 
     override suspend fun search(
         query: String,
@@ -65,8 +80,8 @@ class PipedProvider(
             "/nextpage/search?nextpage=${Uri.encode(pageToken.take(512))}&q=$encodedQ&filter=$filterParam"
         }
 
-        val body = executeWithInstanceFallback(path)
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.SEARCH, path)
+        val obj = json.parseToJsonElement(resp.body).jsonObject
         val items = obj["items"]?.jsonArray.orEmpty()
 
         val tracks = mutableListOf<OnlineTrack>()
@@ -90,20 +105,22 @@ class PipedProvider(
             albums = albums,
             nextPageToken = nextToken,
             hasMore = nextToken != null,
-            providerUsed = OnlineProviderType.PIPED
+            providerUsed = OnlineProviderType.PIPED,
+            providerUsedId = providerId,
+            providerUsedLabel = displayName
         )
     }
 
     override suspend fun suggestions(query: String): List<String> = withContext(Dispatchers.IO) {
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (safeQuery.isBlank()) return@withContext emptyList()
-        val body = executeWithInstanceFallback("/suggestions?query=${Uri.encode(safeQuery)}")
-        json.parseToJsonElement(body).jsonArray.mapNotNull { it.jsonPrimitive.contentOrNull }
+        val resp = executeRawWithFallback(OperationType.SEARCH, "/suggestions?query=${Uri.encode(safeQuery)}")
+        json.parseToJsonElement(resp.body).jsonArray.mapNotNull { it.jsonPrimitive.contentOrNull }
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
-        val body = executeWithInstanceFallback("/trending?region=US")
-        val arr = json.parseToJsonElement(body).jsonArray
+        val resp = executeRawWithFallback(OperationType.SEARCH, "/trending?region=US")
+        val arr = json.parseToJsonElement(resp.body).jsonArray
         arr.mapNotNull { parseStreamItem(it.jsonObject) }
     }
 
@@ -113,13 +130,15 @@ class PipedProvider(
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Piped video ID")
-        val body = executeWithInstanceFallback("/streams/${Uri.encode(videoId)}")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.PLAYBACK, "/streams/${Uri.encode(videoId)}")
+        val obj = json.parseToJsonElement(resp.body).jsonObject
 
         val rawStreams = obj["audioStreams"]?.jsonArray.orEmpty()
         val streams = rawStreams.mapNotNull { el ->
             val st = el.jsonObject
-            val url = InputAndUrlSecurity.validateRemoteHttpsUrl(st.str("url"))
+            val rawUrl = st.str("url")
+            val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
+            val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
                 ?: return@mapNotNull null
             val bps = st.int("bitrate") ?: 128_000
             val kbps = if (bps > 1000) bps / 1000 else bps
@@ -136,8 +155,12 @@ class PipedProvider(
             )
         }
 
-        val selected = StreamQualitySelector.selectBestAudioStream(streams, speedTier)
-            ?: throw IllegalStateException("No playable audio streams returned by Piped")
+        val allowedOrigin = resp.endpointUrl.takeIf { baseUrlsOverride != null }
+        val selected = StreamQualitySelector.selectBestAudioStream(
+            streams = streams,
+            speedTier = speedTier,
+            allowedLoopbackOrigin = allowedOrigin
+        ) ?: throw IllegalStateException("No playable audio streams returned by $displayName")
 
         val title = obj.str("title") ?: track.title
         val uploader = obj.str("uploader") ?: track.artist
@@ -160,15 +183,17 @@ class PipedProvider(
             streams = streams,
             selectedStream = selected,
             relatedTracks = related,
-            resolvedBy = OnlineProviderType.PIPED
+            resolvedBy = OnlineProviderType.PIPED,
+            resolvedByProviderId = providerId,
+            resolvedByLabel = displayName
         )
     }
 
     override suspend fun fetchArtist(artistIdOrUrl: String): OnlineArtistPage = withContext(Dispatchers.IO) {
         val channelId = InputAndUrlSecurity.sanitizePathSegment(extractChannelId(artistIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Piped channel ID")
-        val body = executeWithInstanceFallback("/channel/${Uri.encode(channelId)}")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.METADATA, "/channel/${Uri.encode(channelId)}")
+        val obj = json.parseToJsonElement(resp.body).jsonObject
         val tracks = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
             parseStreamItem(it.jsonObject)
         }
@@ -184,15 +209,16 @@ class PipedProvider(
             description = obj.str("description").orEmpty(),
             tracks = tracks,
             playlists = emptyList(),
-            providerType = OnlineProviderType.PIPED
+            providerType = OnlineProviderType.PIPED,
+            providerId = providerId
         )
     }
 
     override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val playlistId = InputAndUrlSecurity.sanitizePathSegment(extractPlaylistId(albumIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Piped playlist ID")
-        val body = executeWithInstanceFallback("/playlists/${Uri.encode(playlistId)}")
-        val obj = json.parseToJsonElement(body).jsonObject
+        val resp = executeRawWithFallback(OperationType.METADATA, "/playlists/${Uri.encode(playlistId)}")
+        val obj = json.parseToJsonElement(resp.body).jsonObject
         val tracks = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
             parseStreamItem(it.jsonObject)
         }
@@ -200,87 +226,58 @@ class PipedProvider(
         OnlineAlbumPage(
             id = playlistId,
             title = obj.str("name") ?: "Playlist",
-            artist = obj.str("uploader") ?: "Piped",
+            artist = obj.str("uploader") ?: displayName,
             url = "https://www.youtube.com/playlist?list=${Uri.encode(playlistId)}",
             thumbnailUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl"))
                 ?: tracks.firstOrNull()?.thumbnailUrl,
             description = obj.str("description").orEmpty(),
             tracks = tracks,
-            providerType = OnlineProviderType.PIPED
+            providerType = OnlineProviderType.PIPED,
+            providerId = providerId
         )
     }
 
-    private suspend fun getCandidateInstances(): List<String> {
-        if (baseUrlsOverride != null) {
-            return baseUrlsOverride.mapNotNull {
-                InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = true)
-            }
-        }
-        val remoteConfigured = dynamicBaseUrlsProvider?.invoke().orEmpty()
-            .mapNotNull { InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = false) }
-        discoveryMutex.withLock {
-            val now = System.currentTimeMillis()
-            if (discoveredInstances.isEmpty() || now - lastDiscoveryAtMs > DISCOVERY_TTL_MS) {
-                val fresh = runCatching { fetchInstancesFromRegistry() }.getOrDefault(emptyList())
-                discoveredInstances = (remoteConfigured + fresh + DEFAULT_INSTANCES).distinct()
-                lastDiscoveryAtMs = now
-            }
-        }
-        val combined = (remoteConfigured + discoveredInstances).distinct()
-        val now = System.currentTimeMillis()
-        val ready = combined.filter { (instanceCooldowns[it] ?: 0L) <= now }
-        return ready.ifEmpty { combined }
-    }
-
-    private fun fetchInstancesFromRegistry(): List<String> {
-        val req = Request.Builder()
-            .url("https://raw.githubusercontent.com/TeamPiped/piped-instances/main/instances.json")
-            .header("User-Agent", OnlineHttpClient.USER_AGENT)
-            .build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return emptyList()
-            val body = InputAndUrlSecurity.readBodyBounded(resp.body, 1024L * 1024L)
-            val arr = json.parseToJsonElement(body).jsonArray
-            return arr.mapNotNull { el ->
-                val obj = el.jsonObject
-                val apiUrl = obj.str("api_url")
-                val up = obj.bool("up_to_date") ?: true
-                if (!up) null else InputAndUrlSecurity.validateRemoteBaseUrl(apiUrl, allowLoopback = false)
-            }.take(10)
-        }
-    }
-
-    private suspend fun executeWithInstanceFallback(path: String): String {
-        val candidates = getCandidateInstances()
-        var lastErr: Throwable? = null
-        for (base in candidates) {
-            val cleanBase = base.trimEnd('/')
-            val url = "$cleanBase$path"
-            try {
-                val req = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", OnlineHttpClient.USER_AGENT)
-                    .header("Accept", "application/json")
-                    .build()
-                client.newCall(req).execute().use { resp ->
-                    if (!resp.isSuccessful) {
-                        throw IOException("HTTP ${resp.code} from $cleanBase")
-                    }
-                    val body = InputAndUrlSecurity.readBodyBounded(resp.body)
-                    val trimmed = body.trimStart()
-                    if (trimmed.isBlank() || trimmed.startsWith("<")) {
-                        throw IOException("Invalid JSON payload from $cleanBase")
-                    }
-                    lastWorkingInstance = cleanBase
-                    instanceCooldowns.remove(cleanBase)
-                    return body
+    private fun getEndpointConfigs(operation: OperationType): List<ProviderEndpointConfig> {
+        val baseList = when {
+            baseUrlsOverride != null -> baseUrlsOverride.mapIndexedNotNull { idx, raw ->
+                InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = true)?.let { clean ->
+                    ProviderEndpointConfig(url = clean, priority = idx + 1)
                 }
-            } catch (t: Throwable) {
-                lastErr = t
-                instanceCooldowns[cleanBase] = System.currentTimeMillis() + INSTANCE_COOLDOWN_MS
             }
+            currentConfig() != null -> currentConfig()!!.endpointsFor(operation)
+            else -> dynamicBaseUrlsProvider?.invoke().orEmpty()
+                .mapIndexedNotNull { idx, raw ->
+                    InputAndUrlSecurity.validateRemoteBaseUrl(raw, allowLoopback = false)?.let { clean ->
+                        ProviderEndpointConfig(url = clean, priority = idx + 1)
+                    }
+                }
+                .distinctBy { it.url }
         }
-        throw lastErr ?: IOException("All Piped instances unavailable")
+        val stickyForOp = healthTracker.activeEndpointFor(providerId, operation)
+        val preferred = if (stickyForOp == null) lastWorkingInstance else null
+        return if (preferred != null && baseList.any { it.url == preferred }) {
+            val reordered = listOf(baseList.first { it.url == preferred }) + baseList.filterNot { it.url == preferred }
+            reordered.mapIndexed { idx, ep -> ep.copy(priority = idx + 1) }
+        } else {
+            baseList
+        }
+    }
+
+    private suspend fun executeRawWithFallback(operation: OperationType, path: String): ExecutedHttpResponse {
+        val endpoints = getEndpointConfigs(operation)
+        val cfg = currentConfig()
+        val resp = executor.executeRawGet(
+            providerId = providerId,
+            operation = operation,
+            configuredEndpoints = endpoints,
+            pathAndQuery = path,
+            headers = cfg?.headers ?: emptyMap(),
+            timeoutMs = cfg?.timeoutMs ?: 10_000L,
+            maxRetries = cfg?.maxRetries ?: 1,
+            cooldownMs = cfg?.cooldownMs ?: 60_000L
+        )
+        lastWorkingInstance = resp.endpointUrl
+        return resp
     }
 
     private fun parseStreamItem(obj: JsonObject): OnlineTrack? {
@@ -294,18 +291,19 @@ class PipedProvider(
             id = OnlineTrack.canonicalId(OnlineProviderType.YOUTUBE, id),
             sourceId = id,
             providerType = OnlineProviderType.PIPED,
-            providerLabel = OnlineProviderType.PIPED.displayName,
+            providerLabel = displayName,
             sourceUrl = "https://www.youtube.com/watch?v=$id",
             title = obj.str("title") ?: "Untitled",
             artist = obj.str("uploaderName") ?: "YouTube",
             artistId = uploaderUrl?.substringAfter("/channel/")?.substringBefore("/"),
             artistUrl = uploaderUrl,
-            album = "YouTube · Piped",
+            album = "YouTube · $displayName",
             durationMs = if (durationSec > 0L) durationSec * 1000L else 0L,
             thumbnailUrl = safeThumb,
             viewCount = obj.long("views") ?: 0L,
             publishedText = obj.str("uploadedDate").orEmpty(),
-            isLive = durationSec < 0L
+            isLive = durationSec < 0L,
+            providerId = providerId
         )
     }
 
@@ -318,7 +316,8 @@ class PipedProvider(
             url = fullUrl,
             thumbnailUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnail")),
             subscriberText = obj.long("subscribers")?.takeIf { it > 0L }?.let { "${it / 1000}K" }.orEmpty(),
-            providerType = OnlineProviderType.PIPED
+            providerType = OnlineProviderType.PIPED,
+            providerId = providerId
         )
     }
 
@@ -332,7 +331,8 @@ class PipedProvider(
             url = fullUrl,
             thumbnailUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnail")),
             trackCount = obj.int("videos") ?: 0,
-            providerType = OnlineProviderType.PIPED
+            providerType = OnlineProviderType.PIPED,
+            providerId = providerId
         )
     }
 
@@ -367,18 +367,5 @@ class PipedProvider(
         return runCatching {
             Uri.parse(normalizeYoutubeUrl(idOrUrl)).getQueryParameter("list")?.takeIf { it.isNotBlank() }
         }.getOrNull() ?: idOrUrl
-    }
-
-    companion object {
-        private const val DISCOVERY_TTL_MS = 30 * 60_000L
-        private const val INSTANCE_COOLDOWN_MS = 90_000L
-
-        private val DEFAULT_INSTANCES = listOf(
-            "https://pipedapi.kavin.rocks",
-            "https://pipedapi.adminforge.de",
-            "https://pipedapi.r4fo.com",
-            "https://api.piped.private.coffee",
-            "https://pipedapi.darkness.services"
-        )
     }
 }

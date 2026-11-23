@@ -1,9 +1,9 @@
 package app.nocturne.player.data.online
 
 import android.content.Context
+import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
-import app.nocturne.player.data.model.OnlineAlbumSummary
 import app.nocturne.player.data.model.OnlineArtistPage
 import app.nocturne.player.data.model.OnlineArtistSummary
 import app.nocturne.player.data.model.OnlineProviderType
@@ -11,20 +11,28 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.ProviderConnectivityTestResult
+import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.ProviderHealthSnapshot
+import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.prefs.SettingsRepository
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
 import java.io.IOException
 import java.util.ArrayDeque
 import kotlin.math.abs
 
 class OnlineProviderManager(
-    private val providers: Map<OnlineProviderType, OnlineMusicProvider>,
+    private val providers: Map<OnlineProviderType, OnlineMusicProvider>? = null,
     private val healthTracker: ProviderHealthTracker = ProviderHealthTracker(),
     private val streamCache: StreamResolutionCache = StreamResolutionCache(),
-    private val networkMonitor: NetworkMonitor? = null
+    private val networkMonitor: NetworkMonitor? = null,
+    private val remoteConfigRepository: RemoteConfigRepository? = null,
+    private val httpClient: OkHttpClient = OnlineHttpClient.client,
+    private val allowLoopbackForTests: Boolean = false
 ) {
     constructor(
         context: Context,
@@ -32,34 +40,170 @@ class OnlineProviderManager(
             SettingsRepository(context.applicationContext)
         )
     ) : this(
-        providers = mapOf(
-            OnlineProviderType.JIOSAAVN to JioSaavnProvider(
-                dynamicBaseUrlsProvider = { remoteConfigRepository.jiosaavnEndpoints() }
-            ),
-            OnlineProviderType.YOUTUBE to NewPipeProvider(OnlineProviderType.YOUTUBE),
-            OnlineProviderType.PIPED to PipedProvider(
-                dynamicBaseUrlsProvider = { remoteConfigRepository.pipedEndpoints() }
-            ),
-            OnlineProviderType.INVIDIOUS to InvidiousProvider(
-                dynamicBaseUrlsProvider = { remoteConfigRepository.invidiousEndpoints() }
-            ),
-            OnlineProviderType.AUDIUS to AudiusProvider(),
-            OnlineProviderType.SOUNDCLOUD to NewPipeProvider(OnlineProviderType.SOUNDCLOUD),
-            OnlineProviderType.BANDCAMP to NewPipeProvider(OnlineProviderType.BANDCAMP)
-        ),
+        providers = null,
         healthTracker = ProviderHealthTracker(),
         streamCache = StreamResolutionCache(),
-        networkMonitor = NetworkMonitor(context.applicationContext)
+        networkMonitor = NetworkMonitor(context.applicationContext),
+        remoteConfigRepository = remoteConfigRepository,
+        httpClient = OnlineHttpClient.client,
+        allowLoopbackForTests = false
     )
+
+    constructor(
+        remoteConfigRepository: RemoteConfigRepository,
+        httpClient: OkHttpClient = OnlineHttpClient.client,
+        allowLoopbackForTests: Boolean = false,
+        healthTracker: ProviderHealthTracker = ProviderHealthTracker()
+    ) : this(
+        providers = null,
+        healthTracker = healthTracker,
+        streamCache = StreamResolutionCache(),
+        networkMonitor = null,
+        remoteConfigRepository = remoteConfigRepository,
+        httpClient = httpClient,
+        allowLoopbackForTests = allowLoopbackForTests
+    )
+
+    private val sharedExecutor = DynamicHttpExecutor(
+        baseClient = httpClient,
+        healthTracker = healthTracker,
+        allowLoopbackForTests = allowLoopbackForTests
+    )
+
+    private val registryLock = Any()
+    private var cachedConfigSnapshot: RemoteProvidersConfig? = null
+    private var dynamicAdapters: Map<String, OnlineMusicProvider> = emptyMap()
+
+    private suspend fun ensureDynamicRegistryReady(): Map<String, OnlineMusicProvider> {
+        if (providers != null) {
+            return providers.entries.associate { (_, adapter) ->
+                adapter.providerId.lowercase() to adapter
+            }
+        }
+        val repo = remoteConfigRepository ?: return emptyMap()
+        if (repo.activeConfig.value.providers.isEmpty()) {
+            repo.refreshNow(force = false)
+        } else {
+            repo.triggerStartupRefreshIfNeeded()
+        }
+        return currentAdaptersSnapshot()
+    }
+
+    private fun currentAdaptersSnapshot(): Map<String, OnlineMusicProvider> {
+        if (providers != null) {
+            return providers.entries.associate { (type, adapter) ->
+                (adapter.providerId.ifBlank { type.defaultProviderId() }).lowercase() to adapter
+            }
+        }
+        val repo = remoteConfigRepository ?: return emptyMap()
+        val cfg = repo.activeConfig.value
+        synchronized(registryLock) {
+            if (cachedConfigSnapshot === cfg && dynamicAdapters.isNotEmpty()) {
+                return dynamicAdapters
+            }
+            val built = linkedMapOf<String, OnlineMusicProvider>()
+            for (providerCfg in cfg.enabledProviders()) {
+                built[providerCfg.id.lowercase()] = instantiateAdapter(providerCfg, repo)
+            }
+            cachedConfigSnapshot = cfg
+            dynamicAdapters = built
+            return built
+        }
+    }
+
+    private fun instantiateAdapter(
+        providerCfg: DynamicProviderConfig,
+        repo: RemoteConfigRepository
+    ): OnlineMusicProvider {
+        val id = providerCfg.id.lowercase()
+        val configLookup: () -> DynamicProviderConfig? = {
+            repo.activeConfig.value.providerById(id)
+        }
+        val endpointsLookup: () -> List<String> = {
+            repo.activeConfig.value.endpointsForProvider(id)
+        }
+        return when (providerCfg.adapterType.lowercase()) {
+            "jiosaavn" -> JioSaavnProvider(
+                client = httpClient,
+                baseUrlsOverride = endpointsLookup().takeIf { allowLoopbackForTests },
+                dynamicBaseUrlsProvider = endpointsLookup,
+                healthTracker = healthTracker,
+                dynamicConfigProvider = configLookup,
+                executorOverride = sharedExecutor
+            )
+            "piped" -> PipedProvider(
+                client = httpClient,
+                baseUrlsOverride = endpointsLookup().takeIf { allowLoopbackForTests },
+                dynamicBaseUrlsProvider = endpointsLookup,
+                healthTracker = healthTracker,
+                dynamicConfigProvider = configLookup,
+                executorOverride = sharedExecutor
+            )
+            "invidious" -> InvidiousProvider(
+                client = httpClient,
+                baseUrlsOverride = endpointsLookup().takeIf { allowLoopbackForTests },
+                dynamicBaseUrlsProvider = endpointsLookup,
+                healthTracker = healthTracker,
+                dynamicConfigProvider = configLookup,
+                executorOverride = sharedExecutor
+            )
+            "audius" -> AudiusProvider(
+                client = httpClient,
+                baseUrlsOverride = endpointsLookup().takeIf { allowLoopbackForTests },
+                dynamicBaseUrlsProvider = endpointsLookup,
+                healthTracker = healthTracker,
+                dynamicConfigProvider = configLookup,
+                executorOverride = sharedExecutor
+            )
+            "newpipe" -> {
+                val pType = OnlineProviderType.fromProviderId(id).let {
+                    if (it == OnlineProviderType.DYNAMIC) OnlineProviderType.YOUTUBE else it
+                }
+                NewPipeProvider(
+                    providerType = pType,
+                    dynamicConfigProvider = configLookup
+                )
+            }
+            else -> DynamicApiProvider(
+                configProvider = { configLookup() ?: providerCfg },
+                executor = sharedExecutor,
+                healthTracker = healthTracker,
+                allowLoopbackForTests = allowLoopbackForTests
+            )
+        }
+    }
 
     fun currentSpeedTier(): NetworkSpeedTier =
         networkMonitor?.currentSpeedTier() ?: NetworkSpeedTier.STANDARD
 
-    fun getHealthSnapshots(): List<ProviderHealthSnapshot> =
-        healthTracker.snapshotAll(providers.keys.toList())
+    fun getHealthSnapshots(): List<ProviderHealthSnapshot> {
+        val adapters = currentAdaptersSnapshot()
+        val types = adapters.values.map { it.providerType }.distinct()
+        return healthTracker.snapshotAll(types)
+    }
 
-    fun recordStreamFailure(providerType: OnlineProviderType) {
-        healthTracker.recordFailure(providerType)
+    fun getProviderDiagnostics(): List<ProviderDiagnosticsSnapshot> {
+        val repo = remoteConfigRepository
+        if (repo != null) {
+            val cfg = repo.activeConfig.value
+            return cfg.providers.sortedBy { it.priority }.map { providerCfg ->
+                healthTracker.diagnosticsForProvider(providerCfg)
+            }
+        }
+        return currentAdaptersSnapshot().values.mapIndexed { idx, adapter ->
+            val fallbackCfg = adapter.currentConfig() ?: DynamicProviderConfig(
+                id = adapter.providerId,
+                displayName = adapter.displayName,
+                adapterType = adapter.providerType.defaultProviderId(),
+                priority = idx + 1
+            )
+            healthTracker.diagnosticsForProvider(fallbackCfg)
+        }
+    }
+
+    fun recordStreamFailure(providerType: OnlineProviderType, providerId: String? = null) {
+        val id = providerId?.lowercase() ?: providerType.defaultProviderId()
+        healthTracker.recordProviderFailure(id, "Playback stream open failed")
     }
 
     private val requestTimestampsMs = ArrayDeque<Long>()
@@ -81,99 +225,52 @@ class OnlineProviderManager(
         query: String,
         filter: OnlineSearchFilter = OnlineSearchFilter.ALL,
         pageToken: String? = null,
-        preferredProvider: OnlineProviderType? = null
+        preferredProvider: OnlineProviderType? = null,
+        preferredProviderId: String? = null
     ): OnlineSearchPage = withContext(Dispatchers.IO) {
         val cleanQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         require(cleanQuery.isNotBlank()) { "Query cannot be blank" }
         enforceRateLimit()
+
+        val adapters = ensureDynamicRegistryReady()
         val explicitCompilation = isExplicitCompilationQuery(cleanQuery)
         val applySingleTrackFilter =
             (filter == OnlineSearchFilter.ALL || filter == OnlineSearchFilter.SONGS) && !explicitCompilation
 
-        val candidateOrder = if (pageToken != null && preferredProvider != null) {
-            listOf(preferredProvider)
-        } else {
-            when (filter) {
-                OnlineSearchFilter.JIOSAAVN -> listOf(OnlineProviderType.JIOSAAVN)
-                OnlineSearchFilter.AUDIUS -> listOf(OnlineProviderType.AUDIUS)
-                OnlineSearchFilter.SOUNDCLOUD -> listOf(OnlineProviderType.SOUNDCLOUD)
-                OnlineSearchFilter.BANDCAMP -> listOf(OnlineProviderType.BANDCAMP)
-                OnlineSearchFilter.ARTISTS, OnlineSearchFilter.ALBUMS ->
-                    healthTracker.selectOrderedCandidates(
-                        listOf(
-                            OnlineProviderType.JIOSAAVN,
-                            OnlineProviderType.AUDIUS,
-                            OnlineProviderType.YOUTUBE,
-                            OnlineProviderType.PIPED,
-                            OnlineProviderType.INVIDIOUS,
-                            OnlineProviderType.SOUNDCLOUD
-                        )
-                    )
-                OnlineSearchFilter.SONGS ->
-                    healthTracker.selectOrderedCandidates(
-                        if (explicitCompilation) {
-                            listOf(
-                                OnlineProviderType.YOUTUBE,
-                                OnlineProviderType.PIPED,
-                                OnlineProviderType.INVIDIOUS,
-                                OnlineProviderType.SOUNDCLOUD,
-                                OnlineProviderType.JIOSAAVN,
-                                OnlineProviderType.AUDIUS
-                            )
-                        } else {
-                            listOf(
-                                OnlineProviderType.JIOSAAVN,
-                                OnlineProviderType.AUDIUS,
-                                OnlineProviderType.YOUTUBE,
-                                OnlineProviderType.PIPED,
-                                OnlineProviderType.INVIDIOUS,
-                                OnlineProviderType.SOUNDCLOUD
-                            )
-                        }
-                    )
-                OnlineSearchFilter.ALL ->
-                    healthTracker.selectOrderedCandidates(
-                        if (explicitCompilation) {
-                            listOf(
-                                OnlineProviderType.YOUTUBE,
-                                OnlineProviderType.PIPED,
-                                OnlineProviderType.INVIDIOUS,
-                                OnlineProviderType.SOUNDCLOUD,
-                                OnlineProviderType.BANDCAMP,
-                                OnlineProviderType.JIOSAAVN,
-                                OnlineProviderType.AUDIUS
-                            )
-                        } else {
-                            listOf(
-                                OnlineProviderType.JIOSAAVN,
-                                OnlineProviderType.AUDIUS,
-                                OnlineProviderType.YOUTUBE,
-                                OnlineProviderType.PIPED,
-                                OnlineProviderType.INVIDIOUS,
-                                OnlineProviderType.SOUNDCLOUD,
-                                OnlineProviderType.BANDCAMP
-                            )
-                        }
-                    )
-            }
-        }
+        val candidateIds = selectSearchProviderOrder(
+            adapters = adapters,
+            filter = filter,
+            explicitCompilation = explicitCompilation,
+            preferredProviderId = preferredProviderId ?: preferredProvider?.defaultProviderId(),
+            hasPageToken = pageToken != null
+        )
 
         var lastError: Throwable? = null
         var firstFilteredEmptyPage: OnlineSearchPage? = null
-        for (providerType in candidateOrder) {
-            val adapter = providers[providerType] ?: continue
+
+        for (pid in candidateIds) {
+            val adapter = adapters[pid] ?: continue
             val startMs = System.currentTimeMillis()
             try {
                 val page = adapter.search(cleanQuery, filter, pageToken)
                 val elapsed = System.currentTimeMillis() - startMs
-                healthTracker.recordSuccess(providerType, elapsed, activeInstanceUrlOf(adapter))
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = elapsed,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.SEARCH),
+                    operation = OperationType.SEARCH
+                )
                 val deduped = deduplicateTracks(page.tracks)
                 val finalTracks = if (applySingleTrackFilter) {
                     filterSingleSongs(deduped, query = cleanQuery)
                 } else {
                     deduped
                 }
-                val resolvedPage = page.copy(tracks = finalTracks)
+                val resolvedPage = page.copy(
+                    tracks = finalTracks,
+                    providerUsedId = pid,
+                    providerUsedLabel = adapter.displayName
+                )
                 if (finalTracks.isNotEmpty() || page.artists.isNotEmpty() || page.albums.isNotEmpty() || pageToken != null) {
                     return@withContext resolvedPage
                 }
@@ -182,9 +279,10 @@ class OnlineProviderManager(
                 }
             } catch (t: Throwable) {
                 lastError = t
-                healthTracker.recordFailure(providerType)
+                healthTracker.recordProviderFailure(pid, t.message)
             }
         }
+
         if (firstFilteredEmptyPage != null) {
             return@withContext firstFilteredEmptyPage
         }
@@ -195,57 +293,51 @@ class OnlineProviderManager(
         val clean = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (clean.length < 2) return@withContext emptyList()
         enforceRateLimit()
-        val ordered = healthTracker.selectOrderedCandidates(
-            listOf(
-                OnlineProviderType.YOUTUBE,
-                OnlineProviderType.JIOSAAVN,
-                OnlineProviderType.PIPED,
-                OnlineProviderType.INVIDIOUS,
-                OnlineProviderType.AUDIUS,
-                OnlineProviderType.SOUNDCLOUD
-            )
-        )
-        for (providerType in ordered) {
-            val adapter = providers[providerType] ?: continue
+        val adapters = ensureDynamicRegistryReady()
+        val orderedIds = selectOrderedIdsByCapability(adapters, "suggestions")
+        for (pid in orderedIds) {
+            val adapter = adapters[pid] ?: continue
             val start = System.currentTimeMillis()
             try {
                 val list = adapter.suggestions(clean)
-                healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.SEARCH),
+                    operation = OperationType.SEARCH
+                )
                 if (list.isNotEmpty()) return@withContext list.distinct().take(10)
-            } catch (_: Throwable) {
-                healthTracker.recordFailure(providerType)
+            } catch (t: Throwable) {
+                healthTracker.recordProviderFailure(pid, t.message)
             }
         }
         emptyList()
     }
 
     suspend fun trending(): Pair<List<OnlineTrack>, OnlineProviderType?> = withContext(Dispatchers.IO) {
-        val ordered = healthTracker.selectOrderedCandidates(
-            listOf(
-                OnlineProviderType.JIOSAAVN,
-                OnlineProviderType.AUDIUS,
-                OnlineProviderType.PIPED,
-                OnlineProviderType.INVIDIOUS,
-                OnlineProviderType.YOUTUBE,
-                OnlineProviderType.SOUNDCLOUD
-            )
-        )
+        val adapters = ensureDynamicRegistryReady()
+        val orderedIds = selectOrderedIdsByCapability(adapters, "trending")
         var lastError: Throwable? = null
-        for (providerType in ordered) {
-            val adapter = providers[providerType] ?: continue
+        for (pid in orderedIds) {
+            val adapter = adapters[pid] ?: continue
             val start = System.currentTimeMillis()
             try {
                 val tracks = filterSingleSongs(
                     tracks = deduplicateTracks(adapter.trending()),
                     forceFilter = true
                 )
-                healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.SEARCH),
+                    operation = OperationType.SEARCH
+                )
                 if (tracks.isNotEmpty()) {
-                    return@withContext tracks to providerType
+                    return@withContext tracks to adapter.providerType
                 }
             } catch (t: Throwable) {
                 lastError = t
-                healthTracker.recordFailure(providerType)
+                healthTracker.recordProviderFailure(pid, t.message)
             }
         }
         throw lastError ?: IllegalStateException("Unable to load trending music from any provider")
@@ -258,31 +350,19 @@ class OnlineProviderManager(
         val cleanQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         require(cleanQuery.isNotBlank()) { "Discovery query cannot be blank" }
         enforceRateLimit()
-        val baseOrder = if (preferAudiusFirst) {
-            listOf(
-                OnlineProviderType.AUDIUS,
-                OnlineProviderType.JIOSAAVN,
-                OnlineProviderType.PIPED,
-                OnlineProviderType.INVIDIOUS,
-                OnlineProviderType.YOUTUBE,
-                OnlineProviderType.SOUNDCLOUD
-            )
-        } else {
-            listOf(
-                OnlineProviderType.JIOSAAVN,
-                OnlineProviderType.AUDIUS,
-                OnlineProviderType.PIPED,
-                OnlineProviderType.INVIDIOUS,
-                OnlineProviderType.YOUTUBE,
-                OnlineProviderType.SOUNDCLOUD
-            )
+        val adapters = ensureDynamicRegistryReady()
+        val baseIds = selectOrderedIdsByCapability(adapters, "search").let { ids ->
+            if (preferAudiusFirst && "audius" in ids) {
+                listOf("audius") + ids.filterNot { it == "audius" }
+            } else {
+                ids
+            }
         }
-        val ordered = healthTracker.selectOrderedCandidates(baseOrder)
         var lastError: Throwable? = null
         var partialMatch: Pair<List<OnlineTrack>, OnlineProviderType>? = null
 
-        for (providerType in ordered) {
-            val adapter = providers[providerType] ?: continue
+        for (pid in baseIds) {
+            val adapter = adapters[pid] ?: continue
             val start = System.currentTimeMillis()
             try {
                 val page = adapter.search(cleanQuery, OnlineSearchFilter.SONGS, null)
@@ -290,16 +370,21 @@ class OnlineProviderManager(
                     tracks = deduplicateTracks(page.tracks),
                     forceFilter = true
                 )
-                healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.SEARCH),
+                    operation = OperationType.SEARCH
+                )
                 if (filtered.size >= 3) {
-                    return@withContext filtered to providerType
+                    return@withContext filtered to adapter.providerType
                 }
                 if (filtered.isNotEmpty() && partialMatch == null) {
-                    partialMatch = filtered to providerType
+                    partialMatch = filtered to adapter.providerType
                 }
             } catch (t: Throwable) {
                 lastError = t
-                healthTracker.recordFailure(providerType)
+                healthTracker.recordProviderFailure(pid, t.message)
             }
         }
         partialMatch?.let { return@withContext it.first to it.second }
@@ -308,38 +393,36 @@ class OnlineProviderManager(
 
     suspend fun fetchPopularArtists(): Pair<List<OnlineArtistSummary>, OnlineProviderType?> =
         withContext(Dispatchers.IO) {
-            val ordered = healthTracker.selectOrderedCandidates(
-                listOf(
-                    OnlineProviderType.JIOSAAVN,
-                    OnlineProviderType.AUDIUS,
-                    OnlineProviderType.YOUTUBE,
-                    OnlineProviderType.PIPED,
-                    OnlineProviderType.INVIDIOUS
-                )
-            )
+            val adapters = ensureDynamicRegistryReady()
+            val orderedIds = selectOrderedIdsByCapability(adapters, "artist")
             var lastError: Throwable? = null
-            for (providerType in ordered) {
-                val adapter = providers[providerType] ?: continue
+            for (pid in orderedIds) {
+                val adapter = adapters[pid] ?: continue
                 val start = System.currentTimeMillis()
                 try {
-                    val artistQuery = when (providerType) {
+                    val artistQuery = when (adapter.providerType) {
                         OnlineProviderType.JIOSAAVN -> "a"
                         OnlineProviderType.AUDIUS -> "music"
                         else -> "popular music artist"
                     }
                     val page = adapter.search(artistQuery, OnlineSearchFilter.ARTISTS, null)
-                    healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
+                    healthTracker.recordProviderSuccess(
+                        providerId = pid,
+                        latencyMs = System.currentTimeMillis() - start,
+                        instanceUrl = adapter.activeEndpointFor(OperationType.SEARCH),
+                        operation = OperationType.SEARCH
+                    )
                     val artists = page.artists
                         .filter { it.name.isNotBlank() }
                         .distinctBy { it.id }
                         .sortedByDescending { !it.thumbnailUrl.isNullOrBlank() }
                         .take(16)
                     if (artists.isNotEmpty()) {
-                        return@withContext artists to providerType
+                        return@withContext artists to adapter.providerType
                     }
                 } catch (t: Throwable) {
                     lastError = t
-                    healthTracker.recordFailure(providerType)
+                    healthTracker.recordProviderFailure(pid, t.message)
                 }
             }
             if (lastError != null) throw lastError
@@ -352,62 +435,62 @@ class OnlineProviderManager(
     ): OnlineStreamResolution = resolveStream(
         track = track,
         forceRefresh = forceRefresh,
-        excludedProviders = emptySet()
+        excludedProviders = emptySet(),
+        excludedProviderIds = emptySet()
     )
 
     suspend fun resolveStream(
         track: OnlineTrack,
         forceRefresh: Boolean = false,
-        excludedProviders: Set<OnlineProviderType> = emptySet()
+        excludedProviders: Set<OnlineProviderType> = emptySet(),
+        excludedProviderIds: Set<String> = emptySet()
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
-        if (!forceRefresh && excludedProviders.isEmpty()) {
+        val allExcludedIds = (excludedProviderIds.map { it.lowercase() } +
+            excludedProviders.map { it.defaultProviderId() }).toSet()
+
+        if (!forceRefresh && allExcludedIds.isEmpty()) {
             streamCache.getIfValid(track.id)?.let { return@withContext it }
         } else {
             streamCache.invalidate(track.id)
         }
 
+        val adapters = ensureDynamicRegistryReady()
         val speedTier = currentSpeedTier()
-        val nativeCandidates = when (track.providerType) {
-            OnlineProviderType.SOUNDCLOUD -> listOf(OnlineProviderType.SOUNDCLOUD)
-            OnlineProviderType.BANDCAMP -> listOf(OnlineProviderType.BANDCAMP)
-            OnlineProviderType.JIOSAAVN -> listOf(OnlineProviderType.JIOSAAVN)
-            OnlineProviderType.AUDIUS -> listOf(OnlineProviderType.AUDIUS)
-            OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS -> {
-                healthTracker.selectOrderedCandidates(
-                    listOf(
-                        OnlineProviderType.YOUTUBE,
-                        OnlineProviderType.PIPED,
-                        OnlineProviderType.INVIDIOUS
-                    )
-                )
-            }
-        }.filter { it !in excludedProviders }
+        val nativeIds = selectNativePlaybackCandidates(track, adapters)
+            .filter { it !in allExcludedIds }
 
         var lastError: Throwable? = null
-        val tried = excludedProviders.toMutableSet()
+        val triedIds = allExcludedIds.toMutableSet()
 
-        for (providerType in nativeCandidates) {
-            val adapter = providers[providerType] ?: continue
-            tried.add(providerType)
+        for (pid in nativeIds) {
+            val adapter = adapters[pid] ?: continue
+            triedIds.add(pid)
             val start = System.currentTimeMillis()
             try {
                 val resolved = adapter.resolveStream(track, speedTier)
-                if (InputAndUrlSecurity.hasControlChars(resolved.selectedStream.url)) {
-                    throw IOException("Rejected malformed stream URL")
-                }
-                healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
-                streamCache.put(track.id, resolved)
-                return@withContext resolved
+                validateResolvedStreamUrl(resolved.selectedStream.url)
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.PLAYBACK),
+                    operation = OperationType.PLAYBACK
+                )
+                val normalized = resolved.copy(
+                    resolvedByProviderId = resolved.resolvedByProviderId.ifBlank { pid },
+                    resolvedByLabel = resolved.resolvedByLabel.ifBlank { adapter.displayName }
+                )
+                streamCache.put(track.id, normalized)
+                return@withContext normalized
             } catch (t: Throwable) {
                 lastError = t
-                healthTracker.recordFailure(providerType)
+                healthTracker.recordProviderFailure(pid, t.message)
             }
         }
 
-        // Cross-provider failover matching by title + artist when native providers fail or throw 403/429
         val fallbackResolution = resolveCrossProviderMatch(
             track = track,
-            alreadyTried = tried,
+            adapters = adapters,
+            alreadyTriedIds = triedIds,
             speedTier = speedTier
         )
         if (fallbackResolution != null) {
@@ -420,7 +503,8 @@ class OnlineProviderManager(
 
     private suspend fun resolveCrossProviderMatch(
         track: OnlineTrack,
-        alreadyTried: Set<OnlineProviderType>,
+        adapters: Map<String, OnlineMusicProvider>,
+        alreadyTriedIds: Set<String>,
         speedTier: NetworkSpeedTier
     ): OnlineStreamResolution? {
         val cleanTitle = cleanMetadataQuery(track.title)
@@ -433,46 +517,304 @@ class OnlineProviderManager(
         val searchQuery = listOf(cleanTitle, cleanArtist).filter { it.isNotBlank() }.joinToString(" ").trim()
         if (searchQuery.isBlank()) return null
 
-        val fallbackPool = listOf(
-            OnlineProviderType.JIOSAAVN,
-            OnlineProviderType.AUDIUS,
-            OnlineProviderType.PIPED,
-            OnlineProviderType.INVIDIOUS,
-            OnlineProviderType.SOUNDCLOUD,
-            OnlineProviderType.YOUTUBE
-        ).filter { it !in alreadyTried && providers.containsKey(it) }
+        val fallbackIds = adapters.keys
+            .filter { it !in alreadyTriedIds }
+            .filter { pid ->
+                val adapter = adapters[pid] ?: return@filter false
+                adapter.supportsCapability("search") && adapter.supportsCapability("stream")
+            }
 
-        if (fallbackPool.isEmpty()) return null
-        val orderedFallbacks = healthTracker.selectOrderedCandidates(fallbackPool)
+        if (fallbackIds.isEmpty()) return null
+        val orderedFallbacks = healthTracker.selectOrderedProviderIds(fallbackIds)
 
-        for (providerType in orderedFallbacks) {
-            val adapter = providers[providerType] ?: continue
+        for (pid in orderedFallbacks) {
+            val adapter = adapters[pid] ?: continue
             val start = System.currentTimeMillis()
             try {
                 val page = adapter.search(searchQuery, OnlineSearchFilter.SONGS, null)
                 val bestCandidate = pickBestMetadataMatch(track, page.tracks)
                 if (bestCandidate != null) {
                     val resolved = adapter.resolveStream(bestCandidate, speedTier)
-                    healthTracker.recordSuccess(
-                        providerType,
-                        System.currentTimeMillis() - start,
-                        activeInstanceUrlOf(adapter)
+                    validateResolvedStreamUrl(resolved.selectedStream.url)
+                    healthTracker.recordProviderSuccess(
+                        providerId = pid,
+                        latencyMs = System.currentTimeMillis() - start,
+                        instanceUrl = adapter.activeEndpointFor(OperationType.PLAYBACK),
+                        operation = OperationType.PLAYBACK
                     )
-                    // Preserve the queued track's canonical ID so queue/history/favorites stay intact
                     return resolved.copy(
                         track = track.copy(
                             title = track.title.ifBlank { resolved.track.title },
                             artist = track.artist.ifBlank { resolved.track.artist },
                             thumbnailUrl = track.thumbnailUrl ?: resolved.track.thumbnailUrl,
                             durationMs = if (track.durationMs > 0L) track.durationMs else resolved.track.durationMs
-                        )
+                        ),
+                        resolvedByProviderId = resolved.resolvedByProviderId.ifBlank { pid },
+                        resolvedByLabel = resolved.resolvedByLabel.ifBlank { adapter.displayName }
                     )
                 }
-            } catch (_: Throwable) {
-                healthTracker.recordFailure(providerType)
+            } catch (t: Throwable) {
+                healthTracker.recordProviderFailure(pid, t.message)
             }
         }
         return null
+    }
+
+    private fun validateResolvedStreamUrl(url: String) {
+        if (InputAndUrlSecurity.hasControlChars(url)) {
+            throw IOException("Rejected malformed stream URL")
+        }
+        val allowedOrigin = url.takeIf { allowLoopbackForTests || providers != null }
+        if (InputAndUrlSecurity.validateRemoteHttpsUrl(url, allowedOrigin) == null) {
+            throw IOException("Rejected unsafe stream URL")
+        }
+    }
+
+    suspend fun fetchArtist(
+        artistIdOrUrl: String,
+        hintProvider: OnlineProviderType,
+        hintProviderId: String? = null
+    ): OnlineArtistPage = withContext(Dispatchers.IO) {
+        val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(artistIdOrUrl, 300)
+        require(cleanTarget.isNotBlank()) { "Artist identifier cannot be blank" }
+        val adapters = ensureDynamicRegistryReady()
+        val targetId = (hintProviderId ?: hintProvider.defaultProviderId()).lowercase()
+        val candidates = selectMetadataCandidates(targetId, hintProvider, adapters)
+
+        var lastError: Throwable? = null
+        for (pid in candidates) {
+            val adapter = adapters[pid] ?: continue
+            val start = System.currentTimeMillis()
+            try {
+                val page = adapter.fetchArtist(cleanTarget)
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.METADATA),
+                    operation = OperationType.METADATA
+                )
+                return@withContext page.copy(
+                    tracks = deduplicateTracks(page.tracks),
+                    providerId = pid,
+                    providerLabel = page.providerLabel.ifBlank { adapter.displayName }
+                )
+            } catch (t: Throwable) {
+                lastError = t
+                healthTracker.recordProviderFailure(pid, t.message)
+            }
+        }
+        throw lastError ?: IllegalStateException("Could not load artist details")
+    }
+
+    suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        hintProvider: OnlineProviderType,
+        hintProviderId: String? = null
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
+        val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(albumIdOrUrl, 300)
+        require(cleanTarget.isNotBlank()) { "Album or playlist identifier cannot be blank" }
+        val adapters = ensureDynamicRegistryReady()
+        val targetId = (hintProviderId ?: hintProvider.defaultProviderId()).lowercase()
+        val candidates = selectMetadataCandidates(targetId, hintProvider, adapters)
+
+        var lastError: Throwable? = null
+        for (pid in candidates) {
+            val adapter = adapters[pid] ?: continue
+            val start = System.currentTimeMillis()
+            try {
+                val page = adapter.fetchAlbumOrPlaylist(cleanTarget)
+                healthTracker.recordProviderSuccess(
+                    providerId = pid,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = adapter.activeEndpointFor(OperationType.METADATA),
+                    operation = OperationType.METADATA
+                )
+                return@withContext page.copy(
+                    tracks = deduplicateTracks(page.tracks),
+                    providerId = pid,
+                    providerLabel = page.providerLabel.ifBlank { adapter.displayName }
+                )
+            } catch (t: Throwable) {
+                lastError = t
+                healthTracker.recordProviderFailure(pid, t.message)
+            }
+        }
+        throw lastError ?: IllegalStateException("Could not load album or playlist details")
+    }
+
+    suspend fun testProviderConnectivity(providerId: String): ProviderConnectivityTestResult =
+        withContext(Dispatchers.IO) {
+            val id = providerId.lowercase()
+            val adapters = ensureDynamicRegistryReady()
+            val cfg = remoteConfigRepository?.activeConfig?.value?.providerById(id)
+            val adapter = adapters[id]
+            val displayName = cfg?.displayName ?: adapter?.displayName ?: id.uppercase()
+
+            if (cfg != null && !cfg.enabled) {
+                return@withContext ProviderConnectivityTestResult(
+                    providerId = id,
+                    displayName = displayName,
+                    success = false,
+                    errorSummary = "Disabled in GitHub configuration",
+                    details = "Provider is disabled remotely"
+                )
+            }
+            if (adapter == null) {
+                return@withContext ProviderConnectivityTestResult(
+                    providerId = id,
+                    displayName = displayName,
+                    success = false,
+                    errorSummary = "Provider not registered",
+                    details = "No active adapter available"
+                )
+            }
+
+            healthTracker.resetEndpointCooldowns(id)
+            val startNs = System.nanoTime()
+            try {
+                val tracks = adapter.search("a", OnlineSearchFilter.SONGS, null).tracks
+                val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                val activeEp = adapter.activeEndpointFor(OperationType.SEARCH)
+                healthTracker.recordProviderSuccess(id, latencyMs, activeEp, OperationType.SEARCH)
+                ProviderConnectivityTestResult(
+                    providerId = id,
+                    displayName = displayName,
+                    success = true,
+                    testedEndpoint = activeEp,
+                    latencyMs = latencyMs,
+                    details = "Returned ${tracks.size} items via ${activeEp ?: displayName}"
+                )
+            } catch (t: Throwable) {
+                val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                val safeErr = InputAndUrlSecurity.sanitizeErrorForDiagnostics(t.message) ?: "Connection failed"
+                healthTracker.recordProviderFailure(id, safeErr)
+                ProviderConnectivityTestResult(
+                    providerId = id,
+                    displayName = displayName,
+                    success = false,
+                    testedEndpoint = adapter.activeEndpointFor(OperationType.SEARCH),
+                    latencyMs = latencyMs,
+                    errorSummary = safeErr,
+                    details = safeErr
+                )
+            }
+        }
+
+    suspend fun testAllProvidersConnectivity(): List<ProviderConnectivityTestResult> =
+        withContext(Dispatchers.IO) {
+            val adapters = ensureDynamicRegistryReady()
+            val ids = remoteConfigRepository?.activeConfig?.value?.providers?.map { it.id }
+                ?: adapters.keys.toList()
+            ids.map { pid -> testProviderConnectivity(pid) }
+        }
+
+    fun getCachedStream(trackId: String): OnlineStreamResolution? = streamCache.getIfValid(trackId)
+
+    fun invalidateCachedStream(trackId: String) = streamCache.invalidate(trackId)
+
+    private fun selectSearchProviderOrder(
+        adapters: Map<String, OnlineMusicProvider>,
+        filter: OnlineSearchFilter,
+        explicitCompilation: Boolean,
+        preferredProviderId: String?,
+        hasPageToken: Boolean
+    ): List<String> {
+        if (hasPageToken && !preferredProviderId.isNullOrBlank()) {
+            val id = preferredProviderId.lowercase()
+            return if (adapters.containsKey(id)) listOf(id) else emptyList()
+        }
+
+        val matchingFilter = when (filter) {
+            OnlineSearchFilter.JIOSAAVN -> adapters.filter { it.key == "jiosaavn" || it.value.providerType == OnlineProviderType.JIOSAAVN }.keys.toList()
+            OnlineSearchFilter.AUDIUS -> adapters.filter { it.key == "audius" || it.value.providerType == OnlineProviderType.AUDIUS }.keys.toList()
+            OnlineSearchFilter.SOUNDCLOUD -> adapters.filter { it.key == "soundcloud" || it.value.providerType == OnlineProviderType.SOUNDCLOUD }.keys.toList()
+            OnlineSearchFilter.BANDCAMP -> adapters.filter { it.key == "bandcamp" || it.value.providerType == OnlineProviderType.BANDCAMP }.keys.toList()
+            else -> emptyList()
+        }
+        if (matchingFilter.isNotEmpty()) {
+            return healthTracker.selectOrderedProviderIds(matchingFilter)
+        }
+
+        val capability = when (filter) {
+            OnlineSearchFilter.ARTISTS -> "artist"
+            OnlineSearchFilter.ALBUMS -> "album"
+            else -> "search"
+        }
+        val capable = adapters.filterValues { it.supportsCapability(capability) }.keys.toList()
+        val ordered = if (providers != null) {
+            val legacyPriority = when (filter) {
+                OnlineSearchFilter.ARTISTS, OnlineSearchFilter.ALBUMS -> listOf("jiosaavn", "audius", "youtube", "piped", "invidious", "soundcloud")
+                OnlineSearchFilter.SONGS -> if (explicitCompilation) {
+                    listOf("youtube", "piped", "invidious", "soundcloud", "jiosaavn", "audius")
+                } else {
+                    listOf("jiosaavn", "audius", "youtube", "piped", "invidious", "soundcloud")
+                }
+                else -> if (explicitCompilation) {
+                    listOf("youtube", "piped", "invidious", "soundcloud", "bandcamp", "jiosaavn", "audius")
+                } else {
+                    listOf("jiosaavn", "audius", "youtube", "piped", "invidious", "soundcloud", "bandcamp")
+                }
+            }
+            val prioritized = legacyPriority.filter { it in capable }
+            val extras = capable.filter { it !in prioritized }
+            prioritized + extras
+        } else {
+            // Respect GitHub configured priority order, pushing YouTube family higher only if explicit compilation query
+            if (explicitCompilation) {
+                val ytIds = capable.filter { it in setOf("youtube", "piped", "invidious") }
+                ytIds + capable.filterNot { it in ytIds }
+            } else {
+                capable
+            }
+        }
+        return healthTracker.selectOrderedProviderIds(ordered)
+    }
+
+    private fun selectOrderedIdsByCapability(
+        adapters: Map<String, OnlineMusicProvider>,
+        capability: String
+    ): List<String> {
+        val eligible = adapters.filterValues { it.supportsCapability(capability) }.keys.toList()
+        val ordered = if (providers != null) {
+            val legacyPriority = listOf("jiosaavn", "audius", "youtube", "piped", "invidious", "soundcloud", "bandcamp")
+            val prioritized = legacyPriority.filter { it in eligible }
+            prioritized + eligible.filterNot { it in prioritized }
+        } else {
+            eligible
+        }
+        return healthTracker.selectOrderedProviderIds(ordered)
+    }
+
+    private fun selectNativePlaybackCandidates(
+        track: OnlineTrack,
+        adapters: Map<String, OnlineMusicProvider>
+    ): List<String> {
+        val effId = track.effectiveProviderId().lowercase()
+        val ytFamily = setOf("youtube", "piped", "invidious")
+        val rawCandidates = if (effId in ytFamily || track.providerType in setOf(OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS)) {
+            listOf("youtube", "piped", "invidious").filter { adapters.containsKey(it) }
+        } else if (adapters.containsKey(effId)) {
+            listOf(effId)
+        } else {
+            adapters.filterValues { it.providerType == track.providerType }.keys.toList()
+        }
+        return healthTracker.selectOrderedProviderIds(rawCandidates)
+    }
+
+    private fun selectMetadataCandidates(
+        targetId: String,
+        hintProvider: OnlineProviderType,
+        adapters: Map<String, OnlineMusicProvider>
+    ): List<String> {
+        val ytFamily = setOf("youtube", "piped", "invidious")
+        val candidates = if (targetId in ytFamily || hintProvider in setOf(OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS)) {
+            listOf("youtube", "piped", "invidious").filter { adapters.containsKey(it) }
+        } else if (adapters.containsKey(targetId)) {
+            listOf(targetId)
+        } else {
+            adapters.filterValues { it.providerType == hintProvider }.keys.toList()
+        }
+        return healthTracker.selectOrderedProviderIds(candidates)
     }
 
     private fun pickBestMetadataMatch(target: OnlineTrack, candidates: List<OnlineTrack>): OnlineTrack? {
@@ -508,76 +850,6 @@ class OnlineProviderManager(
         }
 
         return scored.maxByOrNull { it.second }?.takeIf { it.second >= 1.1f }?.first
-    }
-
-    fun getCachedStream(trackId: String): OnlineStreamResolution? = streamCache.getIfValid(trackId)
-
-    fun invalidateCachedStream(trackId: String) = streamCache.invalidate(trackId)
-
-    suspend fun fetchArtist(artistIdOrUrl: String, hintProvider: OnlineProviderType): OnlineArtistPage =
-        withContext(Dispatchers.IO) {
-            val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(artistIdOrUrl, 300)
-            require(cleanTarget.isNotBlank()) { "Artist identifier cannot be blank" }
-            val candidates = when (hintProvider) {
-                OnlineProviderType.SOUNDCLOUD -> listOf(OnlineProviderType.SOUNDCLOUD)
-                OnlineProviderType.BANDCAMP -> listOf(OnlineProviderType.BANDCAMP)
-                OnlineProviderType.JIOSAAVN -> listOf(OnlineProviderType.JIOSAAVN)
-                OnlineProviderType.AUDIUS -> listOf(OnlineProviderType.AUDIUS)
-                else -> healthTracker.selectOrderedCandidates(
-                    listOf(OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS)
-                )
-            }
-            var lastError: Throwable? = null
-            for (providerType in candidates) {
-                val adapter = providers[providerType] ?: continue
-                val start = System.currentTimeMillis()
-                try {
-                    val page = adapter.fetchArtist(cleanTarget)
-                    healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
-                    return@withContext page.copy(tracks = deduplicateTracks(page.tracks))
-                } catch (t: Throwable) {
-                    lastError = t
-                    healthTracker.recordFailure(providerType)
-                }
-            }
-            throw lastError ?: IllegalStateException("Could not load artist details")
-        }
-
-    suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String, hintProvider: OnlineProviderType): OnlineAlbumPage =
-        withContext(Dispatchers.IO) {
-            val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(albumIdOrUrl, 300)
-            require(cleanTarget.isNotBlank()) { "Album or playlist identifier cannot be blank" }
-            val candidates = when (hintProvider) {
-                OnlineProviderType.SOUNDCLOUD -> listOf(OnlineProviderType.SOUNDCLOUD)
-                OnlineProviderType.BANDCAMP -> listOf(OnlineProviderType.BANDCAMP)
-                OnlineProviderType.JIOSAAVN -> listOf(OnlineProviderType.JIOSAAVN)
-                OnlineProviderType.AUDIUS -> listOf(OnlineProviderType.AUDIUS)
-                else -> healthTracker.selectOrderedCandidates(
-                    listOf(OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS)
-                )
-            }
-            var lastError: Throwable? = null
-            for (providerType in candidates) {
-                val adapter = providers[providerType] ?: continue
-                val start = System.currentTimeMillis()
-                try {
-                    val page = adapter.fetchAlbumOrPlaylist(cleanTarget)
-                    healthTracker.recordSuccess(providerType, System.currentTimeMillis() - start, activeInstanceUrlOf(adapter))
-                    return@withContext page.copy(tracks = deduplicateTracks(page.tracks))
-                } catch (t: Throwable) {
-                    lastError = t
-                    healthTracker.recordFailure(providerType)
-                }
-            }
-            throw lastError ?: IllegalStateException("Could not load album or playlist details")
-        }
-
-    private fun activeInstanceUrlOf(adapter: OnlineMusicProvider): String? = when (adapter) {
-        is PipedProvider -> adapter.lastWorkingInstance
-        is InvidiousProvider -> adapter.lastWorkingInstance
-        is JioSaavnProvider -> adapter.lastWorkingInstance
-        is AudiusProvider -> adapter.lastWorkingInstance
-        else -> null
     }
 
     companion object {

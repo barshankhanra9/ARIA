@@ -244,7 +244,7 @@ fun OnlineTrackListRow(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    InkStampTag(text = track.providerType.badge, accented = isCurrent)
+                    InkStampTag(text = track.effectiveBadge(), accented = isCurrent)
                     if (track.durationMs > 0L) {
                         Text(
                             text = formatDuration(track.durationMs),
@@ -318,7 +318,7 @@ fun OnlineTrackContextMenuSheet(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         InkStampTag(text = "ONLINE", accented = true)
-                        InkStampTag(text = track.providerType.badge, accented = false)
+                        InkStampTag(text = track.effectiveBadge(), accented = false)
                     }
                     Spacer(Modifier.height(4.dp))
                     Text(

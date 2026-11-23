@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Backup
+import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.CreateNewFolder
@@ -30,15 +31,15 @@ import androidx.compose.material.icons.rounded.Equalizer
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -54,6 +55,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.nocturne.player.BuildConfig
@@ -61,7 +63,11 @@ import app.nocturne.player.data.model.AnimationIntensity
 import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.ArtworkTapAction
 import app.nocturne.player.data.model.AudioEngineTelemetry
+import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.model.PaperAccent
+import app.nocturne.player.data.model.ProviderConnectivityTestResult
+import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
+import app.nocturne.player.data.model.RemoteConfigStatus
 import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.ReplayGainMode
 import app.nocturne.player.data.model.SortField
@@ -70,6 +76,7 @@ import app.nocturne.player.data.model.SwipeVerticalAction
 import app.nocturne.player.data.model.ThemeMode
 import app.nocturne.player.data.model.UserSettings
 import app.nocturne.player.ui.components.EditorialSectionHeader
+import app.nocturne.player.ui.components.InkStampTag
 import app.nocturne.player.ui.components.PaperAlertDialog
 import app.nocturne.player.ui.components.PaperCard
 import app.nocturne.player.ui.components.PaperDebossedWell
@@ -78,6 +85,9 @@ import app.nocturne.player.ui.components.PaperFilterChip
 import app.nocturne.player.ui.components.TactilePaperButton
 import app.nocturne.player.ui.components.paperGrainBackground
 import app.nocturne.player.ui.theme.AriaPaperTheme
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.roundToInt
 
 @Composable
@@ -93,17 +103,22 @@ fun SettingsScreen(
     onExportBackup: (Uri) -> Unit,
     onImportBackup: (Uri) -> Unit,
     remoteConfig: RemoteProvidersConfig = RemoteProvidersConfig.DEFAULT,
+    remoteConfigStatus: RemoteConfigStatus = RemoteConfigStatus(),
+    providerDiagnostics: List<ProviderDiagnosticsSnapshot> = emptyList(),
+    providerTestResults: Map<String, ProviderConnectivityTestResult> = emptyMap(),
+    isTestingProviders: Boolean = false,
     isRefreshingRemoteConfig: Boolean = false,
     lastRemoteConfigError: String? = null,
-    onRefreshRemoteConfig: (String?) -> Unit = {}
+    onRefreshRemoteConfig: (String?) -> Unit = {},
+    onRollbackRemoteConfig: () -> Unit = {},
+    onTestProvider: (String) -> Unit = {},
+    onTestAllProviders: () -> Unit = {}
 ) {
     val palette = AriaPaperTheme.palette
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showPrivacyDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
-    var remoteUrlDraft by remember(settings.remoteProviderConfigUrl) {
-        mutableStateOf(settings.remoteProviderConfigUrl)
-    }
+    val syncTimeFormatter = remember { SimpleDateFormat("MMM d · HH:mm:ss", Locale.getDefault()) }
 
     val exportBackupLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json")
@@ -413,66 +428,134 @@ fun SettingsScreen(
         // 5. REMOTE PROVIDERS & CONFIG
         item {
             SettingsCategoryCard(title = "Streaming & Remote Config", icon = Icons.Rounded.CloudSync) {
-                Text(
-                    text = "GITHUB RAW PROVIDERS JSON URL",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = palette.accent
-                )
-                Spacer(Modifier.height(6.dp))
-                OutlinedTextField(
-                    value = remoteUrlDraft,
-                    onValueChange = { remoteUrlDraft = it },
-                    singleLine = true,
-                    placeholder = { Text(UserSettings.DEFAULT_REMOTE_CONFIG_URL) },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = palette.accent,
-                        unfocusedBorderColor = palette.divider
-                    ),
+                PaperDebossedWell(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("remote_config_url_input")
-                )
+                        .testTag("github_config_status_card"),
+                    cornerRadius = 12.dp,
+                    contentPadding = PaddingValues(12.dp)
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "GITHUB PROVIDER CONFIGURATION",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.accent,
+                                modifier = Modifier.weight(1f)
+                            )
+                            val syncBadge = when {
+                                remoteConfigStatus.wasNotModified304 -> "304 UP-TO-DATE"
+                                remoteConfigStatus.isFromCache -> "CACHED"
+                                else -> "SYNCED"
+                            }
+                            InkStampTag(
+                                text = syncBadge,
+                                accented = !remoteConfigStatus.isFromCache
+                            )
+                        }
+                        Text(
+                            text = "barshankhanra9/aria-providers · providers.json",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = palette.inkPrimary
+                        )
+                        val syncTimeText = if (remoteConfigStatus.lastSyncedAtMs > 0L) {
+                            syncTimeFormatter.format(Date(remoteConfigStatus.lastSyncedAtMs))
+                        } else {
+                            "Pending initial sync"
+                        }
+                        Text(
+                            text = "Config v${remoteConfigStatus.configVersion} · Schema v${remoteConfigStatus.schemaVersion} · $syncTimeText",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = palette.inkSecondary
+                        )
+                        val totalProviders = remoteConfigStatus.providerCount.coerceAtLeast(remoteConfig.providers.size)
+                        val enabledProviders = remoteConfigStatus.enabledProviderCount.coerceAtLeast(remoteConfig.enabledProviders().size)
+                        Text(
+                            text = "$enabledProviders/$totalProviders providers enabled · LRCLIB endpoints: ${remoteConfig.lrclib.size}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkPrimary
+                        )
+                        val effectiveError = remoteConfigStatus.lastError?.takeIf { it.isNotBlank() }
+                            ?: lastRemoteConfigError?.takeIf { it.isNotBlank() }
+                        if (effectiveError != null) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Warning,
+                                    contentDescription = "Configuration warning",
+                                    tint = palette.danger,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = effectiveError,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.danger
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Spacer(Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     TactilePaperButton(
-                        text = if (isRefreshingRemoteConfig) "Syncing…" else "Save & Refresh",
+                        text = if (isRefreshingRemoteConfig) "Syncing…" else "Refresh Config",
                         icon = Icons.Rounded.Refresh,
-                        onClick = { onRefreshRemoteConfig(remoteUrlDraft) },
+                        enabled = !isRefreshingRemoteConfig,
+                        onClick = { onRefreshRemoteConfig(null) },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("remote_config_refresh_btn")
                     )
+                    if (remoteConfigStatus.canRollback) {
+                        TactilePaperButton(
+                            text = "Rollback",
+                            icon = Icons.Rounded.Restore,
+                            filled = false,
+                            enabled = !isRefreshingRemoteConfig,
+                            onClick = onRollbackRemoteConfig,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("remote_config_rollback_btn")
+                        )
+                    }
                     TactilePaperButton(
-                        text = "Reset URL",
+                        text = if (isTestingProviders) "Testing…" else "Test All",
+                        icon = Icons.Rounded.PlayArrow,
                         filled = false,
-                        onClick = {
-                            remoteUrlDraft = UserSettings.DEFAULT_REMOTE_CONFIG_URL
-                            onRefreshRemoteConfig(UserSettings.DEFAULT_REMOTE_CONFIG_URL)
-                        },
+                        enabled = !isTestingProviders,
+                        onClick = onTestAllProviders,
                         modifier = Modifier
                             .weight(1f)
-                            .testTag("remote_config_reset_btn")
+                            .testTag("remote_test_all_btn")
                     )
                 }
-                Spacer(Modifier.height(10.dp))
-                PaperDebossedWell(cornerRadius = 10.dp, contentPadding = PaddingValues(10.dp)) {
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(
-                            text = "ACTIVE ENDPOINTS (AUTO-FAILOVER READY)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = palette.accent
-                        )
-                        Text(
-                            text = "JioSaavn: ${remoteConfig.jiosaavn.size} · Piped: ${remoteConfig.piped.size} · " +
-                                "Invidious: ${remoteConfig.invidious.size} · LRCLIB: ${remoteConfig.lrclib.size}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.inkPrimary
-                        )
-                        if (!lastRemoteConfigError.isNullOrBlank()) {
-                            Text(
-                                text = "Fallback active: $lastRemoteConfigError",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = palette.inkSecondary
+
+                if (providerDiagnostics.isNotEmpty()) {
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        text = "PROVIDER & ENDPOINT DIAGNOSTICS",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        providerDiagnostics.forEach { diag ->
+                            ProviderDiagnosticsCard(
+                                diagnostics = diag,
+                                testResult = providerTestResults[diag.providerId.lowercase()],
+                                isTesting = isTestingProviders,
+                                onTestProvider = { onTestProvider(diag.providerId) }
                             )
                         }
                     }
@@ -881,4 +964,156 @@ private fun SettingsSwitchRow(
             )
         )
     }
+}
+
+@Composable
+private fun ProviderDiagnosticsCard(
+    diagnostics: ProviderDiagnosticsSnapshot,
+    testResult: ProviderConnectivityTestResult?,
+    isTesting: Boolean,
+    onTestProvider: () -> Unit
+) {
+    val palette = AriaPaperTheme.palette
+    val maxCooldownMs = diagnostics.operationHealth.values
+        .flatten()
+        .maxOfOrNull { it.cooldownRemainingMs } ?: 0L
+    val healthLabel = when {
+        !diagnostics.enabled -> "DISABLED"
+        !diagnostics.isAvailable && maxCooldownMs > 0L -> "COOLDOWN ${(maxCooldownMs / 1000L).coerceAtLeast(1L)}s"
+        !diagnostics.isAvailable -> "UNAVAILABLE"
+        else -> "HEALTHY"
+    }
+
+    PaperDebossedWell(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("provider_diag_card_${diagnostics.providerId}"),
+        cornerRadius = 12.dp,
+        contentPadding = PaddingValues(10.dp)
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = diagnostics.displayName,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = palette.inkPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "${diagnostics.providerId} · ${diagnostics.adapterType} · Priority #${diagnostics.priority}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.inkSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                InkStampTag(
+                    text = healthLabel,
+                    accented = diagnostics.enabled && diagnostics.isAvailable
+                )
+            }
+
+            val activeHosts = buildList {
+                diagnostics.activeSearchEndpoint?.let { add("Search: ${compactHostLabel(it)}") }
+                diagnostics.activeMetadataEndpoint?.let { add("Meta: ${compactHostLabel(it)}") }
+                diagnostics.activePlaybackEndpoint?.let { add("Stream: ${compactHostLabel(it)}") }
+            }
+            if (activeHosts.isNotEmpty()) {
+                Text(
+                    text = activeHosts.joinToString(" · "),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.inkPrimary
+                )
+            }
+
+            diagnostics.operationHealth.entries.forEach { (op, endpoints) ->
+                if (endpoints.isNotEmpty()) {
+                    Text(
+                        text = op.label.uppercase(),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent
+                    )
+                    endpoints.forEach { ep ->
+                        val statusPart = when {
+                            ep.cooldownRemainingMs > 0L -> "Cooldown ${(ep.cooldownRemainingMs / 1000L).coerceAtLeast(1L)}s"
+                            ep.consecutiveFailures > 0 -> "Fails ${ep.consecutiveFailures}"
+                            else -> "OK"
+                        }
+                        val latencyPart = if (ep.ewmaLatencyMs > 0L) " · ${ep.ewmaLatencyMs}ms" else ""
+                        Text(
+                            text = "• [P${ep.priority}] ${compactHostLabel(ep.url)} · $statusPart$latencyPart",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (ep.isHealthy) palette.inkPrimary else palette.danger,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (!ep.lastError.isNullOrBlank()) {
+                            Text(
+                                text = "  ${ep.lastError}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.inkSecondary,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+
+            if (testResult != null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = if (testResult.success) Icons.Rounded.CheckCircle else Icons.Rounded.Warning,
+                        contentDescription = null,
+                        tint = if (testResult.success) palette.accent else palette.danger,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Text(
+                        text = buildString {
+                            append(if (testResult.success) "Reachable (${testResult.latencyMs}ms)" else "Test failed")
+                            testResult.testedEndpoint?.let { append(" · ${compactHostLabel(it)}") }
+                            if (testResult.failoverAttempts > 0) append(" · ${testResult.failoverAttempts} failover(s)")
+                            testResult.errorSummary?.let { append(" · $it") }
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (testResult.success) palette.inkPrimary else palette.danger
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(
+                    onClick = onTestProvider,
+                    enabled = !isTesting && diagnostics.enabled,
+                    modifier = Modifier.testTag("test_provider_btn_${diagnostics.providerId}")
+                ) {
+                    Text(
+                        text = "Test ${diagnostics.displayName}",
+                        color = if (diagnostics.enabled) palette.accent else palette.inkTertiary
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun compactHostLabel(rawUrl: String): String {
+    return runCatching {
+        val parsed = Uri.parse(rawUrl)
+        parsed.host?.takeIf { it.isNotBlank() } ?: rawUrl
+    }.getOrDefault(rawUrl)
 }
