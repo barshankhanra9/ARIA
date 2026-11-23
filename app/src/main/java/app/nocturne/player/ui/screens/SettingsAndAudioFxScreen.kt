@@ -21,8 +21,11 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Backup
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -32,17 +35,23 @@ import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Equalizer
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Restore
+import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material.icons.rounded.WifiTethering
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -54,14 +63,18 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.nocturne.player.BuildConfig
@@ -74,7 +87,10 @@ import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.model.PaperAccent
 import app.nocturne.player.data.model.ProviderConnectivityTestResult
 import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
+import app.nocturne.player.data.model.RemoteConfigConnectionState
+import app.nocturne.player.data.model.RemoteConfigErrorType
 import app.nocturne.player.data.model.RemoteConfigStatus
+import app.nocturne.player.data.model.RemoteConfigUrlHelper
 import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.ReplayGainMode
 import app.nocturne.player.data.model.SortField
@@ -111,17 +127,22 @@ fun SettingsScreen(
     onImportBackup: (Uri) -> Unit,
     remoteConfig: RemoteProvidersConfig = RemoteProvidersConfig.DEFAULT,
     remoteConfigStatus: RemoteConfigStatus = RemoteConfigStatus(),
+    remoteConfigConnectionState: RemoteConfigConnectionState = RemoteConfigConnectionState.Idle,
     providerDiagnostics: List<ProviderDiagnosticsSnapshot> = emptyList(),
     providerTestResults: Map<String, ProviderConnectivityTestResult> = emptyMap(),
     isTestingProviders: Boolean = false,
     isRefreshingRemoteConfig: Boolean = false,
     lastRemoteConfigError: String? = null,
+    onSaveRemoteConfigUrl: (String) -> Unit = {},
+    onTestRemoteConfigUrl: (String) -> Unit = {},
     onRefreshRemoteConfig: (String?) -> Unit = {},
+    onClearRemoteConfigFeedback: () -> Unit = {},
     onRollbackRemoteConfig: () -> Unit = {},
     onTestProvider: (String) -> Unit = {},
     onTestAllProviders: () -> Unit = {}
 ) {
     val palette = AriaPaperTheme.palette
+    val keyboard = LocalSoftwareKeyboardController.current
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showPrivacyDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
@@ -475,6 +496,29 @@ fun SettingsScreen(
         // 5. REMOTE PROVIDERS & CONFIG
         item {
             SettingsCategoryCard(title = "Streaming & Remote Config", icon = Icons.Rounded.CloudSync) {
+                val activeSourceUrl = remoteConfigStatus.sourceUrl.ifBlank { settings.remoteProviderConfigUrl }
+                val sourceMeta = remember(activeSourceUrl) {
+                    RemoteConfigUrlHelper.parseSourceMetadata(activeSourceUrl)
+                }
+                val categories = remember(remoteConfigStatus.categories, remoteConfig) {
+                    remoteConfigStatus.categories.ifEmpty { remoteConfig.distinctCategories() }
+                }
+                val totalProviders = if (remoteConfig.providers.isNotEmpty()) {
+                    remoteConfig.providers.size
+                } else {
+                    remoteConfigStatus.providerCount
+                }
+                val enabledProviders = if (remoteConfig.providers.isNotEmpty()) {
+                    remoteConfig.enabledProviders().size
+                } else {
+                    remoteConfigStatus.enabledProviderCount
+                }
+                val lyricsEndpointsCount = if (remoteConfig.lrclib.isNotEmpty()) {
+                    remoteConfig.lrclib.size
+                } else {
+                    remoteConfigStatus.lyricsEndpointCount
+                }
+
                 PaperDebossedWell(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -504,12 +548,29 @@ fun SettingsScreen(
                                 accented = !remoteConfigStatus.isFromCache
                             )
                         }
+
+                        val sourceHeadline = buildString {
+                            append(sourceMeta.repositoryDisplay)
+                            if (sourceMeta.fileName.isNotBlank()) {
+                                append(" · ")
+                                append(sourceMeta.fileName)
+                            }
+                            if (!sourceMeta.branchOrRef.isNullOrBlank()) {
+                                append(" (")
+                                append(sourceMeta.branchOrRef)
+                                append(")")
+                            }
+                        }
                         Text(
-                            text = "barshankhanra9/aria-providers · providers.json",
+                            text = sourceHeadline,
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.SemiBold,
-                            color = palette.inkPrimary
+                            color = palette.inkPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("remote_config_source_summary")
                         )
+
                         val syncTimeText = if (remoteConfigStatus.lastSyncedAtMs > 0L) {
                             syncTimeFormatter.format(Date(remoteConfigStatus.lastSyncedAtMs))
                         } else {
@@ -518,21 +579,41 @@ fun SettingsScreen(
                         Text(
                             text = "Config v${remoteConfigStatus.configVersion} · Schema v${remoteConfigStatus.schemaVersion} · $syncTimeText",
                             style = MaterialTheme.typography.labelSmall,
-                            color = palette.inkSecondary
+                            color = palette.inkSecondary,
+                            modifier = Modifier.testTag("remote_config_version_summary")
                         )
-                        val totalProviders = remoteConfigStatus.providerCount.coerceAtLeast(remoteConfig.providers.size)
-                        val enabledProviders = remoteConfigStatus.enabledProviderCount.coerceAtLeast(remoteConfig.enabledProviders().size)
                         Text(
-                            text = "$enabledProviders/$totalProviders providers enabled · LRCLIB endpoints: ${remoteConfig.lrclib.size}",
+                            text = "$enabledProviders/$totalProviders providers enabled · Lyrics endpoints: $lyricsEndpointsCount",
                             style = MaterialTheme.typography.bodySmall,
-                            color = palette.inkPrimary
+                            color = palette.inkPrimary,
+                            modifier = Modifier.testTag("remote_config_counts_summary")
                         )
+
+                        if (categories.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(
+                                    text = "PROVIDER CATEGORIES",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.accent
+                                )
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.testTag("remote_config_categories_row")
+                                ) {
+                                    items(categories) { category ->
+                                        InkStampTag(text = category, accented = false)
+                                    }
+                                }
+                            }
+                        }
+
                         val effectiveError = remoteConfigStatus.lastError?.takeIf { it.isNotBlank() }
                             ?: lastRemoteConfigError?.takeIf { it.isNotBlank() }
                         if (effectiveError != null) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                modifier = Modifier.testTag("remote_config_status_error")
                             ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Warning,
@@ -540,8 +621,13 @@ fun SettingsScreen(
                                     tint = palette.danger,
                                     modifier = Modifier.size(15.dp)
                                 )
+                                val errorPrefix = if (remoteConfigStatus.lastErrorType != RemoteConfigErrorType.NONE) {
+                                    "${remoteConfigStatus.lastErrorType.label}: "
+                                } else {
+                                    ""
+                                }
                                 Text(
-                                    text = effectiveError,
+                                    text = "$errorPrefix$effectiveError",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = palette.danger
                                 )
@@ -550,7 +636,149 @@ fun SettingsScreen(
                     }
                 }
 
+                Spacer(Modifier.height(12.dp))
+                var draftUrl by rememberSaveable { mutableStateOf(settings.remoteProviderConfigUrl) }
+                LaunchedEffect(settings.remoteProviderConfigUrl) {
+                    draftUrl = settings.remoteProviderConfigUrl
+                }
+
+                val isBusy = isRefreshingRemoteConfig ||
+                    remoteConfigConnectionState is RemoteConfigConnectionState.Testing ||
+                    remoteConfigConnectionState is RemoteConfigConnectionState.Saving
+                val hasUnsavedDraft = draftUrl.trim() != settings.remoteProviderConfigUrl.trim()
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "PROVIDER JSON URL",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.accent
+                    )
+                    if (draftUrl.trim() != UserSettings.DEFAULT_REMOTE_CONFIG_URL) {
+                        TextButton(
+                            onClick = {
+                                draftUrl = UserSettings.DEFAULT_REMOTE_CONFIG_URL
+                                onClearRemoteConfigFeedback()
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.testTag("remote_config_reset_default_btn")
+                        ) {
+                            Text(
+                                text = "Reset Default",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.accent
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+
+                OutlinedTextField(
+                    value = draftUrl,
+                    onValueChange = { updated ->
+                        draftUrl = updated
+                        if (remoteConfigConnectionState !is RemoteConfigConnectionState.Idle) {
+                            onClearRemoteConfigFeedback()
+                        }
+                    },
+                    placeholder = {
+                        Text(
+                            text = UserSettings.DEFAULT_REMOTE_CONFIG_URL,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Rounded.Link,
+                            contentDescription = null,
+                            tint = palette.accent
+                        )
+                    },
+                    trailingIcon = {
+                        if (draftUrl.isNotEmpty()) {
+                            IconButton(
+                                onClick = {
+                                    draftUrl = ""
+                                    onClearRemoteConfigFeedback()
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Close,
+                                    contentDescription = "Clear URL",
+                                    tint = palette.inkSecondary
+                                )
+                            }
+                        }
+                    },
+                    maxLines = 3,
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Uri,
+                        imeAction = ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(
+                        onDone = { keyboard?.hide() }
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = palette.accent,
+                        unfocusedBorderColor = palette.divider,
+                        focusedContainerColor = palette.paperBackground,
+                        unfocusedContainerColor = palette.paperBackground,
+                        focusedTextColor = palette.inkPrimary,
+                        unfocusedTextColor = palette.inkPrimary
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("remote_config_url_input")
+                )
+
+                if (hasUnsavedDraft) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = "Edited URL is not active yet. Test Connection or Save URL to validate JSON and schema first.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.inkSecondary,
+                        modifier = Modifier.testTag("remote_config_unsaved_hint")
+                    )
+                }
+
                 Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    TactilePaperButton(
+                        text = if (remoteConfigConnectionState is RemoteConfigConnectionState.Saving) "Saving…" else "Save URL",
+                        icon = Icons.Rounded.Save,
+                        enabled = !isBusy && draftUrl.isNotBlank(),
+                        onClick = {
+                            keyboard?.hide()
+                            onSaveRemoteConfigUrl(draftUrl)
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("remote_config_save_url_btn")
+                    )
+                    TactilePaperButton(
+                        text = if (remoteConfigConnectionState is RemoteConfigConnectionState.Testing) "Testing…" else "Test Connection",
+                        icon = Icons.Rounded.WifiTethering,
+                        filled = false,
+                        enabled = !isBusy && draftUrl.isNotBlank(),
+                        onClick = {
+                            keyboard?.hide()
+                            onTestRemoteConfigUrl(draftUrl)
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("remote_config_test_connection_btn")
+                    )
+                }
+
+                Spacer(Modifier.height(8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -558,8 +786,12 @@ fun SettingsScreen(
                     TactilePaperButton(
                         text = if (isRefreshingRemoteConfig) "Syncing…" else "Refresh Config",
                         icon = Icons.Rounded.Refresh,
-                        enabled = !isRefreshingRemoteConfig,
-                        onClick = { onRefreshRemoteConfig(null) },
+                        filled = false,
+                        enabled = !isBusy,
+                        onClick = {
+                            keyboard?.hide()
+                            onRefreshRemoteConfig(null)
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("remote_config_refresh_btn")
@@ -569,7 +801,7 @@ fun SettingsScreen(
                             text = "Rollback",
                             icon = Icons.Rounded.Restore,
                             filled = false,
-                            enabled = !isRefreshingRemoteConfig,
+                            enabled = !isBusy,
                             onClick = onRollbackRemoteConfig,
                             modifier = Modifier
                                 .weight(1f)
@@ -580,12 +812,135 @@ fun SettingsScreen(
                         text = if (isTestingProviders) "Testing…" else "Test All",
                         icon = Icons.Rounded.PlayArrow,
                         filled = false,
-                        enabled = !isTestingProviders,
+                        enabled = !isTestingProviders && !isBusy,
                         onClick = onTestAllProviders,
                         modifier = Modifier
                             .weight(1f)
                             .testTag("remote_test_all_btn")
                     )
+                }
+
+                if (remoteConfigConnectionState !is RemoteConfigConnectionState.Idle) {
+                    Spacer(Modifier.height(10.dp))
+                    PaperDebossedWell(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("remote_config_feedback_card"),
+                        cornerRadius = 12.dp,
+                        contentPadding = PaddingValues(12.dp)
+                    ) {
+                        when (val state = remoteConfigConnectionState) {
+                            is RemoteConfigConnectionState.Testing,
+                            is RemoteConfigConnectionState.Saving -> {
+                                val actionTitle = if (state is RemoteConfigConnectionState.Saving) {
+                                    "VALIDATING & SAVING URL…"
+                                } else {
+                                    "TESTING CONNECTION…"
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                        color = palette.accent
+                                    )
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            text = actionTitle,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = palette.accent
+                                        )
+                                        Text(
+                                            text = "Validating URL, fetching JSON, and verifying provider schema…",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = palette.inkSecondary
+                                        )
+                                    }
+                                }
+                            }
+                            is RemoteConfigConnectionState.Success -> {
+                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.CheckCircle,
+                                            contentDescription = "Connection valid",
+                                            tint = palette.accent,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Text(
+                                            text = state.actionLabel,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = palette.accent,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        InkStampTag(text = "${state.latencyMs}ms", accented = true)
+                                    }
+                                    val metaLine = buildString {
+                                        append(state.sourceMetadata.repositoryDisplay)
+                                        if (state.sourceMetadata.fileName.isNotBlank()) {
+                                            append(" · ")
+                                            append(state.sourceMetadata.fileName)
+                                        }
+                                    }
+                                    Text(
+                                        text = "$metaLine · Config v${state.configVersion} · Schema v${state.schemaVersion}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = palette.inkPrimary
+                                    )
+                                    Text(
+                                        text = "${state.enabledProviders}/${state.totalProviders} providers enabled · Lyrics endpoints: ${state.lyricsEndpointCount}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = palette.inkSecondary
+                                    )
+                                    if (state.categories.isNotEmpty()) {
+                                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            items(state.categories) { cat ->
+                                                InkStampTag(text = cat, accented = false)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            is RemoteConfigConnectionState.Error -> {
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Warning,
+                                            contentDescription = "Connection error",
+                                            tint = palette.danger,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        InkStampTag(
+                                            text = state.errorType.label.ifBlank { "Error" },
+                                            accented = false
+                                        )
+                                    }
+                                    Text(
+                                        text = state.message,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = palette.danger
+                                    )
+                                    Text(
+                                        text = "Last working URL and active configuration were preserved.",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = palette.inkSecondary
+                                    )
+                                }
+                            }
+                            RemoteConfigConnectionState.Idle -> Unit
+                        }
+                    }
                 }
 
                 if (providerDiagnostics.isNotEmpty()) {

@@ -166,6 +166,7 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     val remoteConfigStatus by viewModel.remoteConfigStatus.collectAsStateWithLifecycle()
     val isRefreshingRemoteConfig by viewModel.isRefreshingRemoteConfig.collectAsStateWithLifecycle()
     val lastRemoteConfigError by viewModel.lastRemoteConfigError.collectAsStateWithLifecycle()
+    val remoteConfigConnectionState by viewModel.remoteConfigConnectionState.collectAsStateWithLifecycle()
 
     val onlineSnapshot by viewModel.online.snapshot.collectAsStateWithLifecycle()
     val onlineTrending by viewModel.online.trendingState.collectAsStateWithLifecycle()
@@ -699,6 +700,10 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                 isTestingProviders = isTestingProviders,
                                 isRefreshingRemoteConfig = isRefreshingRemoteConfig,
                                 lastRemoteConfigError = lastRemoteConfigError,
+                                remoteConfigConnectionState = remoteConfigConnectionState,
+                                onSaveRemoteConfigUrl = { viewModel.saveRemoteConfigUrl(it) },
+                                onTestRemoteConfigUrl = { viewModel.testRemoteConfigUrl(it) },
+                                onClearRemoteConfigFeedback = { viewModel.clearRemoteConfigConnectionState() },
                                 onRefreshRemoteConfig = { viewModel.refreshRemoteConfig(it) },
                                 onRollbackRemoteConfig = { viewModel.rollbackRemoteConfig() },
                                 onTestProvider = { viewModel.online.testProviderConnectivity(it) },

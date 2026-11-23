@@ -163,7 +163,8 @@ data class DynamicProviderConfig(
     val headers: Map<String, String> = emptyMap(),
     val routes: ProviderRoutesConfig = ProviderRoutesConfig(),
     val mapping: ProviderResponseMapping = ProviderResponseMapping(),
-    val verifyStreamReachable: Boolean = false
+    val verifyStreamReachable: Boolean = false,
+    val categories: List<String> = emptyList()
 ) {
     fun supportsCapability(cap: String): Boolean {
         if (!enabled) return false
@@ -173,6 +174,16 @@ data class DynamicProviderConfig(
 
     fun endpointsFor(operation: OperationType): List<ProviderEndpointConfig> =
         endpoints.filter { it.supports(operation) }.sortedBy { it.priority }
+
+    fun effectiveCategories(): List<String> {
+        val explicit = categories.map { it.trim() }.filter { it.isNotBlank() }
+        if (explicit.isNotEmpty()) return explicit.distinct()
+        return when (adapterType.lowercase()) {
+            "jiosaavn", "audius" -> listOf("Audio Streaming")
+            "piped", "invidious", "newpipe" -> listOf("Video & Audio Streams")
+            else -> if (supportsCapability("stream")) listOf("Streaming API") else listOf("Metadata & Search")
+        }
+    }
 }
 
 @Serializable
@@ -184,6 +195,92 @@ data class DynamicLyricsProviderConfig(
     val endpoints: List<ProviderEndpointConfig> = emptyList(),
     val timeoutMs: Long = 8_000L
 )
+
+@Serializable
+enum class RemoteConfigErrorType(val label: String) {
+    NONE(""),
+    URL_ERROR("URL Error"),
+    NETWORK_ERROR("Network Error"),
+    JSON_PARSE_ERROR("JSON Parse Error"),
+    UNSUPPORTED_SCHEMA_ERROR("Unsupported Schema Error")
+}
+
+data class RemoteConfigSourceMetadata(
+    val repositoryDisplay: String = "",
+    val fileName: String = "",
+    val branchOrRef: String? = null
+)
+
+object RemoteConfigUrlHelper {
+    fun parseSourceMetadata(rawUrl: String?): RemoteConfigSourceMetadata {
+        val trimmed = rawUrl?.trim().orEmpty()
+        if (trimmed.isBlank()) {
+            return RemoteConfigSourceMetadata(repositoryDisplay = "Not configured", fileName = "")
+        }
+        val uri = runCatching { android.net.Uri.parse(trimmed) }.getOrNull()
+            ?: return RemoteConfigSourceMetadata(repositoryDisplay = trimmed, fileName = "")
+        val host = uri.host?.lowercase().orEmpty()
+        val segments = uri.pathSegments.orEmpty().filter { it.isNotBlank() }
+        val fileName = segments.lastOrNull().orEmpty()
+
+        return when {
+            host == "raw.githubusercontent.com" && segments.size >= 4 -> {
+                val repo = "${segments[0]}/${segments[1]}"
+                val branch = when {
+                    segments.size >= 6 && segments[2] == "refs" && (segments[3] == "heads" || segments[3] == "tags") -> segments[4]
+                    else -> segments[2]
+                }
+                RemoteConfigSourceMetadata(
+                    repositoryDisplay = repo,
+                    fileName = fileName,
+                    branchOrRef = branch
+                )
+            }
+            host == "gist.githubusercontent.com" && segments.isNotEmpty() -> {
+                RemoteConfigSourceMetadata(
+                    repositoryDisplay = "gist:${segments[0]}",
+                    fileName = fileName.ifBlank { "gist" },
+                    branchOrRef = null
+                )
+            }
+            host.isNotBlank() -> {
+                val parentPath = if (segments.size > 1) {
+                    segments.dropLast(1).joinToString("/")
+                } else ""
+                val display = if (parentPath.isNotBlank()) "$host/$parentPath" else host
+                RemoteConfigSourceMetadata(
+                    repositoryDisplay = display,
+                    fileName = fileName,
+                    branchOrRef = null
+                )
+            }
+            else -> RemoteConfigSourceMetadata(repositoryDisplay = trimmed, fileName = "")
+        }
+    }
+}
+
+sealed interface RemoteConfigConnectionState {
+    data object Idle : RemoteConfigConnectionState
+    data class Testing(val url: String) : RemoteConfigConnectionState
+    data class Saving(val url: String) : RemoteConfigConnectionState
+    data class Success(
+        val url: String,
+        val actionLabel: String,
+        val configVersion: String,
+        val schemaVersion: Int,
+        val totalProviders: Int,
+        val enabledProviders: Int,
+        val lyricsEndpointCount: Int,
+        val categories: List<String>,
+        val latencyMs: Long,
+        val sourceMetadata: RemoteConfigSourceMetadata
+    ) : RemoteConfigConnectionState
+    data class Error(
+        val url: String,
+        val errorType: RemoteConfigErrorType,
+        val message: String
+    ) : RemoteConfigConnectionState
+}
 
 data class RemoteConfigStatus(
     val sourceUrl: String = UserSettings.DEFAULT_REMOTE_CONFIG_URL,
@@ -198,7 +295,10 @@ data class RemoteConfigStatus(
     val previousConfigVersion: String? = null,
     val providerCount: Int = 0,
     val enabledProviderCount: Int = 0,
-    val lastError: String? = null
+    val lyricsEndpointCount: Int = 0,
+    val categories: List<String> = emptyList(),
+    val lastError: String? = null,
+    val lastErrorType: RemoteConfigErrorType = RemoteConfigErrorType.NONE
 )
 
 data class EndpointHealthInfo(

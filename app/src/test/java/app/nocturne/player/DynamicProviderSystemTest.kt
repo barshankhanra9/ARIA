@@ -735,4 +735,250 @@ class DynamicProviderSystemTest {
             cfgServer.shutdown()
         }
     }
+
+    @Test
+    fun validatorParsesObjectMapAndCategorySchemasWithoutZeroProviderBug() {
+        val objectMapJson = """
+            {
+              "schemaVersion": 2,
+              "configVersion": "2026.11.23-map",
+              "providers": {
+                "jiosaavn": ["https://saavn.example.org/api"],
+                "piped": ["https://pipedapi.example.org"],
+                "youtube": true,
+                "lrclib": ["https://lrclib.net"]
+              }
+            }
+        """.trimIndent()
+
+        val parsedMap = RemoteConfigValidator.parseAndValidate(objectMapJson, allowLoopback = false)
+        assertEquals(3, parsedMap.providers.size)
+        assertEquals(3, parsedMap.enabledProviders().size)
+        assertEquals(listOf("https://saavn.example.org/api"), parsedMap.jiosaavn)
+        assertEquals(listOf("https://pipedapi.example.org"), parsedMap.piped)
+        assertTrue(parsedMap.providers.any { it.id == "youtube" && it.adapterType == "newpipe" && it.enabled })
+        assertEquals(listOf("https://lrclib.net"), parsedMap.lrclib)
+
+        val categorizedJson = """
+            {
+              "schemaVersion": 2,
+              "version": "2026.11.23-cats",
+              "providers": {
+                "Audio Streaming": [
+                  {
+                    "id": "jiosaavn",
+                    "name": "JioSaavn",
+                    "type": "jiosaavn",
+                    "endpoints": ["https://saavn.example.org"]
+                  }
+                ],
+                "Video Mirrors": {
+                  "invidious": {
+                    "enabled": false,
+                    "instances": ["https://invidious.example.org"]
+                  },
+                  "audius": {
+                    "categories": ["Indie Electronic"],
+                    "urls": ["https://audius.example.org"]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        val parsedCats = RemoteConfigValidator.parseAndValidate(categorizedJson, allowLoopback = false)
+        assertEquals("2026.11.23-cats", parsedCats.configVersion)
+        assertEquals(3, parsedCats.providers.size)
+        assertEquals(2, parsedCats.enabledProviders().size)
+        val categories = parsedCats.distinctCategories()
+        assertTrue(categories.contains("Audio Streaming"))
+        assertTrue(categories.contains("Indie Electronic"))
+        assertTrue(categories.contains("Video Mirrors"))
+    }
+
+    @Test
+    fun testConnectionAndSaveUrlClassifyErrorsPreserveLastWorkingConfigAndPersistAcrossRestart() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val settingsRepo = SettingsRepository(context)
+        val server = MockWebServer()
+        server.start()
+        try {
+            val baseUrl = server.url("").toString().trimEnd('/')
+            val workingUrl = "$baseUrl/barshan/aria-providers/refs/heads/main/providers.json"
+            val updatedUrl = "$baseUrl/custom-org/custom-repo/main/custom_providers.json"
+
+            val workingJson = """
+                {
+                  "schemaVersion": 2,
+                  "configVersion": "cfg-working-1",
+                  "providers": [
+                    {
+                      "id": "jiosaavn",
+                      "displayName": "JioSaavn",
+                      "adapterType": "jiosaavn",
+                      "enabled": true,
+                      "priority": 1,
+                      "categories": ["Audio Streaming"],
+                      "endpoints": [{ "url": "$baseUrl/saavn", "priority": 1, "enabled": true }]
+                    },
+                    {
+                      "id": "audius",
+                      "displayName": "Audius",
+                      "adapterType": "audius",
+                      "enabled": false,
+                      "priority": 2,
+                      "categories": ["Indie"],
+                      "endpoints": [{ "url": "$baseUrl/audius", "priority": 1, "enabled": true }]
+                    }
+                  ],
+                  "lyricsProviders": [
+                    {
+                      "id": "lrclib",
+                      "enabled": true,
+                      "endpoints": [{ "url": "$baseUrl/lrclib", "priority": 1, "enabled": true }]
+                    }
+                  ]
+                }
+            """.trimIndent()
+
+            val updatedJson = """
+                {
+                  "schemaVersion": 2,
+                  "configVersion": "cfg-custom-2",
+                  "providers": [
+                    {
+                      "id": "piped",
+                      "displayName": "Piped Mirror",
+                      "adapterType": "piped",
+                      "enabled": true,
+                      "priority": 1,
+                      "categories": ["Video & Audio"],
+                      "endpoints": [{ "url": "$baseUrl/piped", "priority": 1, "enabled": true }]
+                    }
+                  ]
+                }
+            """.trimIndent()
+
+            val repo = RemoteConfigRepository(
+                settingsRepository = settingsRepo,
+                baseClient = OkHttpClient(),
+                allowTestLoopback = true
+            )
+
+            // 1. Save valid initial working URL
+            server.enqueue(MockResponse().setResponseCode(200).addHeader("ETag", "\"etag-w1\"").setBody(workingJson))
+            val saveOk = repo.saveAndActivateUrl(workingUrl)
+            assertTrue(saveOk is app.nocturne.player.data.online.ConfigOperationResult.Success)
+            assertEquals(workingUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+            assertEquals("cfg-working-1", repo.activeConfig.value.configVersion)
+            assertEquals(2, repo.status.value.providerCount)
+            assertEquals(1, repo.status.value.enabledProviderCount)
+            assertEquals(1, repo.status.value.lyricsEndpointCount)
+            assertTrue(repo.status.value.categories.contains("Audio Streaming"))
+
+            // 2. URL Error (github.com blob page / non-HTTPS) -> fails with URL_ERROR & preserves workingUrl
+            val githubBlobResult = repo.saveAndActivateUrl("https://github.com/barshankhanra9/aria-providers/blob/main/providers.json")
+            assertTrue(githubBlobResult is app.nocturne.player.data.online.ConfigOperationResult.Failure)
+            assertEquals(
+                app.nocturne.player.data.model.RemoteConfigErrorType.URL_ERROR,
+                (githubBlobResult as app.nocturne.player.data.online.ConfigOperationResult.Failure).errorType
+            )
+            assertEquals(workingUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+            assertEquals("cfg-working-1", repo.activeConfig.value.configVersion)
+
+            // 3. Network Error (HTTP 404) -> fails with NETWORK_ERROR & preserves workingUrl
+            server.enqueue(MockResponse().setResponseCode(404).setBody("404: Not Found"))
+            val notFoundUrl = "$baseUrl/missing/providers.json"
+            val netFail = repo.saveAndActivateUrl(notFoundUrl)
+            assertTrue(netFail is app.nocturne.player.data.online.ConfigOperationResult.Failure)
+            assertEquals(
+                app.nocturne.player.data.model.RemoteConfigErrorType.NETWORK_ERROR,
+                (netFail as app.nocturne.player.data.online.ConfigOperationResult.Failure).errorType
+            )
+            assertEquals(workingUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+            assertEquals("cfg-working-1", repo.activeConfig.value.configVersion)
+
+            // 4. JSON Parse Error (HTML / malformed JSON) -> fails with JSON_PARSE_ERROR & preserves workingUrl
+            server.enqueue(MockResponse().setResponseCode(200).setBody("<html><body>Error</body></html>"))
+            val jsonFail = repo.saveAndActivateUrl("$baseUrl/bad-json.json")
+            assertTrue(jsonFail is app.nocturne.player.data.online.ConfigOperationResult.Failure)
+            assertEquals(
+                app.nocturne.player.data.model.RemoteConfigErrorType.JSON_PARSE_ERROR,
+                (jsonFail as app.nocturne.player.data.online.ConfigOperationResult.Failure).errorType
+            )
+            assertEquals(workingUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+
+            // 5. Unsupported Schema Error (schemaVersion 99 / empty providers) -> fails with UNSUPPORTED_SCHEMA_ERROR & preserves workingUrl
+            server.enqueue(MockResponse().setResponseCode(200).setBody("""{"schemaVersion": 99, "providers": []}"""))
+            val schemaFail = repo.saveAndActivateUrl("$baseUrl/bad-schema.json")
+            assertTrue(schemaFail is app.nocturne.player.data.online.ConfigOperationResult.Failure)
+            assertEquals(
+                app.nocturne.player.data.model.RemoteConfigErrorType.UNSUPPORTED_SCHEMA_ERROR,
+                (schemaFail as app.nocturne.player.data.online.ConfigOperationResult.Failure).errorType
+            )
+            assertEquals(workingUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+
+            // 6. Test Connection with valid updated URL succeeds WITHOUT mutating active config yet
+            server.enqueue(MockResponse().setResponseCode(200).setBody(updatedJson))
+            val testOk = repo.testConnection(updatedUrl)
+            assertTrue(testOk is app.nocturne.player.data.online.ConfigOperationResult.Success)
+            assertEquals("cfg-custom-2", (testOk as app.nocturne.player.data.online.ConfigOperationResult.Success).config.configVersion)
+            assertEquals(workingUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+            assertEquals("cfg-working-1", repo.activeConfig.value.configVersion)
+
+            // 7. Save URL activates new URL & persists across a new RemoteConfigRepository instance
+            server.enqueue(MockResponse().setResponseCode(200).addHeader("ETag", "\"etag-c2\"").setBody(updatedJson))
+            val saveCustomOk = repo.saveAndActivateUrl(updatedUrl)
+            assertTrue(saveCustomOk is app.nocturne.player.data.online.ConfigOperationResult.Success)
+            assertEquals(updatedUrl, settingsRepo.getSettingsOnce().remoteProviderConfigUrl)
+            assertEquals("cfg-custom-2", repo.activeConfig.value.configVersion)
+
+            // Verify refreshNow() (customUrl = null) uses the newly persisted URL and NOT old ETag
+            server.enqueue(MockResponse().setResponseCode(304).addHeader("ETag", "\"etag-c2\""))
+            val restartedRepo = RemoteConfigRepository(
+                settingsRepository = settingsRepo,
+                baseClient = OkHttpClient(),
+                allowTestLoopback = true
+            )
+            restartedRepo.refreshNow(customUrl = null, force = true)
+            assertEquals(updatedUrl, restartedRepo.status.value.sourceUrl)
+            assertEquals("cfg-custom-2", restartedRepo.activeConfig.value.configVersion)
+            // Drain requests to verify last request targeted updatedUrl with new ETag
+            var lastReqPath: String? = null
+            var lastIfNoneMatch: String? = null
+            while (true) {
+                val r = server.takeRequest(100, TimeUnit.MILLISECONDS) ?: break
+                lastReqPath = r.path
+                lastIfNoneMatch = r.getHeader("If-None-Match")
+            }
+            assertEquals("/custom-org/custom-repo/main/custom_providers.json", lastReqPath)
+            assertEquals("\"etag-c2\"", lastIfNoneMatch)
+        } finally {
+            runCatching { server.shutdown() }
+        }
+    }
+
+    @Test
+    fun sourceMetadataHelperParsesGithubAndCustomUrlsDynamically() {
+        val refsUrlMeta = app.nocturne.player.data.model.RemoteConfigUrlHelper.parseSourceMetadata(
+            "https://raw.githubusercontent.com/alice/my-music-providers/refs/heads/develop/custom.json"
+        )
+        assertEquals("alice/my-music-providers", refsUrlMeta.repositoryDisplay)
+        assertEquals("custom.json", refsUrlMeta.fileName)
+        assertEquals("develop", refsUrlMeta.branchOrRef)
+
+        val shortBranchMeta = app.nocturne.player.data.model.RemoteConfigUrlHelper.parseSourceMetadata(
+            "https://raw.githubusercontent.com/bob/aria-mirrors/main/providers_v2.json"
+        )
+        assertEquals("bob/aria-mirrors", shortBranchMeta.repositoryDisplay)
+        assertEquals("providers_v2.json", shortBranchMeta.fileName)
+        assertEquals("main", shortBranchMeta.branchOrRef)
+
+        val customHostMeta = app.nocturne.player.data.model.RemoteConfigUrlHelper.parseSourceMetadata(
+            "https://cdn.example.org/configs/audio.json"
+        )
+        assertEquals("cdn.example.org/configs", customHostMeta.repositoryDisplay)
+        assertEquals("audio.json", customHostMeta.fileName)
+        assertNull(customHostMeta.branchOrRef)
+    }
 }

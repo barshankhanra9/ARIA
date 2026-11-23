@@ -242,6 +242,16 @@ data class RemoteProvidersConfig(
             ?.distinct()
             .orEmpty()
 
+    fun distinctCategories(): List<String> {
+        val providerCats = providers.flatMap { it.effectiveCategories() }
+        val all = if (lyricsProviders.any { it.enabled && it.endpoints.any { ep -> ep.enabled } }) {
+            providerCats + "Lyrics"
+        } else {
+            providerCats
+        }
+        return all.distinct()
+    }
+
     companion object {
         val DEFAULT = RemoteProvidersConfig()
     }

@@ -59,6 +59,7 @@ class SettingsRepository(private val context: Context) {
         val REMOTE_CONFIG_ETAG = stringPreferencesKey("remote_config_etag")
         val REMOTE_CONFIG_LAST_MODIFIED = stringPreferencesKey("remote_config_last_modified")
         val REMOTE_CONFIG_LAST_SYNC_MS = longPreferencesKey("remote_config_last_sync_ms")
+        val REMOTE_CONFIG_SOURCE_URL = stringPreferencesKey("remote_config_source_url")
     }
 
     val settingsFlow: Flow<UserSettings> = context.ariaDataStore.data.map { prefs ->
@@ -67,7 +68,8 @@ class SettingsRepository(private val context: Context) {
             UserSettings()
         } else {
             val decoded = runCatching { json.decodeFromString<UserSettings>(raw) }.getOrDefault(UserSettings())
-            if (decoded.remoteProviderConfigUrl.trim() == UserSettings.LEGACY_REMOTE_CONFIG_URL) {
+            val trimmedUrl = decoded.remoteProviderConfigUrl.trim()
+            if (trimmedUrl == UserSettings.LEGACY_REMOTE_CONFIG_URL || trimmedUrl.isBlank()) {
                 decoded.copy(remoteProviderConfigUrl = UserSettings.DEFAULT_REMOTE_CONFIG_URL)
             } else {
                 decoded
@@ -101,7 +103,7 @@ class SettingsRepository(private val context: Context) {
         return runCatching { json.decodeFromString<RemoteProvidersConfig>(raw) }.getOrNull()
     }
 
-    suspend fun saveRemoteProvidersConfig(config: RemoteProvidersConfig) {
+    suspend fun saveRemoteProvidersConfig(config: RemoteProvidersConfig, sourceUrl: String? = null) {
         context.ariaDataStore.edit { prefs ->
             val currentRaw = prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON]
             val encodedNew = json.encodeToString(config)
@@ -114,12 +116,19 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.REMOTE_PROVIDERS_CONFIG_JSON] = encodedNew
             if (!config.etag.isNullOrBlank()) {
                 prefs[Keys.REMOTE_CONFIG_ETAG] = config.etag
+            } else if (!sourceUrl.isNullOrBlank() && prefs[Keys.REMOTE_CONFIG_SOURCE_URL] != sourceUrl) {
+                prefs.remove(Keys.REMOTE_CONFIG_ETAG)
             }
             if (!config.lastModified.isNullOrBlank()) {
                 prefs[Keys.REMOTE_CONFIG_LAST_MODIFIED] = config.lastModified
+            } else if (!sourceUrl.isNullOrBlank() && prefs[Keys.REMOTE_CONFIG_SOURCE_URL] != sourceUrl) {
+                prefs.remove(Keys.REMOTE_CONFIG_LAST_MODIFIED)
             }
             if (config.updatedAtMs > 0L) {
                 prefs[Keys.REMOTE_CONFIG_LAST_SYNC_MS] = config.updatedAtMs
+            }
+            if (!sourceUrl.isNullOrBlank()) {
+                prefs[Keys.REMOTE_CONFIG_SOURCE_URL] = sourceUrl
             }
         }
     }
@@ -151,11 +160,23 @@ class SettingsRepository(private val context: Context) {
         )
     }
 
-    suspend fun saveRemoteConfigHttpMetadata(etag: String?, lastModified: String?, syncedAtMs: Long) {
+    suspend fun getRemoteConfigMetadataSourceUrl(): String? {
+        return context.ariaDataStore.data.first()[Keys.REMOTE_CONFIG_SOURCE_URL]
+    }
+
+    suspend fun saveRemoteConfigHttpMetadata(
+        etag: String?,
+        lastModified: String?,
+        syncedAtMs: Long,
+        sourceUrl: String? = null
+    ) {
         context.ariaDataStore.edit { prefs ->
             if (!etag.isNullOrBlank()) prefs[Keys.REMOTE_CONFIG_ETAG] = etag
             if (!lastModified.isNullOrBlank()) prefs[Keys.REMOTE_CONFIG_LAST_MODIFIED] = lastModified
             prefs[Keys.REMOTE_CONFIG_LAST_SYNC_MS] = syncedAtMs
+            if (!sourceUrl.isNullOrBlank()) {
+                prefs[Keys.REMOTE_CONFIG_SOURCE_URL] = sourceUrl
+            }
         }
     }
 

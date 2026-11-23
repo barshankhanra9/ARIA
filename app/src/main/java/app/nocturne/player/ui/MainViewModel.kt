@@ -46,7 +46,9 @@ import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.PlaybackMode
 import app.nocturne.player.data.model.Playlist
+import app.nocturne.player.data.model.RemoteConfigConnectionState
 import app.nocturne.player.data.model.RemoteConfigStatus
+import app.nocturne.player.data.model.RemoteConfigUrlHelper
 import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.SmartPlaylistType
 import app.nocturne.player.data.model.SortField
@@ -54,6 +56,7 @@ import app.nocturne.player.data.model.SortOrder
 import app.nocturne.player.data.model.StorageDiagnostics
 import app.nocturne.player.data.model.Track
 import app.nocturne.player.data.model.UserSettings
+import app.nocturne.player.data.online.ConfigOperationResult
 import app.nocturne.player.data.online.OnlineDependencies
 import app.nocturne.player.data.playlist.PlaylistPortability
 import app.nocturne.player.data.prefs.SettingsRepository
@@ -138,6 +141,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val remoteConfigStatus: StateFlow<RemoteConfigStatus> = remoteConfigRepo.status
     val isRefreshingRemoteConfig: StateFlow<Boolean> = remoteConfigRepo.isRefreshing
     val lastRemoteConfigError: StateFlow<String?> = remoteConfigRepo.lastFetchError
+
+    private val _remoteConfigConnectionState =
+        MutableStateFlow<RemoteConfigConnectionState>(RemoteConfigConnectionState.Idle)
+    val remoteConfigConnectionState: StateFlow<RemoteConfigConnectionState> =
+        _remoteConfigConnectionState.asStateFlow()
 
     private val _optimisticPlaybackMode = MutableStateFlow<PlaybackMode?>(null)
 
@@ -1176,35 +1184,100 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun refreshRemoteConfig(customUrl: String? = null) {
+    fun testRemoteConfigUrl(candidateUrl: String) {
+        val trimmed = candidateUrl.trim()
         viewModelScope.launch {
-            val trimmed = customUrl?.trim()?.takeIf { it.isNotBlank() }
-            val validatedUrl = if (trimmed != null) {
-                InputAndUrlSecurity.validateRemoteHttpsUrl(trimmed)
-                    ?: run {
-                        emitMessage("Invalid remote config URL (public HTTPS host required)")
-                        return@launch
-                    }
-            } else {
-                null
+            _remoteConfigConnectionState.value = RemoteConfigConnectionState.Testing(trimmed)
+            when (val res = remoteConfigRepo.testConnection(trimmed)) {
+                is ConfigOperationResult.Success -> {
+                    val cfg = res.config
+                    _remoteConfigConnectionState.value = RemoteConfigConnectionState.Success(
+                        url = res.url,
+                        actionLabel = "Connection verified",
+                        configVersion = cfg.configVersion,
+                        schemaVersion = cfg.schemaVersion,
+                        totalProviders = cfg.providers.size,
+                        enabledProviders = cfg.enabledProviders().size,
+                        lyricsEndpointCount = cfg.lrclib.size,
+                        categories = cfg.distinctCategories(),
+                        latencyMs = res.latencyMs,
+                        sourceMetadata = RemoteConfigUrlHelper.parseSourceMetadata(res.url)
+                    )
+                    emitMessage("Verified ${cfg.enabledProviders().size}/${cfg.providers.size} providers (v${cfg.configVersion}) in ${res.latencyMs}ms")
+                }
+                is ConfigOperationResult.Failure -> {
+                    _remoteConfigConnectionState.value = RemoteConfigConnectionState.Error(
+                        url = res.url,
+                        errorType = res.errorType,
+                        message = res.message
+                    )
+                    emitMessage("${res.errorType.label}: ${res.message}")
+                }
             }
-            if (validatedUrl != null) {
-                settingsRepo.updateSettings { it.copy(remoteProviderConfigUrl = validatedUrl) }
+        }
+    }
+
+    fun saveRemoteConfigUrl(candidateUrl: String) {
+        val trimmed = candidateUrl.trim()
+        viewModelScope.launch {
+            _remoteConfigConnectionState.value = RemoteConfigConnectionState.Saving(trimmed)
+            when (val res = remoteConfigRepo.saveAndActivateUrl(trimmed)) {
+                is ConfigOperationResult.Success -> {
+                    online.refreshProviderHealth()
+                    val cfg = res.config
+                    _remoteConfigConnectionState.value = RemoteConfigConnectionState.Success(
+                        url = res.url,
+                        actionLabel = "URL saved & synced",
+                        configVersion = cfg.configVersion,
+                        schemaVersion = cfg.schemaVersion,
+                        totalProviders = cfg.providers.size,
+                        enabledProviders = cfg.enabledProviders().size,
+                        lyricsEndpointCount = cfg.lrclib.size,
+                        categories = cfg.distinctCategories(),
+                        latencyMs = res.latencyMs,
+                        sourceMetadata = RemoteConfigUrlHelper.parseSourceMetadata(res.url)
+                    )
+                    emitMessage("Saved URL · ${cfg.enabledProviders().size}/${cfg.providers.size} providers enabled (v${cfg.configVersion})")
+                }
+                is ConfigOperationResult.Failure -> {
+                    _remoteConfigConnectionState.value = RemoteConfigConnectionState.Error(
+                        url = res.url,
+                        errorType = res.errorType,
+                        message = res.message
+                    )
+                    emitMessage("${res.errorType.label}: ${res.message}")
+                }
             }
-            val updated = remoteConfigRepo.refreshNow(validatedUrl, force = true)
+        }
+    }
+
+    fun clearRemoteConfigConnectionState() {
+        _remoteConfigConnectionState.value = RemoteConfigConnectionState.Idle
+    }
+
+    fun refreshRemoteConfig(customUrl: String? = null) {
+        val trimmed = customUrl?.trim()?.takeIf { it.isNotBlank() }
+        if (trimmed != null) {
+            saveRemoteConfigUrl(trimmed)
+            return
+        }
+        viewModelScope.launch {
+            _remoteConfigConnectionState.value = RemoteConfigConnectionState.Idle
+            val updated = remoteConfigRepo.refreshNow(customUrl = null, force = true)
             online.refreshProviderHealth()
             val status = remoteConfigRepo.status.value
             val err = remoteConfigRepo.lastFetchError.value
             when {
-                !err.isNullOrBlank() -> emitMessage("Using cached providers ($err)")
-                status.wasNotModified304 -> emitMessage("Provider config up to date (${updated.enabledProviders().size} enabled)")
-                else -> emitMessage("Synced ${updated.enabledProviders().size} active providers (v${updated.configVersion})")
+                !err.isNullOrBlank() -> emitMessage("${status.lastErrorType.label.ifBlank { "Sync Error" }}: $err")
+                status.wasNotModified304 -> emitMessage("Provider config up to date (${updated.enabledProviders().size}/${updated.providers.size} enabled)")
+                else -> emitMessage("Synced ${updated.enabledProviders().size}/${updated.providers.size} active providers (v${updated.configVersion})")
             }
         }
     }
 
     fun rollbackRemoteConfig() {
         viewModelScope.launch {
+            _remoteConfigConnectionState.value = RemoteConfigConnectionState.Idle
             val restored = remoteConfigRepo.rollbackToPreviousConfig()
             online.refreshProviderHealth()
             if (restored != null) {

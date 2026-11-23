@@ -1,6 +1,7 @@
 package app.nocturne.player.data.online
 
 import app.nocturne.player.data.model.DynamicProviderConfig
+import app.nocturne.player.data.model.RemoteConfigErrorType
 import app.nocturne.player.data.model.RemoteConfigStatus
 import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.UserSettings
@@ -22,6 +23,21 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+
+sealed interface ConfigOperationResult {
+    data class Success(
+        val url: String,
+        val config: RemoteProvidersConfig,
+        val latencyMs: Long,
+        val wasNotModified304: Boolean = false
+    ) : ConfigOperationResult
+
+    data class Failure(
+        val url: String,
+        val errorType: RemoteConfigErrorType,
+        val message: String
+    ) : ConfigOperationResult
+}
 
 class RemoteConfigRepository(
     private val settingsRepository: SettingsRepository,
@@ -63,6 +79,17 @@ class RemoteConfigRepository(
         }
     }
 
+    private suspend fun resolveConfiguredUrl(): String {
+        return runCatching {
+            val configured = settingsRepository.getSettingsOnce().remoteProviderConfigUrl.trim()
+            if (configured == UserSettings.LEGACY_REMOTE_CONFIG_URL || configured.isBlank()) {
+                UserSettings.DEFAULT_REMOTE_CONFIG_URL
+            } else {
+                configured
+            }
+        }.getOrDefault(UserSettings.DEFAULT_REMOTE_CONFIG_URL)
+    }
+
     private suspend fun loadCachedState() {
         if (stateUpdatedExplicitly.get()) return
         val cached = runCatching { settingsRepository.getCachedRemoteProvidersConfig() }.getOrNull()
@@ -70,6 +97,7 @@ class RemoteConfigRepository(
         val (etag, lastModified, lastSyncMs) = runCatching {
             settingsRepository.getRemoteConfigHttpMetadata()
         }.getOrDefault(Triple(null, null, 0L))
+        val configuredUrl = resolveConfiguredUrl()
 
         val sanitizedActive = cached?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
             ?: RemoteProvidersConfig.DEFAULT
@@ -90,7 +118,9 @@ class RemoteConfigRepository(
                 lastSyncedAtMs = lastSyncMs.takeIf { it > 0L } ?: sanitizedActive.updatedAtMs,
                 isFromCache = cached != null,
                 was304 = false,
-                error = _lastFetchError.value
+                error = _lastFetchError.value,
+                errorType = RemoteConfigErrorType.NONE,
+                sourceUrl = configuredUrl
             )
         }
     }
@@ -126,6 +156,90 @@ class RemoteConfigRepository(
         }
     }
 
+    suspend fun testConnection(candidateUrl: String): ConfigOperationResult = withContext(Dispatchers.IO) {
+        val trimmed = candidateUrl.trim()
+        val allowedOrigin = if (allowTestLoopback) trimmed else null
+        val targetUrl = when (val check = InputAndUrlSecurity.validateRemoteConfigUrlDetailed(trimmed, allowedOrigin)) {
+            is InputAndUrlSecurity.RemoteConfigUrlValidationResult.Invalid -> {
+                return@withContext ConfigOperationResult.Failure(
+                    url = trimmed,
+                    errorType = RemoteConfigErrorType.URL_ERROR,
+                    message = check.reason
+                )
+            }
+            is InputAndUrlSecurity.RemoteConfigUrlValidationResult.Valid -> check.normalizedUrl
+        }
+
+        val startNs = System.nanoTime()
+        return@withContext try {
+            val outcome = fetchAndValidateConfig(url = targetUrl)
+            val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+            when (outcome) {
+                is FetchOutcome.Updated -> ConfigOperationResult.Success(
+                    url = targetUrl,
+                    config = outcome.config,
+                    latencyMs = latencyMs,
+                    wasNotModified304 = false
+                )
+                is FetchOutcome.NotModified -> ConfigOperationResult.Failure(
+                    url = targetUrl,
+                    errorType = RemoteConfigErrorType.NETWORK_ERROR,
+                    message = "Unexpected HTTP 304 without conditional headers"
+                )
+            }
+        } catch (t: Throwable) {
+            val (errType, msg) = classifyError(t)
+            ConfigOperationResult.Failure(
+                url = targetUrl,
+                errorType = errType,
+                message = msg
+            )
+        }
+    }
+
+    suspend fun saveAndActivateUrl(candidateUrl: String): ConfigOperationResult = withContext(Dispatchers.IO) {
+        _isRefreshing.value = true
+        try {
+            val result = testConnection(candidateUrl)
+            if (result !is ConfigOperationResult.Success) {
+                return@withContext result
+            }
+            val now = System.currentTimeMillis()
+            val fetched = result.config
+            configMutex.withLock {
+                stateUpdatedExplicitly.set(true)
+                lastRefreshMs.set(now)
+                settingsRepository.updateSettings { it.copy(remoteProviderConfigUrl = result.url) }
+                settingsRepository.saveRemoteProvidersConfig(fetched, sourceUrl = result.url)
+                settingsRepository.saveRemoteConfigHttpMetadata(
+                    etag = fetched.etag,
+                    lastModified = fetched.lastModified,
+                    syncedAtMs = fetched.updatedAtMs,
+                    sourceUrl = result.url
+                )
+                val newPrev = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
+                _activeConfig.value = fetched
+                _previousConfig.value = newPrev
+                _lastFetchError.value = null
+                updateStatus(
+                    config = fetched,
+                    previous = newPrev,
+                    etag = fetched.etag,
+                    lastModified = fetched.lastModified,
+                    lastSyncedAtMs = fetched.updatedAtMs,
+                    isFromCache = false,
+                    was304 = false,
+                    error = null,
+                    errorType = RemoteConfigErrorType.NONE,
+                    sourceUrl = result.url
+                )
+            }
+            result
+        } finally {
+            _isRefreshing.value = false
+        }
+    }
+
     suspend fun refreshNow(
         customUrl: String? = null,
         force: Boolean = true
@@ -138,6 +252,7 @@ class RemoteConfigRepository(
         val (cachedEtag, cachedLastMod, cachedSyncMs) = runCatching {
             settingsRepository.getRemoteConfigHttpMetadata()
         }.getOrDefault(Triple(null, null, 0L))
+        val cachedMetaUrl = runCatching { settingsRepository.getRemoteConfigMetadataSourceUrl() }.getOrNull()
 
         val baseline = cached?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
             ?: _activeConfig.value
@@ -146,33 +261,29 @@ class RemoteConfigRepository(
         }
         _previousConfig.value = prevCached
 
-        val rawTargetUrl = (customUrl ?: runCatching {
-            val configured = settingsRepository.getSettingsOnce().remoteProviderConfigUrl.trim()
-            if (configured == UserSettings.LEGACY_REMOTE_CONFIG_URL || configured.isBlank()) {
-                UserSettings.DEFAULT_REMOTE_CONFIG_URL
-            } else {
-                configured
-            }
-        }.getOrDefault(UserSettings.DEFAULT_REMOTE_CONFIG_URL)).trim()
+        val configuredUrl = resolveConfiguredUrl()
+        val rawTargetUrl = (customUrl ?: configuredUrl).trim()
 
         val allowedOrigin = if (allowTestLoopback) rawTargetUrl else null
-        val targetUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(rawTargetUrl, allowedOrigin)
-        if (targetUrl == null) {
-            val err = "Blocked invalid or non-HTTPS remote config URL"
-            _lastFetchError.value = err
-            _isRefreshing.value = false
-            updateStatus(
-                config = baseline,
-                previous = prevCached,
-                etag = cachedEtag,
-                lastModified = cachedLastMod,
-                lastSyncedAtMs = cachedSyncMs,
-                isFromCache = cached != null,
-                was304 = false,
-                error = err,
-                sourceUrl = rawTargetUrl
-            )
-            return@withContext baseline
+        val targetUrl = when (val urlCheck = InputAndUrlSecurity.validateRemoteConfigUrlDetailed(rawTargetUrl, allowedOrigin)) {
+            is InputAndUrlSecurity.RemoteConfigUrlValidationResult.Invalid -> {
+                _lastFetchError.value = urlCheck.reason
+                _isRefreshing.value = false
+                updateStatus(
+                    config = baseline,
+                    previous = prevCached,
+                    etag = cachedEtag,
+                    lastModified = cachedLastMod,
+                    lastSyncedAtMs = cachedSyncMs,
+                    isFromCache = cached != null,
+                    was304 = false,
+                    error = urlCheck.reason,
+                    errorType = RemoteConfigErrorType.URL_ERROR,
+                    sourceUrl = configuredUrl
+                )
+                return@withContext baseline
+            }
+            is InputAndUrlSecurity.RemoteConfigUrlValidationResult.Valid -> urlCheck.normalizedUrl
         }
 
         val now = System.currentTimeMillis()
@@ -183,17 +294,20 @@ class RemoteConfigRepository(
         }
         lastRefreshMs.set(now)
 
+        val canUseConditionalHeaders = customUrl == null && (cachedMetaUrl == null || cachedMetaUrl == targetUrl)
+
         return@withContext try {
             when (val result = fetchAndValidateConfig(
                 url = targetUrl,
-                currentEtag = if (customUrl == null) (cachedEtag ?: baseline.etag) else null,
-                currentLastModified = if (customUrl == null) (cachedLastMod ?: baseline.lastModified) else null
+                currentEtag = if (canUseConditionalHeaders) (cachedEtag ?: baseline.etag) else null,
+                currentLastModified = if (canUseConditionalHeaders) (cachedLastMod ?: baseline.lastModified) else null
             )) {
                 is FetchOutcome.NotModified -> {
                     settingsRepository.saveRemoteConfigHttpMetadata(
                         etag = result.etag ?: cachedEtag,
                         lastModified = result.lastModified ?: cachedLastMod,
-                        syncedAtMs = now
+                        syncedAtMs = now,
+                        sourceUrl = targetUrl
                     )
                     _lastFetchError.value = null
                     _isRefreshing.value = false
@@ -206,6 +320,7 @@ class RemoteConfigRepository(
                         isFromCache = true,
                         was304 = true,
                         error = null,
+                        errorType = RemoteConfigErrorType.NONE,
                         sourceUrl = targetUrl
                     )
                     baseline
@@ -214,7 +329,7 @@ class RemoteConfigRepository(
                     val fetched = result.config
                     configMutex.withLock {
                         stateUpdatedExplicitly.set(true)
-                        settingsRepository.saveRemoteProvidersConfig(fetched)
+                        settingsRepository.saveRemoteProvidersConfig(fetched, sourceUrl = targetUrl)
                         val newPrev = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
                         _activeConfig.value = fetched
                         _previousConfig.value = newPrev
@@ -229,6 +344,7 @@ class RemoteConfigRepository(
                             isFromCache = false,
                             was304 = false,
                             error = null,
+                            errorType = RemoteConfigErrorType.NONE,
                             sourceUrl = targetUrl
                         )
                     }
@@ -236,8 +352,7 @@ class RemoteConfigRepository(
                 }
             }
         } catch (t: Throwable) {
-            val safeErr = InputAndUrlSecurity.sanitizeErrorForDiagnostics(t.localizedMessage)
-                ?: "Offline or invalid remote provider configuration"
+            val (errType, safeErr) = classifyError(t)
             _lastFetchError.value = safeErr
             _isRefreshing.value = false
             updateStatus(
@@ -249,13 +364,15 @@ class RemoteConfigRepository(
                 isFromCache = cached != null,
                 was304 = false,
                 error = safeErr,
-                sourceUrl = targetUrl
+                errorType = errType,
+                sourceUrl = configuredUrl
             )
             baseline
         }
     }
 
     suspend fun rollbackToPreviousConfig(): RemoteProvidersConfig? = withContext(Dispatchers.IO) {
+        val configuredUrl = resolveConfiguredUrl()
         configMutex.withLock {
             stateUpdatedExplicitly.set(true)
             val restored = settingsRepository.rollbackRemoteProvidersConfig() ?: return@withContext null
@@ -272,7 +389,9 @@ class RemoteConfigRepository(
                 lastSyncedAtMs = sanitized.updatedAtMs,
                 isFromCache = true,
                 was304 = false,
-                error = null
+                error = null,
+                errorType = RemoteConfigErrorType.NONE,
+                sourceUrl = configuredUrl
             )
             sanitized
         }
@@ -289,8 +408,12 @@ class RemoteConfigRepository(
         currentLastModified: String? = null
     ): FetchOutcome {
         val allowedOrigin = if (allowTestLoopback) url else null
-        val safeUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(url, allowedOrigin)
-            ?: throw IOException("Blocked unsafe remote config URL")
+        val safeUrl = when (val check = InputAndUrlSecurity.validateRemoteConfigUrlDetailed(url, allowedOrigin)) {
+            is InputAndUrlSecurity.RemoteConfigUrlValidationResult.Invalid -> {
+                throw RemoteConfigValidationException(RemoteConfigErrorType.URL_ERROR, check.reason)
+            }
+            is InputAndUrlSecurity.RemoteConfigUrlValidationResult.Valid -> check.normalizedUrl
+        }
 
         val reqBuilder = Request.Builder()
             .url(safeUrl)
@@ -302,25 +425,39 @@ class RemoteConfigRepository(
             reqBuilder.header("If-Modified-Since", currentLastModified)
         }
 
-        timeoutClient.newCall(reqBuilder.build()).execute().use { response ->
-            val respEtag = response.header("ETag")
-            val respLastMod = response.header("Last-Modified")
-            if (response.code == 304) {
-                return FetchOutcome.NotModified(etag = respEtag, lastModified = respLastMod)
+        try {
+            timeoutClient.newCall(reqBuilder.build()).execute().use { response ->
+                val respEtag = response.header("ETag")
+                val respLastMod = response.header("Last-Modified")
+                if (response.code == 304) {
+                    return FetchOutcome.NotModified(etag = respEtag, lastModified = respLastMod)
+                }
+                if (!response.isSuccessful) {
+                    throw RemoteConfigValidationException(
+                        RemoteConfigErrorType.NETWORK_ERROR,
+                        "HTTP ${response.code} fetching remote providers config"
+                    )
+                }
+                val body = InputAndUrlSecurity.readBodyBounded(response.body, MAX_CONFIG_BYTES)
+                if (body.isBlank()) {
+                    throw RemoteConfigValidationException(
+                        RemoteConfigErrorType.JSON_PARSE_ERROR,
+                        "Empty remote providers config response"
+                    )
+                }
+                val parsed = parseProvidersJson(
+                    rawJson = body,
+                    etag = respEtag,
+                    lastModified = respLastMod
+                )
+                return FetchOutcome.Updated(parsed)
             }
-            if (!response.isSuccessful) {
-                throw IOException("HTTP ${response.code} fetching remote providers config")
-            }
-            val body = InputAndUrlSecurity.readBodyBounded(response.body, MAX_CONFIG_BYTES)
-            if (body.isBlank()) {
-                throw IOException("Empty remote providers config response")
-            }
-            val parsed = parseProvidersJson(
-                rawJson = body,
-                etag = respEtag,
-                lastModified = respLastMod
-            )
-            return FetchOutcome.Updated(parsed)
+        } catch (e: RemoteConfigValidationException) {
+            throw e
+        } catch (e: IOException) {
+            val detail = InputAndUrlSecurity.sanitizeErrorForDiagnostics(e.localizedMessage)
+                ?: "Network error while fetching configuration"
+            throw RemoteConfigValidationException(RemoteConfigErrorType.NETWORK_ERROR, detail, e)
         }
     }
 
@@ -338,6 +475,16 @@ class RemoteConfigRepository(
         )
     }
 
+    private fun classifyError(t: Throwable): Pair<RemoteConfigErrorType, String> {
+        if (t is RemoteConfigValidationException) {
+            val safeMsg = InputAndUrlSecurity.sanitizeErrorForDiagnostics(t.message) ?: t.errorType.label
+            return t.errorType to safeMsg
+        }
+        val safeErr = InputAndUrlSecurity.sanitizeErrorForDiagnostics(t.localizedMessage)
+            ?: "Network or configuration error"
+        return RemoteConfigErrorType.NETWORK_ERROR to safeErr
+    }
+
     private fun updateStatus(
         config: RemoteProvidersConfig,
         previous: RemoteProvidersConfig?,
@@ -347,6 +494,7 @@ class RemoteConfigRepository(
         isFromCache: Boolean,
         was304: Boolean,
         error: String?,
+        errorType: RemoteConfigErrorType = RemoteConfigErrorType.NONE,
         sourceUrl: String = _status.value.sourceUrl
     ) {
         _status.value = RemoteConfigStatus(
@@ -362,7 +510,10 @@ class RemoteConfigRepository(
             previousConfigVersion = previous?.configVersion,
             providerCount = config.providers.size,
             enabledProviderCount = config.providers.count { it.enabled },
-            lastError = error
+            lyricsEndpointCount = config.lrclib.size,
+            categories = config.distinctCategories(),
+            lastError = error,
+            lastErrorType = errorType
         )
     }
 

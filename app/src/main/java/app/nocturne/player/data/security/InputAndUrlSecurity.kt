@@ -205,6 +205,67 @@ object InputAndUrlSecurity {
         return parsed.newBuilder().fragment(null).build().toString()
     }
 
+    sealed interface RemoteConfigUrlValidationResult {
+        data class Valid(val normalizedUrl: String) : RemoteConfigUrlValidationResult
+        data class Invalid(val reason: String) : RemoteConfigUrlValidationResult
+    }
+
+    fun validateRemoteConfigUrlDetailed(
+        rawUrl: String?,
+        allowedLoopbackOrigin: String? = null
+    ): RemoteConfigUrlValidationResult {
+        val trimmed = rawUrl?.trim().orEmpty()
+        if (trimmed.isBlank()) {
+            return RemoteConfigUrlValidationResult.Invalid("Provider JSON URL cannot be empty")
+        }
+        if (hasControlChars(trimmed) || trimmed.any { it.isWhitespace() }) {
+            return RemoteConfigUrlValidationResult.Invalid("URL contains invalid whitespace or control characters")
+        }
+
+        val parsed = trimmed.toHttpUrlOrNull()
+            ?: return RemoteConfigUrlValidationResult.Invalid("Malformed URL. Expected a valid https:// raw JSON URL")
+
+        if (parsed.username.isNotEmpty() || parsed.password.isNotEmpty()) {
+            return RemoteConfigUrlValidationResult.Invalid("URL must not contain embedded credentials")
+        }
+
+        val cleanHost = parsed.host.trim().trimEnd('.').lowercase()
+        if (cleanHost.isBlank()) {
+            return RemoteConfigUrlValidationResult.Invalid("URL is missing a host name")
+        }
+
+        if (cleanHost == "github.com" || cleanHost == "www.github.com") {
+            return RemoteConfigUrlValidationResult.Invalid(
+                "Use a GitHub Raw JSON URL (raw.githubusercontent.com) instead of a github.com page URL"
+            )
+        }
+
+        if (allowedLoopbackOrigin != null) {
+            val allowed = allowedLoopbackOrigin.trim().toHttpUrlOrNull()
+            if (allowed != null &&
+                parsed.scheme == allowed.scheme &&
+                cleanHost == allowed.host.lowercase() &&
+                parsed.port == allowed.port &&
+                isLoopbackHost(cleanHost)
+            ) {
+                return RemoteConfigUrlValidationResult.Valid(
+                    parsed.newBuilder().fragment(null).build().toString()
+                )
+            }
+        }
+
+        if (!parsed.isHttps) {
+            return RemoteConfigUrlValidationResult.Invalid("Only HTTPS URLs are allowed")
+        }
+        if (!isPublicHostnameAndNotPrivateLiteral(cleanHost)) {
+            return RemoteConfigUrlValidationResult.Invalid("Blocked private, loopback, or restricted host: $cleanHost")
+        }
+
+        return RemoteConfigUrlValidationResult.Valid(
+            parsed.newBuilder().fragment(null).build().toString()
+        )
+    }
+
     fun validateRemoteBaseUrl(
         rawUrl: String?,
         allowLoopback: Boolean = false
@@ -408,10 +469,11 @@ object InputAndUrlSecurity {
     }
 
     fun sanitizeUserSettings(raw: UserSettings): UserSettings {
-        val migratedRawUrl = if (raw.remoteProviderConfigUrl.trim() == UserSettings.LEGACY_REMOTE_CONFIG_URL) {
+        val trimmedConfigUrl = raw.remoteProviderConfigUrl.trim()
+        val migratedRawUrl = if (trimmedConfigUrl == UserSettings.LEGACY_REMOTE_CONFIG_URL || trimmedConfigUrl.isBlank()) {
             UserSettings.DEFAULT_REMOTE_CONFIG_URL
         } else {
-            raw.remoteProviderConfigUrl
+            trimmedConfigUrl
         }
         val validatedConfigUrl = validateRemoteHttpsUrl(migratedRawUrl)
             ?: UserSettings.DEFAULT_REMOTE_CONFIG_URL
