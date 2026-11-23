@@ -1,0 +1,41 @@
+# Secrets & Local Environment Files
+.env
+.env.local
+.env.*.local
+*.jks
+*.keystore
+!debug.keystore.base64
+keystore.properties
+local.properties
+
+# Android / Gradle Build Outputs & Caches
+build/
+app/build/
+.gradle/
+.build-outputs/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Node / Tooling (if present)
+node_modules/
+
+# Local Database, Room, Audio Cache & Temp Files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+cache/
+app/cache/
+*.lrc.cache
+
+# IDE & OS Files
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+captures/
+.cxx/
+.externalNativeBuild/
