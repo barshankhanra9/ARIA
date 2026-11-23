@@ -116,7 +116,11 @@ android {
             val abiOffset = abiVersionCodes[abiName] ?: 0
             apkOutput?.versionCodeOverride = baseVersionCode * 10 + abiOffset
             val abiLabel = abiName ?: "universal"
-            baseOutput?.outputFileName = "AriaMusic-v${appVersionName}-${abiLabel}.apk"
+            baseOutput?.outputFileName = if (buildType.name == "debug" && abiName == null) {
+                "app-debug.apk"
+            } else {
+                "AriaMusic-v${appVersionName}-${abiLabel}.apk"
+            }
         }
     }
 }
