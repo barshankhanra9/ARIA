@@ -12,7 +12,8 @@ object StreamQualitySelector {
     fun selectBestAudioStream(
         streams: List<OnlineAudioStream>,
         speedTier: NetworkSpeedTier,
-        allowedLoopbackOrigin: String? = null
+        allowedLoopbackOrigin: String? = null,
+        preferWebmOpus: Boolean = false
     ): OnlineAudioStream? {
         val valid = streams.mapNotNull { stream ->
             val safeUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(stream.url, allowedLoopbackOrigin)
@@ -21,7 +22,17 @@ object StreamQualitySelector {
         }
         if (valid.isEmpty()) return null
 
-        val scored = valid.map { stream ->
+        val pool = if (preferWebmOpus && speedTier != NetworkSpeedTier.SLOW_OR_METERED) {
+            valid.filter { s ->
+                val mime = s.mimeType.lowercase()
+                val codec = s.codec.lowercase()
+                "webm" in mime || "opus" in codec
+            }.ifEmpty { valid }
+        } else {
+            valid
+        }
+
+        val scored = pool.map { stream ->
             stream to scoreStream(stream, speedTier)
         }
         return scored.maxByOrNull { it.second }?.first

@@ -456,6 +456,11 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onOpenPlaylist = { pl ->
                                         onlinePlaylistTarget = OnlinePlaylistViewTarget.Custom(pl.id)
                                         currentTab = AppTab.PLAYLISTS
+                                    },
+                                    onOpenCuratedPlaylist = { al ->
+                                        val target = al.url.ifBlank { al.id }
+                                        lastAlbumNav = OnlineNavTarget(target, al.providerType, al.providerId)
+                                        viewModel.online.openAlbum(target, al.providerType, al.providerId)
                                     }
                                 )
                             } else {

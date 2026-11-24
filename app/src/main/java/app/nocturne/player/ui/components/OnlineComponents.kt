@@ -57,6 +57,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.OnlinePlaylist
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.PlaybackMode
@@ -198,15 +199,16 @@ fun OnlineTrackListRow(
                 PrintedArtwork(
                     trackUri = track.thumbnailUrl,
                     customCoverUri = track.thumbnailUrl,
-                    modifier = Modifier.size(52.dp),
-                    mattePadding = 3.dp,
-                    targetSizePx = 192
+                    artworkShape = ArtworkShape.SOFT_SQUARE,
+                    modifier = Modifier.size(56.dp),
+                    mattePadding = 2.dp,
+                    targetSizePx = 500
                 )
                 if (isCurrent) {
                     Box(
                         modifier = Modifier
-                            .size(52.dp)
-                            .clip(RoundedCornerShape(4.dp))
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(8.dp))
                             .background(palette.inkPrimary.copy(alpha = 0.52f)),
                         contentAlignment = Alignment.Center
                     ) {
@@ -222,7 +224,7 @@ fun OnlineTrackListRow(
                     text = track.title,
                     style = MaterialTheme.typography.titleMedium,
                     color = if (isCurrent) palette.accent else palette.inkPrimary,
-                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.SemiBold,
+                    fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )

@@ -301,10 +301,21 @@ object OnlineDependencies {
     private var remoteConfigRepository: RemoteConfigRepository? = null
 
     @Volatile
+    private var healthTracker: ProviderHealthTracker? = null
+
+    @Volatile
     private var providerManager: OnlineProviderManager? = null
 
     @Volatile
     private var repository: OnlineLibraryRepository? = null
+
+    fun getHealthTracker(): ProviderHealthTracker {
+        return healthTracker ?: synchronized(this) {
+            healthTracker ?: ProviderHealthTracker().also {
+                healthTracker = it
+            }
+        }
+    }
 
     fun getRemoteConfigRepository(context: Context): RemoteConfigRepository {
         return remoteConfigRepository ?: synchronized(this) {
@@ -319,8 +330,14 @@ object OnlineDependencies {
     fun getProviderManager(context: Context): OnlineProviderManager {
         val appCtx = context.applicationContext
         val configRepo = getRemoteConfigRepository(appCtx)
+        val tracker = getHealthTracker()
         return providerManager ?: synchronized(this) {
-            providerManager ?: OnlineProviderManager(appCtx, configRepo).also {
+            providerManager ?: OnlineProviderManager(
+                providers = null,
+                healthTracker = tracker,
+                networkMonitor = NetworkMonitor(appCtx),
+                remoteConfigRepository = configRepo
+            ).also {
                 providerManager = it
             }
         }

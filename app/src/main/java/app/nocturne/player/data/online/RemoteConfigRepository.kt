@@ -1,6 +1,8 @@
 package app.nocturne.player.data.online
 
+import app.nocturne.player.data.model.DynamicLyricsProviderConfig
 import app.nocturne.player.data.model.DynamicProviderConfig
+import app.nocturne.player.data.model.LyricsCleaningConfig
 import app.nocturne.player.data.model.RemoteConfigErrorType
 import app.nocturne.player.data.model.RemoteConfigStatus
 import app.nocturne.player.data.model.RemoteProvidersConfig
@@ -133,7 +135,25 @@ class RemoteConfigRepository(
 
     fun audiUsEndpoints(): List<String> = _activeConfig.value.audius
 
-    fun lrclibEndpoints(): List<String> = _activeConfig.value.lrclib
+    fun lrclibEndpoints(): List<String> {
+        val cfg = _activeConfig.value
+        val hasExplicitLrclib = cfg.lyricsProviders.any {
+            it.id.equals("lrclib", ignoreCase = true) || it.adapterType.equals("lrclib", ignoreCase = true)
+        }
+        return if (hasExplicitLrclib) cfg.lrclibEndpointsOnly() else cfg.lrclib
+    }
+
+    fun lrclibConfig(): DynamicLyricsProviderConfig? = _activeConfig.value.lrclibConfig()
+
+    fun liriqoConfig(): DynamicLyricsProviderConfig? = _activeConfig.value.liriqoConfig()
+
+    fun musixmatchConfig(): DynamicLyricsProviderConfig? = _activeConfig.value.musixmatchConfig()
+
+    fun jiosaavnLyricsConfig(): DynamicLyricsProviderConfig? = _activeConfig.value.jiosaavnLyricsConfig()
+
+    fun lyricsCleaningConfig(): LyricsCleaningConfig = _activeConfig.value.lyricsCleaning
+
+    fun providerDefaults(): app.nocturne.player.data.model.ProviderDefaultsConfig = _activeConfig.value.providerDefaults
 
     fun enabledProviders(): List<DynamicProviderConfig> = _activeConfig.value.enabledProviders()
 

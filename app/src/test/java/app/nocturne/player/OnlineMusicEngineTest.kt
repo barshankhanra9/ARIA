@@ -7,8 +7,17 @@ import androidx.room.Room
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
+import app.nocturne.player.data.audio.LyricsManager
 import app.nocturne.player.data.audio.LyricsRepository
+import app.nocturne.player.data.audio.MetadataCleaner
+import app.nocturne.player.data.audio.lyrics.JioSaavnLyricsAdapter
+import app.nocturne.player.data.audio.lyrics.LiriQoLyricsAdapter
+import app.nocturne.player.data.audio.lyrics.LrcLibLyricsAdapter
+import app.nocturne.player.data.audio.lyrics.LyricsQuery
+import app.nocturne.player.data.audio.lyrics.MusixmatchLyricsAdapter
 import app.nocturne.player.data.db.AriaDatabase
+import app.nocturne.player.data.model.DynamicLyricsProviderConfig
+import app.nocturne.player.data.model.LyricsCleaningConfig
 import app.nocturne.player.data.model.LyricsSource
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
@@ -31,6 +40,7 @@ import app.nocturne.player.data.online.OnlineProviderManager
 import app.nocturne.player.data.online.PipedProvider
 import app.nocturne.player.data.online.ProviderHealthTracker
 import app.nocturne.player.data.online.RemoteConfigRepository
+import app.nocturne.player.data.online.RemoteConfigValidator
 import app.nocturne.player.data.online.StreamQualitySelector
 import app.nocturne.player.data.online.StreamResolutionCache
 import app.nocturne.player.data.prefs.SettingsRepository
@@ -631,8 +641,7 @@ class OnlineMusicEngineTest {
         server.start()
         try {
             val baseUrl = server.url("").toString().trimEnd('/')
-            // 1. /api/get returns 404 -> falls back to /api/search
-            server.enqueue(MockResponse().setResponseCode(404).setBody("""{"message":"Not Found"}"""))
+            // Direct /api/search?q=<cleaned_title>+<cleaned_artist> query
             server.enqueue(
                 MockResponse().setResponseCode(200).setBody(
                     """
@@ -693,6 +702,9 @@ class OnlineMusicEngineTest {
             )
 
             val live = repo.loadLyricsForTrack(track)
+            val req = server.takeRequest(2, TimeUnit.SECONDS)
+            assertNotNull(req)
+            assertTrue(req!!.path.orEmpty().startsWith("/api/search?q="))
             assertEquals(LyricsSource.LRCLIB, live.source)
             assertFalse(live.fromCache)
             assertEquals(2, live.syncedLines.size)
@@ -836,6 +848,737 @@ class OnlineMusicEngineTest {
         assertEquals(2, artists.size)
         assertEquals("art_with_img", artists[0].id)
         assertEquals("Arijit Singh", artists[0].name)
+    }
+
+    @Test
+    fun jioSaavnProvider_resolves320kbpsByDefaultAndUpgrades500x500Artwork() = runTest {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val baseUrl = server.url("/api").toString().trimEnd('/')
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """
+                    {
+                      "success": true,
+                      "data": {
+                        "results": [
+                          {
+                            "id": "saavn_320",
+                            "name": "Starlight",
+                            "duration": "205",
+                            "album": { "name": "Midnight Album", "url": "https://www.jiosaavn.com/album/mid/a1" },
+                            "artists": { "primary": [{ "id": "art1", "name": "Muse", "url": "https://www.jiosaavn.com/artist/muse/art1" }] },
+                            "image": [
+                              { "quality": "150x150", "url": "https://c.saavncdn.com/123/art-150x150.jpg" }
+                            ],
+                            "encrypted_media_url": "enc_abc_xyz",
+                            "downloadUrl": [
+                              { "quality": "96kbps", "url": "https://aac.saavncdn.com/123/track_96.mp4" },
+                              { "quality": "320kbps", "url": "https://aac.saavncdn.com/123/track_320.mp4" }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                    """.trimIndent()
+                )
+            )
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """
+                    {
+                      "success": true,
+                      "data": [
+                        {
+                          "id": "saavn_320",
+                          "name": "Starlight",
+                          "duration": "205",
+                          "encrypted_media_url": "enc_abc_xyz",
+                          "downloadUrl": [
+                            { "quality": "96kbps", "url": "https://aac.saavncdn.com/123/track_96.mp4" },
+                            { "quality": "320kbps", "url": "https://aac.saavncdn.com/123/track_320.mp4" }
+                          ]
+                        }
+                      ]
+                    }
+                    """.trimIndent()
+                )
+            )
+
+            val provider = JioSaavnProvider(
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(baseUrl)
+            )
+            val page = provider.search("Starlight", OnlineSearchFilter.SONGS, null)
+            assertEquals(1, page.tracks.size)
+            val track = page.tracks[0]
+            assertEquals("https://c.saavncdn.com/123/art-500x500.jpg", track.thumbnailUrl)
+            assertEquals("enc_abc_xyz", track.saavnEncryptedUrl)
+            assertEquals("https://c.saavncdn.com/123/art-500x500.jpg", track.toUnifiedTrack().artworkUrl)
+
+            val stream = provider.resolveStream(track, NetworkSpeedTier.STANDARD)
+            assertEquals(320, stream.selectedStream.bitrateKbps)
+            assertEquals("320kbps AAC", stream.selectedStream.formatLabel)
+            assertTrue(stream.selectedStream.url.endsWith("_320.mp4"))
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun pipedProvider_excludesVideoOnlyAndPrefersHighestBitrateWebmOpus() = runTest {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val baseUrl = server.url("").toString().trimEnd('/')
+            server.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """
+                    {
+                      "title": "Demo Video",
+                      "uploader": "Channel",
+                      "duration": 180,
+                      "thumbnailUrl": "https://img.example/thumb.jpg",
+                      "audioStreams": [
+                        { "url": "https://cdn.example/video_only.webm", "bitrate": 320000, "mimeType": "audio/webm", "codec": "opus", "videoOnly": true },
+                        { "url": "https://cdn.example/aac_256.m4a", "bitrate": 256000, "mimeType": "audio/mp4", "codec": "mp4a.40.2", "videoOnly": false },
+                        { "url": "https://cdn.example/opus_160.webm", "bitrate": 160000, "mimeType": "audio/webm", "codec": "opus", "videoOnly": false },
+                        { "url": "https://cdn.example/opus_96.webm", "bitrate": 96000, "mimeType": "audio/webm", "codec": "opus", "videoOnly": false }
+                      ],
+                      "relatedStreams": []
+                    }
+                    """.trimIndent()
+                )
+            )
+
+            val provider = PipedProvider(
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(baseUrl)
+            )
+            val track = OnlineTrack(
+                id = OnlineTrack.canonicalId(OnlineProviderType.PIPED, "dQw4w9WgXcQ"),
+                sourceId = "dQw4w9WgXcQ",
+                providerType = OnlineProviderType.PIPED,
+                sourceUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                title = "Demo Video",
+                artist = "Channel"
+            )
+            val resolved = provider.resolveStream(track, NetworkSpeedTier.STANDARD)
+            assertEquals("https://cdn.example/opus_160.webm", resolved.selectedStream.url)
+            assertEquals(160, resolved.selectedStream.bitrateKbps)
+            assertEquals("Opus 160k", resolved.selectedStream.formatLabel)
+            assertFalse(resolved.streams.any { it.url.contains("video_only") })
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun searchDecoupling_queriesOnlyJioSaavnForSongsAndPipedInvidiousForVideosRemixes() = runTest {
+        var pipedCalledForSongs = false
+        val jioSaavn = object : FakeProvider(OnlineProviderType.JIOSAAVN) {
+            override suspend fun search(query: String, filter: OnlineSearchFilter, pageToken: String?): OnlineSearchPage {
+                return OnlineSearchPage(
+                    query = query,
+                    tracks = listOf(
+                        sampleTrack("js_clean", title = "Kesariya", artist = "Arijit Singh", durationMs = 268_000L)
+                            .copy(id = OnlineTrack.canonicalId(OnlineProviderType.JIOSAAVN, "js_clean"), providerType = OnlineProviderType.JIOSAAVN)
+                    ),
+                    providerUsed = OnlineProviderType.JIOSAAVN
+                )
+            }
+        }
+        val piped = object : FakeProvider(OnlineProviderType.PIPED) {
+            override suspend fun search(query: String, filter: OnlineSearchFilter, pageToken: String?): OnlineSearchPage {
+                if (filter == OnlineSearchFilter.SONGS) pipedCalledForSongs = true
+                return OnlineSearchPage(
+                    query = query,
+                    tracks = listOf(
+                        sampleTrack("piped_remix", title = "Kesariya (Live Unplugged 25m)", durationMs = 1_500_000L)
+                            .copy(id = OnlineTrack.canonicalId(OnlineProviderType.PIPED, "piped_remix"), providerType = OnlineProviderType.PIPED)
+                    ),
+                    providerUsed = OnlineProviderType.PIPED
+                )
+            }
+        }
+
+        val manager = OnlineProviderManager(
+            providers = mapOf(
+                OnlineProviderType.JIOSAAVN to jioSaavn,
+                OnlineProviderType.PIPED to piped
+            ),
+            healthTracker = ProviderHealthTracker()
+        )
+
+        val songsPage = manager.search("Kesariya", OnlineSearchFilter.SONGS, null)
+        assertFalse(pipedCalledForSongs)
+        assertEquals(OnlineProviderType.JIOSAAVN, songsPage.providerUsed)
+        assertEquals(listOf("js_clean"), songsPage.tracks.map { it.sourceId })
+
+        val videosPage = manager.search("Kesariya unplugged", OnlineSearchFilter.VIDEOS_REMIXES, null)
+        assertEquals(OnlineProviderType.PIPED, videosPage.providerUsed)
+        assertEquals(listOf("piped_remix"), videosPage.tracks.map { it.sourceId })
+    }
+
+    @Test
+    fun playbackResolver_fallsBackToPipedThenInvidiousWithin3SecondsAndPreservesCleanMetadata() = runTest {
+        val failingSaavn = object : FakeProvider(OnlineProviderType.JIOSAAVN) {
+            override suspend fun resolveStream(track: OnlineTrack, speedTier: NetworkSpeedTier): OnlineStreamResolution {
+                throw IOException("Saavn CDN unavailable")
+            }
+        }
+        var pipedSearchQuery = ""
+        val pipedNoExactDuration = object : FakeProvider(OnlineProviderType.PIPED) {
+            override suspend fun search(query: String, filter: OnlineSearchFilter, pageToken: String?): OnlineSearchPage {
+                pipedSearchQuery = query
+                return OnlineSearchPage(
+                    query = query,
+                    tracks = listOf(
+                        // 15s off -> outside +/-3s tolerance
+                        sampleTrack("piped_wrong_len", title = "Blinding Lights", artist = "The Weeknd", durationMs = 215_000L)
+                            .copy(providerType = OnlineProviderType.PIPED)
+                    ),
+                    providerUsed = OnlineProviderType.PIPED
+                )
+            }
+        }
+        val invidiousExact = object : FakeProvider(OnlineProviderType.INVIDIOUS) {
+            override suspend fun search(query: String, filter: OnlineSearchFilter, pageToken: String?): OnlineSearchPage {
+                return OnlineSearchPage(
+                    query = query,
+                    tracks = listOf(
+                        sampleTrack("inv_exact", title = "Blinding Lights (Official Audio)", artist = "WeekndVEVO", durationMs = 201_500L)
+                            .copy(providerType = OnlineProviderType.INVIDIOUS, thumbnailUrl = "https://i.ytimg.com/vi/inv_exact/hqdefault.jpg")
+                    ),
+                    providerUsed = OnlineProviderType.INVIDIOUS
+                )
+            }
+
+            override suspend fun resolveStream(track: OnlineTrack, speedTier: NetworkSpeedTier): OnlineStreamResolution {
+                return OnlineStreamResolution(
+                    track = track,
+                    streams = emptyList(),
+                    selectedStream = OnlineAudioStream(
+                        url = "https://invidious.example/audio/opus_160.webm",
+                        bitrateKbps = 160,
+                        mimeType = "audio/webm",
+                        codec = "opus",
+                        formatLabel = "Opus 160k",
+                        expiresAtMs = System.currentTimeMillis() + 3_600_000L
+                    ),
+                    resolvedBy = OnlineProviderType.INVIDIOUS
+                )
+            }
+        }
+
+        val manager = OnlineProviderManager(
+            providers = mapOf(
+                OnlineProviderType.JIOSAAVN to failingSaavn,
+                OnlineProviderType.PIPED to pipedNoExactDuration,
+                OnlineProviderType.INVIDIOUS to invidiousExact
+            ),
+            healthTracker = ProviderHealthTracker(failureThreshold = 1)
+        )
+
+        val cleanSaavnTrack = OnlineTrack(
+            id = OnlineTrack.canonicalId(OnlineProviderType.JIOSAAVN, "saavn_bl"),
+            sourceId = "saavn_bl",
+            providerType = OnlineProviderType.JIOSAAVN,
+            providerLabel = "JioSaavn",
+            sourceUrl = "https://www.jiosaavn.com/song/bl/saavn_bl",
+            title = "Blinding Lights",
+            artist = "The Weeknd",
+            album = "After Hours",
+            durationMs = 200_000L,
+            thumbnailUrl = "https://c.saavncdn.com/bl-500x500.jpg"
+        )
+
+        val resolution = manager.resolveStream(cleanSaavnTrack, forceRefresh = true)
+        assertTrue(pipedSearchQuery.contains("Blinding Lights"))
+        assertTrue(pipedSearchQuery.contains("official audio", ignoreCase = true))
+        assertEquals(OnlineProviderType.INVIDIOUS, resolution.resolvedBy)
+        assertEquals("https://invidious.example/audio/opus_160.webm", resolution.selectedStream.url)
+        // Original clean JioSaavn title & 500x500 artwork are preserved on screen
+        assertEquals("Blinding Lights", resolution.track.title)
+        assertEquals("The Weeknd", resolution.track.artist)
+        assertEquals("https://c.saavncdn.com/bl-500x500.jpg", resolution.track.thumbnailUrl)
+    }
+
+    @Test
+    fun metadataCleaner_appliesConfigRegexesAndDelimiters() {
+        val cleaned = MetadataCleaner.clean(
+            rawTitle = "The Weeknd - Blinding Lights (Official Video) [4K] ft. Rosalía | Lyrical",
+            rawArtist = "The Weeknd - Topic",
+            config = LyricsCleaningConfig()
+        )
+        assertEquals("Blinding Lights", cleaned.title)
+        assertEquals("The Weeknd", cleaned.artist)
+    }
+
+    @Test
+    fun lyricsManager_executesFourTierFallbackWithMusixmatchTokenRefreshAndCachesInRoom() = runTest {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AriaDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val liriQoServer = MockWebServer()
+        val mxmServer = MockWebServer()
+        liriQoServer.start()
+        mxmServer.start()
+
+        try {
+            // Tier 1 LiriQo returns 404 -> falls back to Tier 2 Musixmatch
+            liriQoServer.enqueue(MockResponse().setResponseCode(404))
+
+            // Tier 2 Musixmatch: token.get -> macro returns 401 -> refreshes token -> macro returns synced LRC
+            mxmServer.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """{"message":{"header":{"status_code":200},"body":{"user_token":"expired_tok"}}}"""
+                )
+            )
+            mxmServer.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """{"message":{"header":{"status_code":401},"body":{}}}"""
+                )
+            )
+            mxmServer.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """{"message":{"header":{"status_code":200},"body":{"user_token":"fresh_tok_123"}}}"""
+                )
+            )
+            mxmServer.enqueue(
+                MockResponse().setResponseCode(200).setBody(
+                    """
+                    {
+                      "message": {
+                        "header": { "status_code": 200 },
+                        "body": {
+                          "macro_calls": {
+                            "track.subtitles.get": {
+                              "message": {
+                                "body": {
+                                  "subtitle_list": [
+                                    { "subtitle": { "subtitle_body": "[00:04.00]City lights glow\n[00:08.50]Night drives slow" } }
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                    """.trimIndent()
+                )
+            )
+
+            val liriQo = LiriQoLyricsAdapter(
+                configProvider = { DynamicLyricsProviderConfig(id = "liriqo", enabled = true) },
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(liriQoServer.url("").toString().trimEnd('/'))
+            )
+            val musixmatch = MusixmatchLyricsAdapter(
+                configProvider = {
+                    DynamicLyricsProviderConfig(
+                        id = "musixmatch",
+                        enabled = true,
+                        userAgent = "CustomAgent/1.0",
+                        cookie = "mxm_sess=abc",
+                        appId = "web-desktop-app-v1.0"
+                    )
+                },
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(mxmServer.url("").toString().trimEnd('/'))
+            )
+
+            val manager = LyricsManager(
+                context = context,
+                db = db,
+                remoteConfigRepository = RemoteConfigRepository(
+                    settingsRepository = SettingsRepository(context),
+                    baseClient = OkHttpClient(),
+                    allowTestLoopback = true
+                ),
+                providersOverride = listOf(liriQo, musixmatch)
+            )
+
+            val track = Track(
+                id = 505L,
+                uriString = "aria-online://piped/abc505",
+                filePath = "",
+                displayName = "City Lights (Official Video) [HD]",
+                title = "City Lights (Official Video) [HD]",
+                artist = "NightRunner - Topic",
+                album = "Online",
+                albumArtist = "NightRunner",
+                genre = "Synth",
+                year = 2025,
+                trackNumber = 1,
+                discNumber = 1,
+                composer = "",
+                durationMs = 190_000L,
+                sizeBytes = 0L,
+                dateAddedSec = 0L,
+                dateModifiedSec = 0L,
+                mimeType = "audio/webm",
+                formatLabel = "Opus 160k",
+                bitrateKbps = 160,
+                sampleRateHz = 48000,
+                channelCount = 2,
+                folderPath = "",
+                folderName = "Piped",
+                isOnline = true,
+                onlineTrackId = "YOUTUBE:abc505",
+                onlineSourceId = "abc505",
+                onlineProvider = "Piped"
+            )
+
+            val fetched = manager.loadLyricsForTrack(track)
+            assertEquals(LyricsSource.MUSIXMATCH, fetched.source)
+            assertFalse(fetched.fromCache)
+            assertEquals(2, fetched.syncedLines.size)
+            assertEquals("City lights glow", fetched.syncedLines[0].text)
+
+            // Verify cleaned query reached LiriQo & Musixmatch sent custom User-Agent + Cookie
+            val liriQoReq = liriQoServer.takeRequest(1, TimeUnit.SECONDS)
+            assertTrue(liriQoReq?.path.orEmpty().contains("City%20Lights"))
+            assertFalse(liriQoReq?.path.orEmpty().contains("Official"))
+            val mxmTokenReq = mxmServer.takeRequest(1, TimeUnit.SECONDS)
+            assertEquals("CustomAgent/1.0", mxmTokenReq?.getHeader("User-Agent"))
+            assertEquals("mxm_sess=abc", mxmTokenReq?.getHeader("Cookie"))
+
+            // Room cache hit survives network shutdown
+            liriQoServer.shutdown()
+            mxmServer.shutdown()
+            val cached = manager.loadLyricsForTrack(track)
+            assertEquals(LyricsSource.MUSIXMATCH, cached.source)
+            assertTrue(cached.fromCache)
+            assertEquals(2, cached.syncedLines.size)
+        } finally {
+            runCatching { liriQoServer.shutdown() }
+            runCatching { mxmServer.shutdown() }
+            db.close()
+        }
+    }
+
+    @Test
+    fun remoteConfigValidator_parsesLyricsProvidersAndCleaningRules() {
+        val rawJson = """
+            {
+              "version": 3,
+              "lyrics_cleaning": {
+                "strip_brackets_regex": "\\([^)]*\\)|\\[[^\\]]*\\]",
+                "strip_keywords_regex": "\\b(official|video|lyrics)\\b",
+                "title_delimiters": [" - ", " | "]
+              },
+              "lyrics": {
+                "liriqo": {
+                  "enabled": true,
+                  "priority": 1,
+                  "timeout_ms": 6500,
+                  "instances": ["https://lyrics.liriqo.example"]
+                },
+                "musixmatch": {
+                  "enabled": true,
+                  "priority": 2,
+                  "user_agent": "Mozilla/5.0 Test",
+                  "cookie": "x-mxm-user=1",
+                  "app_id": "web-desktop-app-v1.0"
+                },
+                "jiosaavn_lyrics": {
+                  "enabled": true,
+                  "priority": 3
+                },
+                "lrclib": {
+                  "enabled": true,
+                  "priority": 4,
+                  "instances": ["https://lrclib.net"]
+                }
+              },
+              "providers": {
+                "jiosaavn": {
+                  "enabled": true,
+                  "type": "jiosaavn",
+                  "display_name": "JioSaavn",
+                  "priority": 1,
+                  "endpoints": {
+                    "search": ["https://saavn.dev/api"],
+                    "playback": ["https://saavn.dev/api"]
+                  }
+                }
+              }
+            }
+        """.trimIndent()
+
+        val cfg = RemoteConfigValidator.parseAndValidate(rawJson, allowLoopback = true)
+
+        assertEquals(listOf(" - ", " | "), cfg.lyricsCleaning.titleDelimiters)
+        assertNotNull(cfg.liriqoConfig())
+        assertEquals(listOf("https://lyrics.liriqo.example"), cfg.liriqoConfig()!!.resolvedEndpoints())
+        assertEquals(6500L, cfg.liriqoConfig()!!.timeoutMs)
+
+        val mxm = cfg.musixmatchConfig()
+        assertNotNull(mxm)
+        assertEquals("Mozilla/5.0 Test", mxm!!.userAgent)
+        assertEquals("x-mxm-user=1", mxm.cookie)
+        assertEquals("web-desktop-app-v1.0", mxm.appId)
+
+        assertNotNull(cfg.jiosaavnLyricsConfig())
+        assertEquals(listOf("https://lrclib.net"), cfg.lrclibEndpointsOnly())
+    }
+
+    @Test
+    fun remoteConfigValidator_parsesSchemaV2ProvidersJsonAndCapabilityGating() {
+        val rawV2Json = """
+            {
+              "schema_version": 2,
+              "config_version": 42,
+              "metadata_cleaning": {
+                "strip_brackets_regex": "\\([^)]*\\)|\\[[^\\]]*\\]",
+                "strip_keywords_regex": "\\b(official|video|4k)\\b",
+                "title_delimiters": [" - ", " | "]
+              },
+              "provider_defaults": {
+                "endpoint_failover": true,
+                "max_retries_per_endpoint": 2,
+                "request_timeout_ms": 4500,
+                "health_check_cooldown_ms": 90000
+              },
+              "providers": [
+                {
+                  "id": "jiosaavn",
+                  "name": "JioSaavn",
+                  "category": "music",
+                  "enabled": true,
+                  "adapter": "jiosaavn",
+                  "base_urls": ["https://saavn.dev/api", "https://saavn-backup.example/api"],
+                  "capabilities": ["search", "playback", "lyrics"],
+                  "priority": 1,
+                  "headers": { "X-App": "Nocturne" },
+                  "params": { "lang": "hindi,english" }
+                },
+                {
+                  "id": "piped_primary",
+                  "name": "Piped",
+                  "category": "music",
+                  "enabled": true,
+                  "adapter": "piped",
+                  "base_urls": ["https://pipedapi.kavin.rocks"],
+                  "capabilities": ["search", "playback"],
+                  "priority": 2
+                },
+                {
+                  "id": "musixmatch",
+                  "name": "Musixmatch",
+                  "category": "lyrics",
+                  "enabled": true,
+                  "adapter": "musixmatch",
+                  "base_urls": ["https://apic-desktop.musixmatch.com"],
+                  "capabilities": ["lyrics", "synced_lyrics"],
+                  "priority": 20,
+                  "headers": { "User-Agent": "MXM/2.0", "Cookie": "sid=xyz" },
+                  "params": { "app_id": "web-desktop-app-v1.0" }
+                },
+                {
+                  "id": "liriqo",
+                  "name": "LiriQo",
+                  "category": "lyrics",
+                  "enabled": true,
+                  "adapter": "liriqo",
+                  "base_urls": ["https://liriqo.example", "https://liriqo2.example"],
+                  "capabilities": ["lyrics", "synced_lyrics"],
+                  "priority": 10,
+                  "params": { "source": "apple,musixmatch" }
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val cfg = RemoteConfigValidator.parseAndValidate(rawV2Json, allowLoopback = true)
+        assertEquals(2, cfg.schemaVersion)
+        assertEquals("42", cfg.configVersion)
+        assertEquals(listOf(" - ", " | "), cfg.lyricsCleaning.titleDelimiters)
+        assertTrue(cfg.providerDefaults.endpointFailover)
+        assertEquals(2, cfg.providerDefaults.maxRetriesPerEndpoint)
+        assertEquals(4500L, cfg.providerDefaults.requestTimeoutMs)
+        assertEquals(90_000L, cfg.providerDefaults.healthCheckCooldownMs)
+
+        // Verify music providers inherit defaults, base_urls, headers, params, capabilities
+        val saavn = cfg.providers.first { it.id == "jiosaavn" }
+        assertEquals("music", saavn.category)
+        assertEquals("jiosaavn", saavn.adapterType)
+        assertEquals(listOf("https://saavn.dev/api", "https://saavn-backup.example/api"), saavn.baseUrls())
+        assertEquals(listOf("search", "playback", "lyrics"), saavn.capabilities)
+        assertEquals(4500L, saavn.timeoutMs)
+        assertEquals(2, saavn.maxRetries)
+        assertEquals(90_000L, saavn.cooldownMs)
+        assertEquals("Nocturne", saavn.headers["X-App"])
+        assertEquals("hindi,english", saavn.params["lang"])
+
+        // Verify lyrics providers are sorted ascending by priority (10 before 20)
+        assertEquals(listOf("liriqo", "musixmatch"), cfg.lyricsProviders.map { it.id })
+        val liriqo = cfg.liriqoConfig()!!
+        assertEquals(listOf("https://liriqo.example", "https://liriqo2.example"), liriqo.baseUrls())
+        assertEquals("apple,musixmatch", liriqo.params["source"])
+        assertEquals(4500L, liriqo.timeoutMs)
+        assertEquals(90_000L, liriqo.cooldownMs)
+
+        val mxm = cfg.musixmatchConfig()!!
+        assertEquals("MXM/2.0", mxm.userAgent)
+        assertEquals("sid=xyz", mxm.cookie)
+        assertEquals("web-desktop-app-v1.0", mxm.appId)
+
+        // Verify JioSaavn lyrics config is synthesized when "lyrics" is in capabilities
+        val saavnLyrics = cfg.jiosaavnLyricsConfig()
+        assertNotNull(saavnLyrics)
+        assertTrue(saavnLyrics!!.supportsCapability("lyrics"))
+        assertEquals(listOf("https://saavn.dev/api", "https://saavn-backup.example/api"), saavnLyrics.baseUrls())
+
+        // Remove "lyrics" from jiosaavn capabilities -> jiosaavnLyricsConfig() must return null
+        val noLyricsJson = rawV2Json.replace(
+            """"capabilities": ["search", "playback", "lyrics"]""",
+            """"capabilities": ["search", "playback"]"""
+        )
+        val noLyricsCfg = RemoteConfigValidator.parseAndValidate(noLyricsJson, allowLoopback = true)
+        assertNull(noLyricsCfg.jiosaavnLyricsConfig())
+    }
+
+    @Test
+    fun jioSaavnLyricsAdapter_respectsLyricsCapability() = runTest {
+        val server = MockWebServer()
+        server.start()
+        try {
+            server.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"data":{"lyrics":"Golden hour sky<br>Fading slowly"}}""")
+            )
+            val baseUrl = server.url("/").toString().trimEnd('/')
+            var allowCapability = false
+            val adapter = JioSaavnLyricsAdapter(
+                configProvider = {
+                    DynamicLyricsProviderConfig(
+                        id = "jiosaavn_lyrics",
+                        adapterType = "jiosaavn",
+                        enabled = true,
+                        capabilities = if (allowCapability) listOf("search", "playback", "lyrics") else listOf("search", "playback"),
+                        instances = listOf(baseUrl)
+                    )
+                },
+                jioSaavnEndpointsProvider = { listOf(baseUrl) },
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(baseUrl)
+            )
+            val query = LyricsQuery(
+                cleanedTitle = "Golden Hour",
+                cleanedArtist = "Artist",
+                durationMs = 200_000L,
+                isOnline = true,
+                onlineProvider = "JioSaavn",
+                sourceId = "saavn77"
+            )
+
+            // When "lyrics" capability is absent, adapter must skip HTTP calls entirely
+            assertNull(adapter.fetchLyrics(query))
+            assertEquals(0, server.requestCount)
+
+            // When "lyrics" capability is present, adapter queries endpoint and parses lyrics
+            allowCapability = true
+            val resolved = adapter.fetchLyrics(query)
+            assertNotNull(resolved)
+            assertEquals("Golden hour sky\nFading slowly", resolved!!.plainLyrics)
+            assertEquals(1, server.requestCount)
+        } finally {
+            runCatching { server.shutdown() }
+        }
+    }
+
+    @Test
+    fun lyricsAdapter_failsOverAcrossBaseUrlsAndSkipsCoolingDownEndpoint() = runTest {
+        val failingServer = MockWebServer()
+        val healthyServer = MockWebServer()
+        failingServer.start()
+        healthyServer.start()
+        try {
+            var fakeNow = 100_000L
+            val tracker = ProviderHealthTracker(clockMs = { fakeNow })
+
+            // Endpoint 1 returns HTTP 503; Endpoint 2 returns synced LRC
+            failingServer.enqueue(MockResponse().setResponseCode(503).setBody("unavailable"))
+            healthyServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"lrc":"[00:01.00]Line one"}""")
+            )
+            // Second query response on healthyServer
+            healthyServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"lrc":"[00:01.00]Line two"}""")
+            )
+
+            val failUrl = failingServer.url("/").toString().trimEnd('/')
+            val okUrl = healthyServer.url("/").toString().trimEnd('/')
+
+            val adapter = LiriQoLyricsAdapter(
+                configProvider = {
+                    DynamicLyricsProviderConfig(
+                        id = "liriqo",
+                        adapterType = "liriqo",
+                        enabled = true,
+                        instances = listOf(failUrl, okUrl),
+                        timeoutMs = 3_000L,
+                        maxRetries = 0,
+                        cooldownMs = 45_000L,
+                        endpointFailover = true,
+                        params = mapOf("mode" to "synced")
+                    )
+                },
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(failUrl, okUrl),
+                healthTracker = tracker
+            )
+
+            val query = LyricsQuery(
+                cleanedTitle = "Midnight",
+                cleanedArtist = "Echo",
+                durationMs = 180_000L,
+                isOnline = false,
+                onlineProvider = "",
+                sourceId = ""
+            )
+
+            val first = adapter.fetchLyrics(query)
+            assertNotNull(first)
+            assertEquals("Line one", first!!.parsedLines.first().text)
+            assertEquals(1, failingServer.requestCount)
+            assertEquals(1, healthyServer.requestCount)
+            val okReq = healthyServer.takeRequest(1, TimeUnit.SECONDS)
+            assertTrue(okReq?.path.orEmpty().contains("mode=synced"))
+
+            // Within 45s cooldown, failingServer must be skipped completely
+            fakeNow += 10_000L
+            val second = adapter.fetchLyrics(query)
+            assertNotNull(second)
+            assertEquals("Line two", second!!.parsedLines.first().text)
+            assertEquals(1, failingServer.requestCount)
+            assertEquals(2, healthyServer.requestCount)
+
+            // Once cooldown expires, failingServer becomes eligible again
+            fakeNow += 40_000L
+            failingServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody("""{"lrc":"[00:02.00]Recovered"}""")
+            )
+            val third = adapter.fetchLyrics(query)
+            assertNotNull(third)
+            assertEquals("Recovered", third!!.parsedLines.first().text)
+            assertEquals(2, failingServer.requestCount)
+        } finally {
+            runCatching { failingServer.shutdown() }
+            runCatching { healthyServer.shutdown() }
+        }
     }
 
     private fun sampleTrack(

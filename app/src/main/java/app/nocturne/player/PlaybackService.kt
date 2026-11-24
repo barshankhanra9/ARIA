@@ -35,11 +35,13 @@ import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
+import app.nocturne.player.data.audio.LyricsRepository
 import app.nocturne.player.data.audio.TagAndLyricsEngine
 import app.nocturne.player.data.db.AriaDatabase
 import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.ReplayGainMode
+import app.nocturne.player.data.model.Track
 import app.nocturne.player.data.model.UserSettings
 import app.nocturne.player.data.online.OnlineDependencies
 import app.nocturne.player.data.online.OnlineHttpClient
@@ -82,6 +84,7 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var database: AriaDatabase
     private lateinit var providerManager: OnlineProviderManager
     private lateinit var onlineRepo: OnlineLibraryRepository
+    private lateinit var lyricsRepository: LyricsRepository
 
     // Offline playback engine (existing behavior preserved)
     private lateinit var player: ExoPlayer
@@ -99,6 +102,7 @@ class PlaybackService : MediaLibraryService() {
     private var progressSaverJob: Job? = null
     private var onlineProgressJob: Job? = null
     private var crossfadeJob: Job? = null
+    private var lyricsPreloadJob: Job? = null
     private var receiversRegistered = false
 
     private data class ResolvedStreamCtx(
@@ -143,9 +147,16 @@ class PlaybackService : MediaLibraryService() {
         super.onCreate()
         settingsRepository = SettingsRepository(this)
         database = AriaDatabase.getInstance(this)
-        OnlineDependencies.getRemoteConfigRepository(this).triggerStartupRefreshIfNeeded()
+        val remoteConfigRepo = OnlineDependencies.getRemoteConfigRepository(this)
+        remoteConfigRepo.triggerStartupRefreshIfNeeded()
         providerManager = OnlineDependencies.getProviderManager(this)
         onlineRepo = OnlineDependencies.getRepository(this)
+        lyricsRepository = LyricsRepository(
+            context = this,
+            db = database,
+            remoteConfigRepository = remoteConfigRepo,
+            healthTracker = OnlineDependencies.getHealthTracker()
+        )
 
         balanceAndRgProcessor = BalanceAndReplayGainAudioProcessor { sampleRate, channels, encoding ->
             PlaybackRuntimeBus.updateTelemetry {
@@ -189,6 +200,7 @@ class PlaybackService : MediaLibraryService() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 applyReplayGainForCurrentItem(mediaItem)
                 applyCrossfadeFadeInIfActive()
+                preloadLyricsForOfflineMediaItem(mediaItem)
                 syncOfflineSnapshot()
                 savePlaybackStateAsync()
             }
@@ -275,6 +287,9 @@ class PlaybackService : MediaLibraryService() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 onlineAccumulatedMs = 0L
                 lastCountedOnlineId = null
+                mediaItem?.mediaId?.let { id -> onlineTrackMap[id] }?.let { tr ->
+                    preloadLyricsForOnlineTrack(tr)
+                }
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
             }
@@ -384,6 +399,7 @@ class PlaybackService : MediaLibraryService() {
             val resolvedLabel = resolution.resolvedByLabel.ifBlank { resolution.resolvedBy.displayName }
             onlineTrackMap[track.id] = resolution.track
             resolvedStreamContext[safeStreamUrl] = ResolvedStreamCtx(resolution.track, resolution.resolvedBy, resolvedPid)
+            preloadLyricsForOnlineTrack(resolution.track, resolution.selectedStream.formatLabel)
             PlaybackRuntimeBus.updateOnlineSnapshot { snap ->
                 snap.copy(
                     isResolving = false,
@@ -1017,6 +1033,7 @@ class PlaybackService : MediaLibraryService() {
         progressSaverJob?.cancel()
         onlineProgressJob?.cancel()
         crossfadeJob?.cancel()
+        lyricsPreloadJob?.cancel()
         if (receiversRegistered) {
             runCatching { unregisterReceiver(noisyAndBtReceiver) }
             receiversRegistered = false
@@ -1030,12 +1047,80 @@ class PlaybackService : MediaLibraryService() {
         super.onDestroy()
     }
 
+    private fun preloadLyricsForOnlineTrack(track: OnlineTrack, formatTag: String? = null) {
+        if (!::lyricsRepository.isInitialized) return
+        val uiTrack = track.toUiTrack(formatTag)
+        lyricsPreloadJob?.cancel()
+        lyricsPreloadJob = serviceScope.launch(Dispatchers.IO) {
+            val loaded = runCatching {
+                lyricsRepository.loadLyricsForTrack(
+                    track = uiTrack,
+                    includedSafFolders = currentSettings.includedSafFolderUris,
+                    forceRemoteRefresh = false
+                )
+            }.getOrNull()
+            if (loaded != null && loaded.hasContent) {
+                PlaybackRuntimeBus.updatePreloadedLyrics(uiTrack.uriString, loaded)
+            }
+        }
+    }
+
+    private fun preloadLyricsForOfflineMediaItem(mediaItem: MediaItem?) {
+        if (mediaItem == null || !::lyricsRepository.isInitialized) return
+        val uriStr = mediaItem.localConfiguration?.uri?.toString() ?: return
+        val meta = mediaItem.mediaMetadata
+        val title = meta.title?.toString().orEmpty()
+        val artist = meta.artist?.toString().orEmpty()
+        val album = meta.albumTitle?.toString().orEmpty()
+        if (title.isBlank()) return
+        val lightweightTrack = Track(
+            id = uriStr.hashCode().toLong(),
+            uriString = uriStr,
+            filePath = "",
+            displayName = title,
+            title = title,
+            artist = artist,
+            album = album,
+            albumArtist = artist,
+            genre = "",
+            year = 0,
+            trackNumber = 0,
+            discNumber = 0,
+            composer = "",
+            durationMs = 0L,
+            sizeBytes = 0L,
+            dateAddedSec = 0L,
+            dateModifiedSec = 0L,
+            mimeType = "audio/*",
+            formatLabel = "",
+            bitrateKbps = 0,
+            sampleRateHz = 0,
+            channelCount = 0,
+            folderPath = "",
+            folderName = ""
+        )
+        lyricsPreloadJob?.cancel()
+        lyricsPreloadJob = serviceScope.launch(Dispatchers.IO) {
+            val loaded = runCatching {
+                lyricsRepository.loadLyricsForTrack(
+                    track = lightweightTrack,
+                    includedSafFolders = currentSettings.includedSafFolderUris,
+                    forceRemoteRefresh = false
+                )
+            }.getOrNull()
+            if (loaded != null && loaded.hasContent) {
+                PlaybackRuntimeBus.updatePreloadedLyrics(uriStr, loaded)
+            }
+        }
+    }
+
     private inner class OnlineBridgeImpl : OnlinePlaybackBridge {
         override fun playOnlineTracks(tracks: List<OnlineTrack>, startIndex: Int, shuffle: Boolean) {
             if (tracks.isEmpty()) return
             serviceScope.launch {
                 tracks.forEach { onlineTrackMap[it.id] = it }
                 val safeIdx = startIndex.coerceIn(tracks.indices)
+                preloadLyricsForOnlineTrack(tracks[safeIdx])
                 val items = tracks.map { buildOnlineMediaItem(it) }
                 activateEngine(ActiveAudioEngine.ONLINE, pauseOther = true)
                 onlinePlayer.shuffleModeEnabled = shuffle

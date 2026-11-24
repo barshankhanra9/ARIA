@@ -137,6 +137,21 @@ object InputAndUrlSecurity {
         return result
     }
 
+    fun sanitizeParamMap(raw: Map<String, String>): Map<String, String> {
+        if (raw.isEmpty()) return emptyMap()
+        val result = linkedMapOf<String, String>()
+        for ((k, v) in raw) {
+            if (result.size >= 16) break
+            val cleanKey = k.trim()
+            if (cleanKey.isBlank() || cleanKey.length > 64) continue
+            if (cleanKey.any { it.isISOControl() || it.isWhitespace() }) continue
+            val cleanVal = v.trim()
+            if (cleanVal.length > 512 || cleanVal.any { it.isISOControl() }) continue
+            result[cleanKey] = cleanVal
+        }
+        return result
+    }
+
     fun redactHeaderValuesForDiagnostics(headers: Map<String, String>): Map<String, String> {
         return headers.mapValues { (k, v) ->
             if (k.lowercase() in SENSITIVE_HEADER_KEYS || k.lowercase().contains("auth") || k.lowercase().contains("secret")) {

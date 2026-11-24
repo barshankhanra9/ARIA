@@ -168,6 +168,37 @@ class JioSaavnProvider(
             .mapNotNull { parseSongItem(it.jsonObject) }
     }
 
+    suspend fun fetchNewReleases(): List<OnlineTrack> = withContext(Dispatchers.IO) {
+        val cfg = currentConfig()
+        val resp = executeConfiguredOrPath(
+            operation = OperationType.SEARCH,
+            template = cfg?.routes?.searchSongs,
+            variables = mapOf("query" to "new releases", "page" to "1", "limit" to "16"),
+            fallbackPath = "/search/songs?query=${Uri.encode("new releases")}&page=1&limit=16"
+        )
+        extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
+            .mapNotNull { parseSongItem(it.jsonObject) }
+    }
+
+    suspend fun fetchCuratedPlaylists(): List<OnlineAlbumSummary> = withContext(Dispatchers.IO) {
+        val cfg = currentConfig()
+        val resp = runCatching {
+            executeRawWithFallback(
+                OperationType.SEARCH,
+                "/search/playlists?query=${Uri.encode("trending top charts")}&page=1&limit=12"
+            )
+        }.getOrElse {
+            executeConfiguredOrPath(
+                operation = OperationType.SEARCH,
+                template = cfg?.routes?.searchAlbums,
+                variables = mapOf("query" to "top charts", "page" to "1", "limit" to "12"),
+                fallbackPath = "/search/albums?query=${Uri.encode("top charts")}&page=1&limit=12"
+            )
+        }
+        extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
+            .mapNotNull { parseAlbumItem(it.jsonObject) }
+    }
+
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
@@ -209,9 +240,10 @@ class JioSaavnProvider(
         }
 
         val allowedOrigin = lastWorkingInstance?.takeIf { baseUrlsOverride != null }
+        val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
         val selected = StreamQualitySelector.selectBestAudioStream(
             streams = streams,
-            speedTier = speedTier,
+            speedTier = effectiveTier,
             allowedLoopbackOrigin = allowedOrigin
         ) ?: throw IOException("No playable audio streams returned by $displayName for ${track.title}")
 
@@ -357,7 +389,8 @@ class JioSaavnProvider(
             headers = cfg?.headers ?: emptyMap(),
             timeoutMs = cfg?.timeoutMs ?: 10_000L,
             maxRetries = cfg?.maxRetries ?: 1,
-            cooldownMs = cfg?.cooldownMs ?: 60_000L
+            cooldownMs = cfg?.cooldownMs ?: 60_000L,
+            endpointFailover = cfg?.endpointFailover ?: true
         )
         lastWorkingInstance = resp.endpointUrl
         return resp
@@ -410,6 +443,7 @@ class JioSaavnProvider(
         val durationSec = parseFlexibleLong(obj["duration"])
         val thumb = pickBestImageUrl(obj["image"])
         val sourceUrl = obj.str("url") ?: "https://www.jiosaavn.com/song/$id"
+        val saavnEncryptedUrl = obj.str("encrypted_media_url")?.takeIf { it.isNotBlank() }
         val streams = parseDownloadUrls(obj["downloadUrl"])
         if (streams.isNotEmpty()) {
             parsedStreamsCache.put(id, streams)
@@ -432,7 +466,8 @@ class JioSaavnProvider(
             viewCount = parseFlexibleLong(obj["playCount"]),
             publishedText = obj.str("year").orEmpty(),
             isLive = false,
-            providerId = providerId
+            providerId = providerId,
+            saavnEncryptedUrl = saavnEncryptedUrl
         )
     }
 
@@ -472,17 +507,23 @@ class JioSaavnProvider(
             val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
                 ?: return@mapNotNull null
             val qualityStr = obj.str("quality").orEmpty()
-            val kbps = Regex("""(\d+)""").find(qualityStr)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 160
+            val inferredKbps = when {
+                url.contains("_320.", ignoreCase = true) -> 320
+                url.contains("_160.", ignoreCase = true) -> 160
+                url.contains("_96.", ignoreCase = true) -> 96
+                else -> 160
+            }
+            val kbps = Regex("""(\d+)""").find(qualityStr)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: inferredKbps
             val isMp3 = url.contains(".mp3", ignoreCase = true)
             OnlineAudioStream(
                 url = url,
                 bitrateKbps = kbps.coerceAtLeast(48),
                 mimeType = if (isMp3) "audio/mpeg" else "audio/mp4",
                 codec = if (isMp3) "mp3" else "mp4a.40.2",
-                formatLabel = if (isMp3) "MP3 ${kbps}k" else "MP4 ${kbps}k",
+                formatLabel = if (isMp3) "MP3 ${kbps}k" else "${kbps}kbps AAC",
                 expiresAtMs = System.currentTimeMillis() + 3 * 60 * 60_000L
             )
-        }
+        }.sortedByDescending { it.bitrateKbps }
     }
 
     private fun extractPrimaryArtists(obj: JsonObject?): String {
@@ -497,14 +538,26 @@ class JioSaavnProvider(
     }
 
     private fun pickBestImageUrl(el: JsonElement?): String? {
-        val arr = el as? JsonArray ?: return InputAndUrlSecurity.validateRemoteHttpsUrl((el as? JsonPrimitive)?.contentOrNull)
-        val objects = arr.mapNotNull { it as? JsonObject }
-        val preferred = objects.firstOrNull {
-            val q = it.str("quality").orEmpty()
-            q.contains("500") || q.contains("high", ignoreCase = true)
-        } ?: objects.lastOrNull()
-        val raw = preferred?.let { it.str("url") ?: it.str("link") }
-        return InputAndUrlSecurity.validateRemoteHttpsUrl(raw)
+        val raw = when (el) {
+            is JsonArray -> {
+                val objects = el.mapNotNull { it as? JsonObject }
+                val preferred = objects.firstOrNull {
+                    val q = it.str("quality").orEmpty()
+                    q.contains("500") || q.contains("high", ignoreCase = true)
+                } ?: objects.lastOrNull()
+                preferred?.let { it.str("url") ?: it.str("link") }
+            }
+            is JsonPrimitive -> el.contentOrNull
+            else -> null
+        } ?: return null
+
+        val upgraded = raw
+            .replace("150x150", "500x500")
+            .replace("50x50", "500x500")
+            .replace("_150.", "_500.")
+            .replace("_50.", "_500.")
+        val allowedOrigin = upgraded.takeIf { baseUrlsOverride != null }
+        return InputAndUrlSecurity.validateRemoteHttpsUrl(upgraded, allowedOrigin)
     }
 
     private fun parseFlexibleLong(el: JsonElement?): Long {

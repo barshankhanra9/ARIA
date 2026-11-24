@@ -41,7 +41,7 @@ import kotlinx.coroutines.launch
 
 data class OnlineSearchUiState(
     val query: String = "",
-    val filter: OnlineSearchFilter = OnlineSearchFilter.ALL,
+    val filter: OnlineSearchFilter = OnlineSearchFilter.SONGS,
     val suggestions: List<String> = emptyList(),
     val tracks: List<OnlineTrack> = emptyList(),
     val artists: List<OnlineArtistSummary> = emptyList(),
@@ -59,6 +59,8 @@ data class OnlineSearchUiState(
 
 data class OnlineTrendingUiState(
     val tracks: List<OnlineTrack> = emptyList(),
+    val newReleases: List<OnlineTrack> = emptyList(),
+    val curatedPlaylists: List<OnlineAlbumSummary> = emptyList(),
     val providerUsed: OnlineProviderType? = null,
     val providerUsedId: String? = null,
     val providerUsedLabel: String? = null,
@@ -171,6 +173,7 @@ class OnlineCoordinator(
     val isTestingProviders: StateFlow<Boolean> = _isTestingProviders.asStateFlow()
 
     private var suggestionJob: Job? = null
+    private var liveSearchDebounceJob: Job? = null
     private var searchJob: Job? = null
     private var trendingJob: Job? = null
     private var artistJob: Job? = null
@@ -305,15 +308,52 @@ class OnlineCoordinator(
                 return@launch
             }
 
-            runCatching {
-                if (category == OnlineDiscoveryCategory.TRENDING) {
-                    providerManager.trending()
-                } else {
-                    providerManager.fetchDiscoveryFeed(
-                        query = category.searchQuery ?: category.label,
-                        preferAudiusFirst = category.preferAudiusFirst
-                    )
+            if (category == OnlineDiscoveryCategory.TRENDING) {
+                runCatching {
+                    providerManager.fetchHomeDiscoverySections()
+                }.onSuccess { sections ->
+                    val firstTrack = sections.trendingCharts.firstOrNull()
+                    val resolvedProv = sections.providerType ?: firstTrack?.providerType
+                    val resolvedId = firstTrack?.effectiveProviderId() ?: resolvedProv?.defaultProviderId()
+                    val resolvedLabel = firstTrack?.providerLabel?.takeIf { it.isNotBlank() }
+                        ?: resolvedId?.let { remoteConfigRepo.activeConfig.value.providerById(it)?.displayName }
+                        ?: resolvedProv?.displayName
+                    _trendingState.update { cur ->
+                        cur.copy(
+                            selectedCategory = category,
+                            tracks = sections.trendingCharts,
+                            newReleases = sections.newReleases.ifEmpty { cur.newReleases },
+                            curatedPlaylists = sections.curatedPlaylists.ifEmpty { cur.curatedPlaylists },
+                            providerUsed = resolvedProv,
+                            providerUsedId = resolvedId,
+                            providerUsedLabel = resolvedLabel,
+                            isLoading = false,
+                            isArtistsLoading = false,
+                            errorMessage = if (sections.trendingCharts.isEmpty() && sections.newReleases.isEmpty()) {
+                                "Unable to load Trending music"
+                            } else null
+                        )
+                    }
+                    refreshProviderHealth()
+                }.onFailure { err ->
+                    _trendingState.update {
+                        it.copy(
+                            selectedCategory = category,
+                            isLoading = false,
+                            isArtistsLoading = false,
+                            errorMessage = err.localizedMessage ?: "Unable to load Trending music"
+                        )
+                    }
+                    refreshProviderHealth()
                 }
+                return@launch
+            }
+
+            runCatching {
+                providerManager.fetchDiscoveryFeed(
+                    query = category.searchQuery ?: category.label,
+                    preferAudiusFirst = category.preferAudiusFirst
+                )
             }.onSuccess { (tracks, provider) ->
                 val firstTrack = tracks.firstOrNull()
                 val resolvedId = firstTrack?.effectiveProviderId() ?: provider?.defaultProviderId()
@@ -353,16 +393,38 @@ class OnlineCoordinator(
             .take(InputAndUrlSecurity.MAX_SEARCH_QUERY_LENGTH)
         _searchState.update { it.copy(query = stripped) }
         suggestionJob?.cancel()
+        liveSearchDebounceJob?.cancel()
         val sanitized = InputAndUrlSecurity.sanitizeSearchQuery(stripped)
         if (sanitized.length < 2) {
-            _searchState.update { it.copy(suggestions = emptyList()) }
+            _searchState.update {
+                if (sanitized.isBlank()) {
+                    it.copy(
+                        suggestions = emptyList(),
+                        tracks = emptyList(),
+                        artists = emptyList(),
+                        albums = emptyList(),
+                        hasSearched = false,
+                        isLoading = false,
+                        errorMessage = null
+                    )
+                } else {
+                    it.copy(suggestions = emptyList())
+                }
+            }
             return
         }
         suggestionJob = scope.launch {
-            delay(280L)
+            delay(250L)
             val list = runCatching { providerManager.suggestions(sanitized) }.getOrDefault(emptyList())
             if (_searchState.value.query == stripped) {
                 _searchState.update { it.copy(suggestions = list) }
+            }
+        }
+        // 400ms debounced live search as the user types
+        liveSearchDebounceJob = scope.launch {
+            delay(400L)
+            if (_searchState.value.query == stripped) {
+                executeSearch(query = sanitized, filter = _searchState.value.filter, recordInHistory = false)
             }
         }
     }
@@ -370,16 +432,21 @@ class OnlineCoordinator(
     fun selectSearchFilter(filter: OnlineSearchFilter) {
         val curQuery = InputAndUrlSecurity.sanitizeSearchQuery(_searchState.value.query)
         _searchState.update { it.copy(filter = filter) }
-        if (curQuery.isNotBlank() && _searchState.value.hasSearched) {
-            executeSearch(curQuery, filter)
+        if (curQuery.isNotBlank()) {
+            executeSearch(curQuery, filter, recordInHistory = false)
         }
     }
 
-    fun executeSearch(query: String = _searchState.value.query, filter: OnlineSearchFilter = _searchState.value.filter) {
+    fun executeSearch(
+        query: String = _searchState.value.query,
+        filter: OnlineSearchFilter = _searchState.value.filter,
+        recordInHistory: Boolean = true
+    ) {
         val clean = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (clean.isBlank()) return
 
         suggestionJob?.cancel()
+        liveSearchDebounceJob?.cancel()
         searchJob?.cancel()
         _searchState.update {
             it.copy(
@@ -393,8 +460,10 @@ class OnlineCoordinator(
             )
         }
 
-        scope.launch(Dispatchers.IO) {
-            repository.recordSearch(clean)
+        if (recordInHistory) {
+            scope.launch(Dispatchers.IO) {
+                repository.recordSearch(clean)
+            }
         }
 
         searchJob = scope.launch {
@@ -467,6 +536,7 @@ class OnlineCoordinator(
     fun clearSearch() {
         searchJob?.cancel()
         suggestionJob?.cancel()
+        liveSearchDebounceJob?.cancel()
         _searchState.value = OnlineSearchUiState(filter = _searchState.value.filter)
     }
 

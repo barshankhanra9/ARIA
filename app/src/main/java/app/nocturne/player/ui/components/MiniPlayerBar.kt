@@ -12,6 +12,7 @@ import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -147,7 +148,10 @@ fun MiniPlayerBar(
                                         style = MaterialTheme.typography.titleMedium,
                                         color = palette.inkPrimary,
                                         maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier
+                                            .weight(1f, fill = false)
+                                            .basicMarquee()
                                     )
                                 }
                                 Text(
@@ -160,7 +164,10 @@ fun MiniPlayerBar(
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (!errorMessage.isNullOrBlank()) palette.danger else palette.inkSecondary,
                                     maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .basicMarquee()
                                 )
                             }
                         }

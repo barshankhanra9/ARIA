@@ -149,9 +149,18 @@ data class ProviderResponseMapping(
 )
 
 @Serializable
+data class ProviderDefaultsConfig(
+    val endpointFailover: Boolean = true,
+    val maxRetriesPerEndpoint: Int = 1,
+    val requestTimeoutMs: Long = 10_000L,
+    val healthCheckCooldownMs: Long = 60_000L
+)
+
+@Serializable
 data class DynamicProviderConfig(
     val id: String,
     val displayName: String = id.replaceFirstChar { it.uppercase() },
+    val category: String = "music",
     val adapterType: String = "generic_rest", // "jiosaavn", "piped", "invidious", "audius", "newpipe", "generic_rest"
     val enabled: Boolean = true,
     val priority: Int = 100,
@@ -160,12 +169,17 @@ data class DynamicProviderConfig(
     val timeoutMs: Long = 10_000L,
     val maxRetries: Int = 1,
     val cooldownMs: Long = 60_000L,
+    val endpointFailover: Boolean = true,
     val headers: Map<String, String> = emptyMap(),
+    val params: Map<String, String> = emptyMap(),
     val routes: ProviderRoutesConfig = ProviderRoutesConfig(),
     val mapping: ProviderResponseMapping = ProviderResponseMapping(),
     val verifyStreamReachable: Boolean = false,
     val categories: List<String> = emptyList()
 ) {
+    fun baseUrls(): List<String> =
+        endpoints.filter { it.enabled }.sortedBy { it.priority }.map { it.url }.distinct()
+
     fun supportsCapability(cap: String): Boolean {
         if (!enabled) return false
         if (capabilities.isEmpty()) return true
@@ -187,14 +201,47 @@ data class DynamicProviderConfig(
 }
 
 @Serializable
+data class LyricsCleaningConfig(
+    val stripBracketsRegex: String = """(\[[^\]]*]|\([^)]*(official|video|audio|lyrics|lyric|hd|4k|8k|uhd|visualizer|remaster|live|mv|m/v|music\s*video|lyric\s*video|feat\.?|ft\.?)[^)]*\))""",
+    val stripKeywordsRegex: String = """\b(official\s*(music\s*)?(video|audio)|lyric\s*video|lyrics|full\s*(song|video|audio)|hd|4k|8k|remastered|visualizer|vevo|topic)\b""",
+    val titleDelimiters: List<String> = listOf("|", "//", " - ", " — ", " – ")
+)
+
+@Serializable
 data class DynamicLyricsProviderConfig(
     val id: String = "lrclib",
     val displayName: String = "LRCLIB",
+    val category: String = "lyrics",
+    val adapterType: String = id,
     val enabled: Boolean = true,
     val priority: Int = 1,
+    val capabilities: List<String> = emptyList(),
     val endpoints: List<ProviderEndpointConfig> = emptyList(),
-    val timeoutMs: Long = 8_000L
-)
+    val instances: List<String> = emptyList(),
+    val timeoutMs: Long = 8_000L,
+    val maxRetries: Int = 1,
+    val cooldownMs: Long = 60_000L,
+    val endpointFailover: Boolean = true,
+    val userAgent: String? = null,
+    val cookie: String? = null,
+    val appId: String? = null,
+    val headers: Map<String, String> = emptyMap(),
+    val params: Map<String, String> = emptyMap()
+) {
+    fun supportsCapability(cap: String): Boolean {
+        if (!enabled) return false
+        if (capabilities.isEmpty()) return true
+        return capabilities.any { it.equals(cap, ignoreCase = true) || it.equals("all", ignoreCase = true) }
+    }
+
+    fun resolvedEndpoints(): List<String> =
+        (endpoints.filter { it.enabled }.sortedBy { it.priority }.map { it.url } + instances)
+            .map { it.trim().trimEnd('/') }
+            .filter { it.isNotBlank() }
+            .distinct()
+
+    fun baseUrls(): List<String> = resolvedEndpoints()
+}
 
 @Serializable
 enum class RemoteConfigErrorType(val label: String) {

@@ -155,20 +155,27 @@ class InvidiousProvider(
             val encoding = fmt.str("encoding").orEmpty().ifBlank {
                 type.substringAfter("codecs=\"").substringBefore("\"")
             }
+            val cleanLabel = if (encoding.contains("opus", ignoreCase = true) || type.contains("webm", ignoreCase = true)) {
+                "Opus ${kbps}k"
+            } else {
+                "${container.uppercase()} ${kbps}k"
+            }
             OnlineAudioStream(
                 url = resolvedUrl,
                 bitrateKbps = kbps,
                 mimeType = type.substringBefore(";"),
                 codec = encoding,
-                formatLabel = "${container.uppercase()} ${kbps}k",
+                formatLabel = cleanLabel,
                 expiresAtMs = StreamQualitySelector.parseExpiryFromUrl(resolvedUrl)
             )
         }
 
+        val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
         val selected = StreamQualitySelector.selectBestAudioStream(
             streams = streams,
-            speedTier = speedTier,
-            allowedLoopbackOrigin = allowedTestOrigin
+            speedTier = effectiveTier,
+            allowedLoopbackOrigin = allowedTestOrigin,
+            preferWebmOpus = true
         ) ?: throw IllegalStateException("No audio stream returned by $displayName")
 
         val title = obj.str("title") ?: track.title
@@ -289,7 +296,8 @@ class InvidiousProvider(
             headers = cfg?.headers ?: emptyMap(),
             timeoutMs = cfg?.timeoutMs ?: 10_000L,
             maxRetries = cfg?.maxRetries ?: 1,
-            cooldownMs = cfg?.cooldownMs ?: 60_000L
+            cooldownMs = cfg?.cooldownMs ?: 60_000L,
+            endpointFailover = cfg?.endpointFailover ?: true
         )
         lastWorkingInstance = resp.endpointUrl
         return resp
@@ -347,8 +355,9 @@ class InvidiousProvider(
 
     private fun parseChannelObject(obj: JsonObject): OnlineArtistSummary? {
         val id = obj.str("authorId")?.takeIf { it.isNotBlank() } ?: return null
-        val thumb = obj["authorThumbnails"]?.jsonArray?.lastOrNull()?.jsonObject?.str("url")
+        val thumbRaw = obj["authorThumbnails"]?.jsonArray?.lastOrNull()?.jsonObject?.str("url")
             ?.let { if (it.startsWith("//")) "https:$it" else it }
+        val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(thumbRaw, thumbRaw?.takeIf { baseUrlsOverride != null })
         return OnlineArtistSummary(
             id = id,
             name = obj.str("author") ?: "Artist",
@@ -362,12 +371,15 @@ class InvidiousProvider(
 
     private fun parsePlaylistObject(obj: JsonObject): OnlineAlbumSummary? {
         val id = obj.str("playlistId")?.takeIf { it.isNotBlank() } ?: return null
+        val thumbRaw = obj.str("playlistThumbnail")
+            ?.let { if (it.startsWith("//")) "https:$it" else it }
+        val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(thumbRaw, thumbRaw?.takeIf { baseUrlsOverride != null })
         return OnlineAlbumSummary(
             id = id,
             title = obj.str("title") ?: "Playlist",
             artist = obj.str("author") ?: "YouTube",
             url = "https://www.youtube.com/playlist?list=$id",
-            thumbnailUrl = obj.str("playlistThumbnail"),
+            thumbnailUrl = thumb,
             trackCount = obj.int("videoCount") ?: 0,
             providerType = OnlineProviderType.INVIDIOUS,
             providerId = providerId

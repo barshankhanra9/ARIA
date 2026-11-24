@@ -265,7 +265,8 @@ class AudiusProvider(
             headers = cfg?.headers ?: emptyMap(),
             timeoutMs = cfg?.timeoutMs ?: 10_000L,
             maxRetries = cfg?.maxRetries ?: 1,
-            cooldownMs = cfg?.cooldownMs ?: 60_000L
+            cooldownMs = cfg?.cooldownMs ?: 60_000L,
+            endpointFailover = cfg?.endpointFailover ?: true
         )
         lastWorkingInstance = resp.endpointUrl
         return resp

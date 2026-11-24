@@ -1,8 +1,10 @@
 package app.nocturne.player.ui.screens
 
+import android.graphics.drawable.BitmapDrawable
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateDpAsState
@@ -77,6 +79,7 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -86,8 +89,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -95,6 +102,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.media3.common.Player
+import androidx.palette.graphics.Palette
+import app.nocturne.player.data.library.ArtworkCache
 import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.ArtworkTapAction
 import app.nocturne.player.data.model.AudioEngineTelemetry
@@ -102,6 +111,7 @@ import app.nocturne.player.data.model.LyricsData
 import app.nocturne.player.data.model.SwipeVerticalAction
 import app.nocturne.player.data.model.Track
 import app.nocturne.player.data.model.UserSettings
+import app.nocturne.player.data.security.InputAndUrlSecurity
 import app.nocturne.player.playback.SleepTimerState
 import app.nocturne.player.ui.PlaybackUiState
 import app.nocturne.player.ui.components.AnimatedInkEqualizer
@@ -117,6 +127,11 @@ import app.nocturne.player.ui.components.TactilePaperButton
 import app.nocturne.player.ui.components.formatDuration
 import app.nocturne.player.ui.components.paperGrainBackground
 import app.nocturne.player.ui.theme.AriaPaperTheme
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -159,7 +174,59 @@ fun NowPlayingScreen(
 
     val palette = AriaPaperTheme.palette
     val motion = AriaPaperTheme.motion
+    val context = LocalContext.current
     val track = playback.currentTrack
+
+    var extractedAmbientColor by remember { mutableStateOf<Color?>(null) }
+    val artworkLookupKey = remember(track?.uriString, track?.customCoverUri, track?.artworkUrl) {
+        track?.customCoverUri?.takeIf { it.isNotBlank() }
+            ?: track?.artworkUrl?.takeIf { it.isNotBlank() }
+            ?: track?.uriString
+    }
+    LaunchedEffect(artworkLookupKey, settings.preferFolderCoverArt) {
+        extractedAmbientColor = null
+        val cur = track ?: return@LaunchedEffect
+        val remoteUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(artworkLookupKey)
+        val bmp = withContext(Dispatchers.IO) {
+            if (remoteUrl != null) {
+                runCatching {
+                    val req = ImageRequest.Builder(context)
+                        .data(remoteUrl)
+                        .size(256)
+                        .allowHardware(false)
+                        .build()
+                    val result = context.imageLoader.execute(req) as? SuccessResult
+                    (result?.drawable as? BitmapDrawable)?.bitmap
+                }.getOrNull()
+            } else {
+                ArtworkCache.loadArtwork(
+                    context = context,
+                    trackUri = cur.uriString,
+                    customCoverUri = cur.customCoverUri,
+                    folderPath = cur.folderPath,
+                    preferFolderCover = settings.preferFolderCoverArt,
+                    targetSizePx = 256
+                )?.asAndroidBitmap()
+            }
+        } ?: return@LaunchedEffect
+
+        val swatchRgb = withContext(Dispatchers.Default) {
+            runCatching {
+                val p = Palette.from(bmp).generate()
+                (if (palette.isDark) p.darkVibrantSwatch ?: p.vibrantSwatch ?: p.dominantSwatch else p.vibrantSwatch ?: p.dominantSwatch ?: p.mutedSwatch)?.rgb
+            }.getOrNull()
+        }
+        if (swatchRgb != null) {
+            extractedAmbientColor = Color(swatchRgb)
+        }
+    }
+
+    val targetAmbientColor = extractedAmbientColor ?: palette.accent
+    val animatedAmbientColor by animateColorAsState(
+        targetValue = targetAmbientColor,
+        animationSpec = tween(durationMillis = if (motion.isReduced) 0 else 550),
+        label = "now_playing_ambient_color"
+    )
 
     var dragX by remember { mutableFloatStateOf(0f) }
     var dragY by remember { mutableFloatStateOf(0f) }
@@ -208,10 +275,22 @@ fun NowPlayingScreen(
         }
     }
 
+    val topAmbientAlpha = if (extractedAmbientColor != null) {
+        if (palette.isDark) 0.34f else 0.22f
+    } else {
+        if (palette.isDark) 0.14f else 0.08f
+    }
     Box(
         modifier = Modifier
             .fillMaxSize()
             .paperGrainBackground(palette.paperBackground)
+            .background(
+                Brush.verticalGradient(
+                    0.0f to animatedAmbientColor.copy(alpha = topAmbientAlpha),
+                    0.52f to animatedAmbientColor.copy(alpha = topAmbientAlpha * 0.32f),
+                    1.0f to Color.Transparent
+                )
+            )
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {

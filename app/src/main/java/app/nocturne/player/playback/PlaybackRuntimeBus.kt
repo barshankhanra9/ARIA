@@ -1,6 +1,7 @@
 package app.nocturne.player.playback
 
 import app.nocturne.player.data.model.AudioEngineTelemetry
+import app.nocturne.player.data.model.LyricsData
 import app.nocturne.player.data.model.OnlineTrack
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +18,11 @@ enum class ActiveAudioEngine {
     OFFLINE,
     ONLINE
 }
+
+data class PreloadedLyricsEntry(
+    val trackUri: String,
+    val lyrics: LyricsData
+)
 
 data class OnlineEngineSnapshot(
     val isReady: Boolean = false,
@@ -108,6 +114,9 @@ object PlaybackRuntimeBus {
     private val _offlineSnapshot = MutableStateFlow(OfflineEngineSnapshot())
     val offlineSnapshot: StateFlow<OfflineEngineSnapshot> = _offlineSnapshot.asStateFlow()
 
+    private val _preloadedLyrics = MutableStateFlow<PreloadedLyricsEntry?>(null)
+    val preloadedLyrics: StateFlow<PreloadedLyricsEntry?> = _preloadedLyrics.asStateFlow()
+
     @Volatile
     var onlineBridge: OnlinePlaybackBridge? = null
 
@@ -136,5 +145,9 @@ object PlaybackRuntimeBus {
 
     fun updateOfflineSnapshot(snapshot: OfflineEngineSnapshot) {
         _offlineSnapshot.value = snapshot
+    }
+
+    fun updatePreloadedLyrics(trackUri: String, lyrics: LyricsData) {
+        _preloadedLyrics.value = PreloadedLyricsEntry(trackUri = trackUri, lyrics = lyrics)
     }
 }

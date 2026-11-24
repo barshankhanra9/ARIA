@@ -16,6 +16,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 data class ExecutedHttpResponse(
@@ -32,6 +33,7 @@ class DynamicHttpExecutor(
     private val allowLoopbackForTests: Boolean = false
 ) {
     private val json = Json { ignoreUnknownKeys = true }
+    private val timedClients = ConcurrentHashMap<Long, OkHttpClient>()
 
     suspend fun executeTemplated(
         config: DynamicProviderConfig,
@@ -49,8 +51,9 @@ class DynamicHttpExecutor(
             providerId = config.id,
             operation = operation,
             configuredEndpoints = candidateConfigs.map { it.url }
-        )
+        ).let { if (config.endpointFailover) it else it.take(1) }
         val endpointByUrl = candidateConfigs.associateBy { it.url.trimEnd('/') }
+        val effectiveVariables = if (config.params.isEmpty()) variables else config.params + variables
 
         var lastError: Throwable? = null
         val maxRetries = config.maxRetries.coerceIn(0, 3)
@@ -63,7 +66,7 @@ class DynamicHttpExecutor(
                 buildRequest(
                     baseUrl = endpointUrl,
                     template = template,
-                    variables = variables,
+                    variables = effectiveVariables,
                     providerHeaders = config.headers,
                     endpointHeaders = epCfg.headers
                 )
@@ -142,7 +145,8 @@ class DynamicHttpExecutor(
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 10_000L,
         maxRetries: Int = 1,
-        cooldownMs: Long = 60_000L
+        cooldownMs: Long = 60_000L,
+        endpointFailover: Boolean = true
     ): ExecutedHttpResponse = withContext(Dispatchers.IO) {
         val enabledEps = configuredEndpoints
             .filter { it.supports(operation) }
@@ -154,7 +158,7 @@ class DynamicHttpExecutor(
             providerId = providerId,
             operation = operation,
             configuredEndpoints = enabledEps.map { it.url }
-        )
+        ).let { if (endpointFailover) it else it.take(1) }
         val epByUrl = enabledEps.associateBy { it.url.trimEnd('/') }
         var lastError: Throwable? = null
         val boundedRetries = maxRetries.coerceIn(0, 3)
@@ -353,12 +357,15 @@ class DynamicHttpExecutor(
     }
 
     private fun clientWithTimeout(timeoutMs: Long): OkHttpClient {
-        return baseClient.newBuilder()
-            .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-            .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-            .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
-            .callTimeout(timeoutMs + 2_000L, TimeUnit.MILLISECONDS)
-            .build()
+        val clamped = timeoutMs.coerceIn(1_500L, 30_000L)
+        return timedClients.computeIfAbsent(clamped) { ms ->
+            baseClient.newBuilder()
+                .connectTimeout(ms, TimeUnit.MILLISECONDS)
+                .readTimeout(ms, TimeUnit.MILLISECONDS)
+                .writeTimeout(ms, TimeUnit.MILLISECONDS)
+                .callTimeout(ms + 2_000L, TimeUnit.MILLISECONDS)
+                .build()
+        }
     }
 
     private fun isTransientFailure(t: Throwable): Boolean {

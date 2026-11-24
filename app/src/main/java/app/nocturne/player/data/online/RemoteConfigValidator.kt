@@ -3,6 +3,8 @@ package app.nocturne.player.data.online
 import app.nocturne.player.data.model.DynamicLyricsProviderConfig
 import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.EndpointOperationTemplate
+import app.nocturne.player.data.model.LyricsCleaningConfig
+import app.nocturne.player.data.model.ProviderDefaultsConfig
 import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.model.ProviderResponseMapping
 import app.nocturne.player.data.model.ProviderRoutesConfig
@@ -41,7 +43,13 @@ object RemoteConfigValidator {
         "configVersion", "config_version", "version",
         "refreshIntervalSeconds", "refresh_interval_seconds", "refreshInterval", "ttlSeconds", "ttl",
         "repository", "repo", "name", "description", "updatedAt", "updated_at",
-        "lyricsProviders", "lyrics_providers", "lyrics", "lrclib"
+        "providerDefaults", "provider_defaults",
+        "metadataCleaning", "metadata_cleaning",
+        "lyricsProviders", "lyrics_providers", "lyrics", "lrclib",
+        "lyricsCleaning", "lyrics_cleaning",
+        "stripBracketsRegex", "strip_brackets_regex",
+        "stripKeywordsRegex", "strip_keywords_regex",
+        "titleDelimiters", "title_delimiters"
     )
     private val ENDPOINT_OPERATIONS = setOf("search", "metadata", "playback", "all")
 
@@ -65,22 +73,33 @@ object RemoteConfigValidator {
                 "Remote provider configuration is empty"
             )
         }
+        if (trimmed.startsWith("<")) {
+            throw RemoteConfigValidationException(
+                RemoteConfigErrorType.JSON_PARSE_ERROR,
+                "Response returned HTML/XML instead of JSON"
+            )
+        }
 
         val parsedElement = try {
             json.parseToJsonElement(trimmed)
         } catch (e: SerializationException) {
-            val looksLikeHtml = trimmed.startsWith("<")
-            val detail = if (looksLikeHtml) {
-                "Response returned HTML/text instead of JSON"
-            } else {
-                "Invalid JSON syntax: ${e.message?.lineSequence()?.firstOrNull()?.take(120) ?: "malformed JSON"}"
-            }
-            throw RemoteConfigValidationException(RemoteConfigErrorType.JSON_PARSE_ERROR, detail, e)
+            throw RemoteConfigValidationException(
+                RemoteConfigErrorType.JSON_PARSE_ERROR,
+                "Invalid JSON syntax: ${e.message?.lineSequence()?.firstOrNull()?.take(120) ?: "malformed JSON"}",
+                e
+            )
         } catch (e: IllegalArgumentException) {
             throw RemoteConfigValidationException(
                 RemoteConfigErrorType.JSON_PARSE_ERROR,
                 "Invalid JSON payload: ${e.message?.take(120) ?: "parse error"}",
                 e
+            )
+        }
+
+        if (parsedElement is JsonPrimitive && !isStrictJsonPrimitiveLiteral(trimmed)) {
+            throw RemoteConfigValidationException(
+                RemoteConfigErrorType.JSON_PARSE_ERROR,
+                "Invalid JSON syntax: expected a JSON object"
             )
         }
 
@@ -129,6 +148,8 @@ object RemoteConfigValidator {
             "ttl"
         ) ?: 1800).coerceIn(60, 86_400)
 
+        val providerDefaults = parseProviderDefaultsConfig(root)
+
         val parsedProviders = mutableListOf<DynamicProviderConfig>()
         val parsedLyrics = mutableListOf<DynamicLyricsProviderConfig>()
 
@@ -136,6 +157,7 @@ object RemoteConfigValidator {
             parseV2Providers(
                 element = root[providersKey],
                 allowLoopback = allowLoopback,
+                providerDefaults = providerDefaults,
                 outProviders = parsedProviders,
                 outLyrics = parsedLyrics
             )
@@ -143,6 +165,7 @@ object RemoteConfigValidator {
             parseLegacyV1Providers(
                 obj = root,
                 allowLoopback = allowLoopback,
+                providerDefaults = providerDefaults,
                 outProviders = parsedProviders,
                 outLyrics = parsedLyrics
             )
@@ -150,11 +173,12 @@ object RemoteConfigValidator {
 
         val lyricsKey = LYRICS_CONTAINER_KEYS.firstOrNull { root.containsKey(it) }
         if (lyricsKey != null) {
-            parseLyricsElement(root[lyricsKey], allowLoopback, parsedLyrics)
+            parseLyricsElement(root[lyricsKey], allowLoopback, providerDefaults, parsedLyrics)
         }
         if (root.containsKey("lrclib")) {
-            parseLyricsElement(root["lrclib"], allowLoopback, parsedLyrics, fallbackId = "lrclib")
+            parseLyricsElement(root["lrclib"], allowLoopback, providerDefaults, parsedLyrics, fallbackId = "lrclib")
         }
+        val lyricsCleaning = parseLyricsCleaningConfig(root)
 
         val dedupedProviders = parsedProviders
             .distinctBy { it.id.lowercase() }
@@ -177,6 +201,8 @@ object RemoteConfigValidator {
             refreshIntervalSeconds = refreshIntervalSeconds,
             providers = dedupedProviders,
             lyricsProviders = dedupedLyrics,
+            lyricsCleaning = lyricsCleaning,
+            providerDefaults = providerDefaults,
             etag = etag,
             lastModified = lastModified,
             updatedAtMs = updatedAtMs
@@ -187,21 +213,40 @@ object RemoteConfigValidator {
         config: RemoteProvidersConfig,
         allowLoopback: Boolean = false
     ): RemoteProvidersConfig {
+        val sanitizedDefaults = sanitizeProviderDefaults(config.providerDefaults)
         val sanitizedProviders = config.providers.mapNotNull { sanitizeProviderConfig(it, allowLoopback) }
         val sanitizedLyrics = config.lyricsProviders.mapNotNull { lp ->
             val id = InputAndUrlSecurity.sanitizeProviderId(lp.id) ?: return@mapNotNull null
+            val adapter = lp.adapterType.trim().lowercase().ifBlank { id }
             val endpoints = lp.endpoints.mapNotNull { ep -> sanitizeEndpoint(ep, allowLoopback) }
-            if (endpoints.isEmpty() && lp.enabled) return@mapNotNull null
+            val safeInstances = lp.instances.mapNotNull { InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback) }.distinct()
+            val allowsEmptyEndpoints = isImplicitEndpointLyricsId(id, adapter)
+            if (endpoints.isEmpty() && safeInstances.isEmpty() && lp.enabled && !allowsEmptyEndpoints) {
+                return@mapNotNull null
+            }
             lp.copy(
                 id = id,
-                displayName = InputAndUrlSecurity.sanitizeSingleLineText(lp.displayName, 48).ifBlank { id.uppercase() },
+                displayName = InputAndUrlSecurity.sanitizeSingleLineText(lp.displayName, 48).ifBlank { defaultLyricsDisplayName(id) },
+                category = lp.category.trim().lowercase().ifBlank { "lyrics" },
+                adapterType = adapter,
+                capabilities = lp.capabilities.map { it.trim().lowercase() }.filter { it.isNotBlank() }.distinct(),
                 endpoints = endpoints,
-                timeoutMs = lp.timeoutMs.coerceIn(1_000L, 20_000L)
+                instances = safeInstances,
+                timeoutMs = lp.timeoutMs.coerceIn(1_000L, 30_000L),
+                maxRetries = lp.maxRetries.coerceIn(0, 3),
+                cooldownMs = lp.cooldownMs.coerceIn(1_000L, 3_600_000L),
+                userAgent = lp.userAgent?.takeIf { !InputAndUrlSecurity.hasControlChars(it) && it.length <= 512 },
+                cookie = lp.cookie?.takeIf { !InputAndUrlSecurity.hasControlChars(it) && it.length <= 4096 },
+                appId = lp.appId?.takeIf { !InputAndUrlSecurity.hasControlChars(it) && it.length <= 128 },
+                headers = InputAndUrlSecurity.sanitizeRemoteHeaderMap(lp.headers),
+                params = InputAndUrlSecurity.sanitizeParamMap(lp.params)
             )
         }
         return config.copy(
             providers = sanitizedProviders.sortedBy { it.priority },
-            lyricsProviders = sanitizedLyrics.sortedBy { it.priority }
+            lyricsProviders = sanitizedLyrics.sortedBy { it.priority },
+            lyricsCleaning = sanitizeLyricsCleaningConfig(config.lyricsCleaning),
+            providerDefaults = sanitizedDefaults
         )
     }
 
@@ -229,6 +274,7 @@ object RemoteConfigValidator {
     private fun parseV2Providers(
         element: JsonElement?,
         allowLoopback: Boolean,
+        providerDefaults: ProviderDefaultsConfig,
         outProviders: MutableList<DynamicProviderConfig>,
         outLyrics: MutableList<DynamicLyricsProviderConfig>,
         inheritedCategory: String? = null
@@ -240,12 +286,13 @@ object RemoteConfigValidator {
                     val rawId = obj.strValue("id", "providerId", "provider_id", "key")
                     val id = InputAndUrlSecurity.sanitizeProviderId(rawId) ?: return@forEachIndexed
                     if (isLyricsEntry(id, obj, inheritedCategory)) {
-                        parseSingleLyricsObject(id, obj, allowLoopback, idx + 1)?.let(outLyrics::add)
+                        parseSingleLyricsObject(id, obj, allowLoopback, idx + 1, providerDefaults)?.let(outLyrics::add)
                     } else {
                         parseSingleProviderObject(
                             id = id,
                             obj = obj,
                             allowLoopback = allowLoopback,
+                            providerDefaults = providerDefaults,
                             fallbackCategory = inheritedCategory
                         )?.let(outProviders::add)
                     }
@@ -258,11 +305,12 @@ object RemoteConfigValidator {
                             if (looksLikeCategoryArray(value)) {
                                 val categoryName = formatCategoryLabel(key)
                                 if (key.equals("lyrics", ignoreCase = true) || key.equals("lyricsProviders", ignoreCase = true)) {
-                                    parseLyricsElement(value, allowLoopback, outLyrics)
+                                    parseLyricsElement(value, allowLoopback, providerDefaults, outLyrics)
                                 } else {
                                     parseV2Providers(
                                         element = value,
                                         allowLoopback = allowLoopback,
+                                        providerDefaults = providerDefaults,
                                         outProviders = outProviders,
                                         outLyrics = outLyrics,
                                         inheritedCategory = categoryName
@@ -271,13 +319,14 @@ object RemoteConfigValidator {
                             } else {
                                 val id = InputAndUrlSecurity.sanitizeProviderId(key) ?: continue
                                 if (isLyricsId(id)) {
-                                    parseLyricsUrlArray(id, value, allowLoopback)?.let(outLyrics::add)
+                                    parseLyricsUrlArray(id, value, allowLoopback, providerDefaults)?.let(outLyrics::add)
                                 } else {
                                     val eps = extractEndpointsFromArray(value, allowLoopback)
                                     val candidate = buildProviderFromEndpoints(
                                         id = id,
                                         endpoints = eps,
                                         categories = listOfNotNull(inheritedCategory),
+                                        providerDefaults = providerDefaults,
                                         allowLoopback = allowLoopback
                                     )
                                     if (candidate != null) outProviders.add(candidate)
@@ -289,12 +338,13 @@ object RemoteConfigValidator {
                                 val rawId = value.strValue("id", "providerId", "provider_id", "key") ?: key
                                 val id = InputAndUrlSecurity.sanitizeProviderId(rawId) ?: continue
                                 if (isLyricsEntry(id, value, inheritedCategory)) {
-                                    parseSingleLyricsObject(id, value, allowLoopback, 1)?.let(outLyrics::add)
+                                    parseSingleLyricsObject(id, value, allowLoopback, 1, providerDefaults)?.let(outLyrics::add)
                                 } else {
                                     parseSingleProviderObject(
                                         id = id,
                                         obj = value,
                                         allowLoopback = allowLoopback,
+                                        providerDefaults = providerDefaults,
                                         fallbackCategory = inheritedCategory
                                     )?.let(outProviders::add)
                                 }
@@ -303,6 +353,7 @@ object RemoteConfigValidator {
                                 parseV2Providers(
                                     element = value,
                                     allowLoopback = allowLoopback,
+                                    providerDefaults = providerDefaults,
                                     outProviders = outProviders,
                                     outLyrics = outLyrics,
                                     inheritedCategory = categoryName
@@ -324,7 +375,11 @@ object RemoteConfigValidator {
                                                     displayName = id.uppercase(),
                                                     enabled = true,
                                                     priority = 1,
-                                                    endpoints = listOf(safeEp)
+                                                    endpoints = listOf(safeEp),
+                                                    timeoutMs = providerDefaults.requestTimeoutMs,
+                                                    maxRetries = providerDefaults.maxRetriesPerEndpoint,
+                                                    cooldownMs = providerDefaults.healthCheckCooldownMs,
+                                                    endpointFailover = providerDefaults.endpointFailover
                                                 )
                                             )
                                         }
@@ -333,6 +388,7 @@ object RemoteConfigValidator {
                                             id = id,
                                             endpoints = listOf(ep),
                                             categories = listOfNotNull(inheritedCategory),
+                                            providerDefaults = providerDefaults,
                                             allowLoopback = allowLoopback
                                         )?.let(outProviders::add)
                                     }
@@ -345,6 +401,10 @@ object RemoteConfigValidator {
                                         enabled = boolVal,
                                         priority = defaultPriorityForId(id),
                                         capabilities = defaultCapabilitiesForAdapter("newpipe"),
+                                        timeoutMs = providerDefaults.requestTimeoutMs,
+                                        maxRetries = providerDefaults.maxRetriesPerEndpoint,
+                                        cooldownMs = providerDefaults.healthCheckCooldownMs,
+                                        endpointFailover = providerDefaults.endpointFailover,
                                         categories = listOfNotNull(inheritedCategory)
                                     )
                                     sanitizeProviderConfig(candidate, allowLoopback)?.let(outProviders::add)
@@ -371,6 +431,8 @@ object RemoteConfigValidator {
                 obj.containsKey("adapterType") ||
                 obj.containsKey("adapter") ||
                 obj.containsKey("endpoints") ||
+                obj.containsKey("base_urls") ||
+                obj.containsKey("baseUrls") ||
                 obj.containsKey("urls") ||
                 obj.containsKey("instances") ||
                 obj.containsKey("servers") ||
@@ -389,34 +451,51 @@ object RemoteConfigValidator {
         val providerFieldHints = setOf(
             "id", "providerId", "provider_id",
             "adapterType", "adapter_type", "adapter", "type", "engine",
-            "enabled", "isEnabled", "active", "disabled",
-            "priority", "capabilities",
+            "category", "enabled", "isEnabled", "active", "disabled",
+            "priority", "capabilities", "params", "headers",
             "baseUrl", "base_url", "url", "apiUrl", "api_url", "endpoint", "host", "instance",
-            "endpoints", "urls", "baseUrls", "instances", "servers", "mirrors", "hosts", "nodes",
+            "endpoints", "urls", "baseUrls", "base_urls", "instances", "servers", "mirrors", "hosts", "nodes",
             "routes", "mapping"
         )
         return obj.keys.any { it in providerFieldHints }
     }
 
     private fun isLyricsEntry(id: String, obj: JsonObject, inheritedCategory: String?): Boolean {
-        if (isLyricsId(id)) return true
-        val rawAdapter = obj.strValue("adapterType", "adapter_type", "adapter", "type", "kind")?.lowercase()
-        if (rawAdapter == "lyrics" || rawAdapter == "lrclib") return true
         val rawCat = obj.strValue("category", "group")?.lowercase()
         if (rawCat == "lyrics") return true
+        val rawAdapter = obj.strValue("adapterType", "adapter_type", "adapter", "type", "kind")?.lowercase()
+        if (rawAdapter in setOf("lyrics", "lrclib", "liriqo", "musixmatch", "jiosaavn_lyrics")) return true
+        if (rawCat == "music" || rawCat == "audio") return false
+        if (isLyricsId(id)) return true
         if (inheritedCategory.equals("Lyrics", ignoreCase = true)) return true
         return false
     }
 
     private fun isLyricsId(id: String): Boolean {
         val lower = id.lowercase()
-        return lower == "lrclib" || lower == "lyrics"
+        return lower in setOf("lrclib", "lyrics", "liriqo", "musixmatch", "jiosaavn_lyrics", "jiosaavnlyrics")
+    }
+
+    private fun isImplicitEndpointLyricsId(id: String, adapterType: String = id): Boolean {
+        val lowerId = id.lowercase()
+        val lowerAdapter = adapterType.lowercase()
+        val implicitSet = setOf("musixmatch", "jiosaavn_lyrics", "jiosaavnlyrics", "jiosaavn")
+        return lowerId in implicitSet || lowerAdapter in implicitSet
+    }
+
+    private fun defaultLyricsDisplayName(id: String): String = when (id.lowercase()) {
+        "liriqo" -> "LiriQo"
+        "musixmatch" -> "Musixmatch"
+        "jiosaavn_lyrics", "jiosaavnlyrics", "jiosaavn" -> "JioSaavn Lyrics"
+        "lrclib" -> "LRCLIB"
+        else -> id.uppercase()
     }
 
     private fun parseSingleProviderObject(
         id: String,
         obj: JsonObject,
         allowLoopback: Boolean,
+        providerDefaults: ProviderDefaultsConfig = ProviderDefaultsConfig(),
         fallbackCategory: String? = null
     ): DynamicProviderConfig? {
         val rawEndpoints = extractEndpointsFromObject(obj)
@@ -445,6 +524,7 @@ object RemoteConfigValidator {
                 ?: defaultDisplayNameForId(id),
             48
         ).ifBlank { id.uppercase() }
+        val category = obj.strValue("category", "group")?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: "music"
 
         val capabilities = (obj["capabilities"] as? JsonArray)
             ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()?.takeIf { c -> c.isNotBlank() } }
@@ -457,12 +537,18 @@ object RemoteConfigValidator {
         val headers = InputAndUrlSecurity.sanitizeRemoteHeaderMap(
             parseStringMap(obj["headers"] as? JsonObject)
         )
+        val params = InputAndUrlSecurity.sanitizeParamMap(
+            parseStringMap(obj["params"] as? JsonObject)
+        )
 
-        val timeoutMs = ((obj["timeoutMs"] ?: obj["timeout_ms"]) as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
-            ?.coerceIn(1_500L, 30_000L) ?: 10_000L
-        val maxRetries = (obj.intValue("maxRetries", "max_retries") ?: 1).coerceIn(0, 3)
-        val cooldownMs = ((obj["cooldownMs"] ?: obj["cooldown_ms"]) as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
-            ?.coerceIn(5_000L, 3_600_000L) ?: 60_000L
+        val timeoutMs = ((obj["request_timeout_ms"] ?: obj["requestTimeoutMs"] ?: obj["timeoutMs"] ?: obj["timeout_ms"]) as? JsonPrimitive)
+            ?.contentOrNull?.toLongOrNull()?.coerceIn(1_500L, 30_000L) ?: providerDefaults.requestTimeoutMs
+        val maxRetries = (obj.intValue("max_retries_per_endpoint", "maxRetriesPerEndpoint", "maxRetries", "max_retries")
+            ?: providerDefaults.maxRetriesPerEndpoint).coerceIn(0, 3)
+        val cooldownMs = ((obj["health_check_cooldown_ms"] ?: obj["healthCheckCooldownMs"] ?: obj["cooldownMs"] ?: obj["cooldown_ms"]) as? JsonPrimitive)
+            ?.contentOrNull?.toLongOrNull()?.coerceIn(1_000L, 3_600_000L) ?: providerDefaults.healthCheckCooldownMs
+        val endpointFailover = ((obj["endpoint_failover"] ?: obj["endpointFailover"]) as? JsonPrimitive)
+            ?.booleanOrNull ?: providerDefaults.endpointFailover
         val verifyStreamReachable = (obj["verifyStreamReachable"] ?: obj["verify_stream_reachable"])
             ?.let { (it as? JsonPrimitive)?.booleanOrNull } ?: false
 
@@ -477,6 +563,7 @@ object RemoteConfigValidator {
         val candidate = DynamicProviderConfig(
             id = id,
             displayName = displayName,
+            category = category,
             adapterType = adapterType,
             enabled = enabled,
             priority = priority,
@@ -485,7 +572,9 @@ object RemoteConfigValidator {
             timeoutMs = timeoutMs,
             maxRetries = maxRetries,
             cooldownMs = cooldownMs,
+            endpointFailover = endpointFailover,
             headers = headers,
+            params = params,
             routes = routes,
             mapping = mapping,
             verifyStreamReachable = verifyStreamReachable,
@@ -613,6 +702,7 @@ object RemoteConfigValidator {
         id: String,
         endpoints: List<ProviderEndpointConfig>,
         categories: List<String>,
+        providerDefaults: ProviderDefaultsConfig = ProviderDefaultsConfig(),
         allowLoopback: Boolean
     ): DynamicProviderConfig? {
         val adapter = defaultAdapterForId(id, hasHttpEndpoints = endpoints.isNotEmpty())
@@ -624,6 +714,10 @@ object RemoteConfigValidator {
             priority = defaultPriorityForId(id),
             capabilities = defaultCapabilitiesForAdapter(adapter),
             endpoints = endpoints,
+            timeoutMs = providerDefaults.requestTimeoutMs,
+            maxRetries = providerDefaults.maxRetriesPerEndpoint,
+            cooldownMs = providerDefaults.healthCheckCooldownMs,
+            endpointFailover = providerDefaults.endpointFailover,
             categories = categories
         )
         return sanitizeProviderConfig(candidate, allowLoopback)
@@ -652,6 +746,7 @@ object RemoteConfigValidator {
     private fun parseLegacyV1Providers(
         obj: JsonObject,
         allowLoopback: Boolean,
+        providerDefaults: ProviderDefaultsConfig,
         outProviders: MutableList<DynamicProviderConfig>,
         outLyrics: MutableList<DynamicLyricsProviderConfig>
     ) {
@@ -675,6 +770,7 @@ object RemoteConfigValidator {
                         parseV2Providers(
                             element = value,
                             allowLoopback = allowLoopback,
+                            providerDefaults = providerDefaults,
                             outProviders = outProviders,
                             outLyrics = outLyrics,
                             inheritedCategory = formatCategoryLabel(rawKey)
@@ -690,18 +786,23 @@ object RemoteConfigValidator {
                                 enabled = true,
                                 priority = defaultPri,
                                 capabilities = defaultCapabilitiesForAdapter(adapter),
-                                endpoints = endpoints
+                                endpoints = endpoints,
+                                timeoutMs = providerDefaults.requestTimeoutMs,
+                                maxRetries = providerDefaults.maxRetriesPerEndpoint,
+                                cooldownMs = providerDefaults.healthCheckCooldownMs,
+                                endpointFailover = providerDefaults.endpointFailover
                             )
                         }
                     }
                 }
                 is JsonObject -> {
                     if (looksLikeProviderObject(rawKey, value)) {
-                        parseSingleProviderObject(id, value, allowLoopback)?.let(outProviders::add)
+                        parseSingleProviderObject(id, value, allowLoopback, providerDefaults)?.let(outProviders::add)
                     } else {
                         parseV2Providers(
                             element = value,
                             allowLoopback = allowLoopback,
+                            providerDefaults = providerDefaults,
                             outProviders = outProviders,
                             outLyrics = outLyrics,
                             inheritedCategory = formatCategoryLabel(rawKey)
@@ -722,7 +823,11 @@ object RemoteConfigValidator {
                                 enabled = true,
                                 priority = defaultPri,
                                 capabilities = defaultCapabilitiesForAdapter(adapter),
-                                endpoints = listOf(ProviderEndpointConfig(url = valid, priority = 1))
+                                endpoints = listOf(ProviderEndpointConfig(url = valid, priority = 1)),
+                                timeoutMs = providerDefaults.requestTimeoutMs,
+                                maxRetries = providerDefaults.maxRetriesPerEndpoint,
+                                cooldownMs = providerDefaults.healthCheckCooldownMs,
+                                endpointFailover = providerDefaults.endpointFailover
                             )
                         }
                     } else if (boolVal != null && id in BUILTIN_EXTRACTOR_IDS) {
@@ -732,7 +837,11 @@ object RemoteConfigValidator {
                             adapterType = "newpipe",
                             enabled = boolVal,
                             priority = defaultPri,
-                            capabilities = defaultCapabilitiesForAdapter("newpipe")
+                            capabilities = defaultCapabilitiesForAdapter("newpipe"),
+                            timeoutMs = providerDefaults.requestTimeoutMs,
+                            maxRetries = providerDefaults.maxRetriesPerEndpoint,
+                            cooldownMs = providerDefaults.healthCheckCooldownMs,
+                            endpointFailover = providerDefaults.endpointFailover
                         )
                     }
                 }
@@ -744,38 +853,102 @@ object RemoteConfigValidator {
     private fun parseLyricsElement(
         element: JsonElement?,
         allowLoopback: Boolean,
+        providerDefaults: ProviderDefaultsConfig,
         outLyrics: MutableList<DynamicLyricsProviderConfig>,
         fallbackId: String? = null
     ) {
         when (element) {
             is JsonArray -> {
-                if (element.any { it is JsonObject && (it.containsKey("id") || it.containsKey("endpoints") || it.containsKey("urls")) }) {
+                if (element.any {
+                        it is JsonObject && (
+                            it.containsKey("id") ||
+                                it.containsKey("providerId") ||
+                                it.containsKey("key") ||
+                                it.containsKey("endpoints") ||
+                                it.containsKey("base_urls") ||
+                                it.containsKey("baseUrls") ||
+                                it.containsKey("urls") ||
+                                it.containsKey("instances") ||
+                                it.containsKey("user_agent") ||
+                                it.containsKey("userAgent") ||
+                                it.containsKey("app_id") ||
+                                it.containsKey("appId")
+                            )
+                    }
+                ) {
                     element.forEachIndexed { index, el ->
                         val obj = el as? JsonObject ?: return@forEachIndexed
                         val id = InputAndUrlSecurity.sanitizeProviderId(
                             obj.strValue("id", "providerId", "key") ?: fallbackId ?: "lrclib_$index"
                         ) ?: return@forEachIndexed
-                        parseSingleLyricsObject(id, obj, allowLoopback, index + 1)?.let(outLyrics::add)
+                        parseSingleLyricsObject(id, obj, allowLoopback, index + 1, providerDefaults)?.let(outLyrics::add)
                     }
                 } else {
-                    parseLyricsUrlArray(fallbackId ?: "lrclib", element, allowLoopback)?.let(outLyrics::add)
+                    parseLyricsUrlArray(fallbackId ?: "lrclib", element, allowLoopback, providerDefaults)?.let(outLyrics::add)
                 }
             }
             is JsonObject -> {
-                val id = InputAndUrlSecurity.sanitizeProviderId(
-                    element.strValue("id", "providerId", "key") ?: fallbackId ?: "lrclib"
-                ) ?: return
-                parseSingleLyricsObject(id, element, allowLoopback, 1)?.let(outLyrics::add)
+                val hasExplicitIdOrEndpoints = element.containsKey("id") ||
+                    element.containsKey("providerId") ||
+                    element.containsKey("key") ||
+                    element.containsKey("endpoints") ||
+                    element.containsKey("base_urls") ||
+                    element.containsKey("baseUrls") ||
+                    element.containsKey("urls") ||
+                    element.containsKey("instances") ||
+                    element.containsKey("baseUrl") ||
+                    element.containsKey("base_url") ||
+                    element.containsKey("url") ||
+                    element.containsKey("user_agent") ||
+                    element.containsKey("userAgent") ||
+                    element.containsKey("cookie") ||
+                    element.containsKey("Cookie") ||
+                    element.containsKey("app_id") ||
+                    element.containsKey("appId") ||
+                    element.containsKey("params")
+
+                val hasNestedLyricsKeys = !hasExplicitIdOrEndpoints && element.keys.any { k ->
+                    k.lowercase() in setOf(
+                        "liriqo", "musixmatch", "lrclib", "jiosaavn", "jiosaavn_lyrics",
+                        "cleaning", "lyrics_cleaning", "lyricsCleaning", "metadata_cleaning", "metadataCleaning"
+                    )
+                }
+
+                if (hasNestedLyricsKeys) {
+                    element.entries.forEachIndexed { idx, (subKey, subVal) ->
+                        val lower = subKey.lowercase()
+                        if (lower in setOf("cleaning", "lyrics_cleaning", "lyricscleaning", "metadata_cleaning", "metadatacleaning")) {
+                            return@forEachIndexed
+                        }
+                        val normalizedId = if (lower == "jiosaavn") "jiosaavn_lyrics" else lower
+                        if (subVal is JsonObject && isLyricsEntry(normalizedId, subVal, "Lyrics")) {
+                            parseSingleLyricsObject(normalizedId, subVal, allowLoopback, idx + 1, providerDefaults)?.let(outLyrics::add)
+                        } else {
+                            parseLyricsElement(subVal, allowLoopback, providerDefaults, outLyrics, fallbackId = normalizedId)
+                        }
+                    }
+                } else {
+                    val id = InputAndUrlSecurity.sanitizeProviderId(
+                        element.strValue("id", "providerId", "key") ?: fallbackId ?: "lrclib"
+                    ) ?: return
+                    parseSingleLyricsObject(id, element, allowLoopback, 1, providerDefaults)?.let(outLyrics::add)
+                }
             }
             is JsonPrimitive -> {
                 val url = element.contentOrNull?.trim() ?: return
                 val valid = InputAndUrlSecurity.validateRemoteBaseUrl(url, allowLoopback) ?: return
+                val id = fallbackId ?: "lrclib"
                 outLyrics += DynamicLyricsProviderConfig(
-                    id = fallbackId ?: "lrclib",
-                    displayName = (fallbackId ?: "lrclib").uppercase(),
+                    id = id,
+                    displayName = defaultLyricsDisplayName(id),
                     enabled = true,
-                    priority = 1,
-                    endpoints = listOf(ProviderEndpointConfig(url = valid, priority = 1))
+                    priority = defaultLyricsPriority(id),
+                    endpoints = listOf(ProviderEndpointConfig(url = valid, priority = 1)),
+                    instances = listOf(valid),
+                    timeoutMs = providerDefaults.requestTimeoutMs,
+                    maxRetries = providerDefaults.maxRetriesPerEndpoint,
+                    cooldownMs = providerDefaults.healthCheckCooldownMs,
+                    endpointFailover = providerDefaults.endpointFailover
                 )
             }
             else -> Unit
@@ -786,44 +959,191 @@ object RemoteConfigValidator {
         id: String,
         obj: JsonObject,
         allowLoopback: Boolean,
-        defaultPriority: Int
+        defaultPriority: Int,
+        providerDefaults: ProviderDefaultsConfig = ProviderDefaultsConfig()
     ): DynamicLyricsProviderConfig? {
         val enabled = resolveEnabledFlag(obj)
-        val priority = (obj.intValue("priority", "order") ?: defaultPriority).coerceIn(0, 1000)
+        val priority = (obj.intValue("priority", "order") ?: defaultLyricsPriority(id, defaultPriority)).coerceIn(0, 1000)
+        val adapterType = (obj.strValue("adapterType", "adapter_type", "adapter", "type", "kind") ?: id)
+            .trim().lowercase().ifBlank { id.lowercase() }
+        val category = obj.strValue("category", "group")?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: "lyrics"
+        val capabilities = (obj["capabilities"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()?.takeIf { c -> c.isNotBlank() } }
+            ?.distinct()
+            .orEmpty()
+
         val rawEndpoints = extractEndpointsFromObject(obj)
         val sanitized = rawEndpoints
             .mapNotNull { sanitizeEndpoint(it, allowLoopback) }
             .distinctBy { it.url }
             .sortedBy { it.priority }
             .take(15)
-        if (enabled && sanitized.isEmpty()) return null
+        val instanceUrls = sanitized.map { it.url }
+        val allowsEmpty = isImplicitEndpointLyricsId(id, adapterType)
+        if (enabled && sanitized.isEmpty() && !allowsEmpty) return null
+
+        val rawHeaders = parseStringMap(obj["headers"] as? JsonObject)
+        val rawParams = parseStringMap(obj["params"] as? JsonObject)
+        val userAgent = (obj.strValue("userAgent", "user_agent", "User-Agent")
+            ?: rawHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
+            ?: rawParams.entries.firstOrNull { it.key.equals("user_agent", ignoreCase = true) || it.key.equals("userAgent", ignoreCase = true) }?.value)
+            ?.takeIf { !InputAndUrlSecurity.hasControlChars(it) && it.length <= 512 }
+        val cookie = (obj.strValue("cookie", "Cookie")
+            ?: rawHeaders.entries.firstOrNull { it.key.equals("Cookie", ignoreCase = true) }?.value
+            ?: rawParams.entries.firstOrNull { it.key.equals("cookie", ignoreCase = true) }?.value)
+            ?.takeIf { !InputAndUrlSecurity.hasControlChars(it) && it.length <= 4096 }
+        val appId = (obj.strValue("appId", "app_id")
+            ?: rawParams.entries.firstOrNull { it.key.equals("app_id", ignoreCase = true) || it.key.equals("appId", ignoreCase = true) }?.value)
+            ?.takeIf { !InputAndUrlSecurity.hasControlChars(it) && it.length <= 128 }
+        val safeHeaders = InputAndUrlSecurity.sanitizeRemoteHeaderMap(rawHeaders)
+        val safeParams = InputAndUrlSecurity.sanitizeParamMap(rawParams)
+
+        val timeoutMs = ((obj["request_timeout_ms"] ?: obj["requestTimeoutMs"] ?: obj["timeoutMs"] ?: obj["timeout_ms"]) as? JsonPrimitive)
+            ?.contentOrNull?.toLongOrNull()?.coerceIn(1_000L, 30_000L) ?: providerDefaults.requestTimeoutMs
+        val maxRetries = (obj.intValue("max_retries_per_endpoint", "maxRetriesPerEndpoint", "maxRetries", "max_retries")
+            ?: providerDefaults.maxRetriesPerEndpoint).coerceIn(0, 3)
+        val cooldownMs = ((obj["health_check_cooldown_ms"] ?: obj["healthCheckCooldownMs"] ?: obj["cooldownMs"] ?: obj["cooldown_ms"]) as? JsonPrimitive)
+            ?.contentOrNull?.toLongOrNull()?.coerceIn(1_000L, 3_600_000L) ?: providerDefaults.healthCheckCooldownMs
+        val endpointFailover = ((obj["endpoint_failover"] ?: obj["endpointFailover"]) as? JsonPrimitive)
+            ?.booleanOrNull ?: providerDefaults.endpointFailover
+
         return DynamicLyricsProviderConfig(
             id = id,
             displayName = InputAndUrlSecurity.sanitizeSingleLineText(
-                obj.strValue("displayName", "display_name", "name") ?: id.uppercase(),
+                obj.strValue("displayName", "display_name", "name") ?: defaultLyricsDisplayName(id),
                 48
-            ).ifBlank { id.uppercase() },
+            ).ifBlank { defaultLyricsDisplayName(id) },
+            category = category,
+            adapterType = adapterType,
             enabled = enabled,
             priority = priority,
+            capabilities = capabilities,
             endpoints = sanitized,
-            timeoutMs = ((obj["timeoutMs"] ?: obj["timeout_ms"]) as? JsonPrimitive)?.contentOrNull?.toLongOrNull()
-                ?.coerceIn(1_500L, 20_000L) ?: 8_000L
+            instances = instanceUrls,
+            timeoutMs = timeoutMs,
+            maxRetries = maxRetries,
+            cooldownMs = cooldownMs,
+            endpointFailover = endpointFailover,
+            userAgent = userAgent,
+            cookie = cookie,
+            appId = appId,
+            headers = safeHeaders,
+            params = safeParams
         )
     }
 
     private fun parseLyricsUrlArray(
         id: String,
         arr: JsonArray,
-        allowLoopback: Boolean
+        allowLoopback: Boolean,
+        providerDefaults: ProviderDefaultsConfig = ProviderDefaultsConfig()
     ): DynamicLyricsProviderConfig? {
         val endpoints = extractEndpointsFromArray(arr, allowLoopback)
         if (endpoints.isEmpty()) return null
         return DynamicLyricsProviderConfig(
             id = id,
-            displayName = if (id.equals("lrclib", ignoreCase = true)) "LRCLIB" else id.uppercase(),
+            displayName = defaultLyricsDisplayName(id),
             enabled = true,
-            priority = 1,
-            endpoints = endpoints
+            priority = defaultLyricsPriority(id),
+            endpoints = endpoints,
+            instances = endpoints.map { it.url },
+            timeoutMs = providerDefaults.requestTimeoutMs,
+            maxRetries = providerDefaults.maxRetriesPerEndpoint,
+            cooldownMs = providerDefaults.healthCheckCooldownMs,
+            endpointFailover = providerDefaults.endpointFailover
+        )
+    }
+
+    private fun defaultLyricsPriority(id: String, fallback: Int = 1): Int = when (id.lowercase()) {
+        "liriqo" -> 1
+        "musixmatch" -> 2
+        "jiosaavn_lyrics", "jiosaavnlyrics", "jiosaavn" -> 3
+        "lrclib" -> 4
+        else -> fallback
+    }
+
+    private fun parseProviderDefaultsConfig(root: JsonObject): ProviderDefaultsConfig {
+        val obj = (root["provider_defaults"] ?: root["providerDefaults"]) as? JsonObject
+            ?: return ProviderDefaultsConfig()
+        val endpointFailover = ((obj["endpoint_failover"] ?: obj["endpointFailover"]) as? JsonPrimitive)
+            ?.booleanOrNull ?: true
+        val maxRetries = (obj.intValue("max_retries_per_endpoint", "maxRetriesPerEndpoint", "max_retries", "maxRetries")
+            ?: 1).coerceIn(0, 3)
+        val timeoutMs = ((obj["request_timeout_ms"] ?: obj["requestTimeoutMs"] ?: obj["timeout_ms"] ?: obj["timeoutMs"]) as? JsonPrimitive)
+            ?.contentOrNull?.toLongOrNull()?.coerceIn(1_500L, 30_000L) ?: 10_000L
+        val cooldownMs = ((obj["health_check_cooldown_ms"] ?: obj["healthCheckCooldownMs"] ?: obj["cooldown_ms"] ?: obj["cooldownMs"]) as? JsonPrimitive)
+            ?.contentOrNull?.toLongOrNull()?.coerceIn(1_000L, 3_600_000L) ?: 60_000L
+        return sanitizeProviderDefaults(
+            ProviderDefaultsConfig(
+                endpointFailover = endpointFailover,
+                maxRetriesPerEndpoint = maxRetries,
+                requestTimeoutMs = timeoutMs,
+                healthCheckCooldownMs = cooldownMs
+            )
+        )
+    }
+
+    private fun sanitizeProviderDefaults(defaults: ProviderDefaultsConfig): ProviderDefaultsConfig =
+        ProviderDefaultsConfig(
+            endpointFailover = defaults.endpointFailover,
+            maxRetriesPerEndpoint = defaults.maxRetriesPerEndpoint.coerceIn(0, 3),
+            requestTimeoutMs = defaults.requestTimeoutMs.coerceIn(1_500L, 30_000L),
+            healthCheckCooldownMs = defaults.healthCheckCooldownMs.coerceIn(1_000L, 3_600_000L)
+        )
+
+    private fun parseLyricsCleaningConfig(root: JsonObject): LyricsCleaningConfig {
+        val lyricsObj = root["lyrics"] as? JsonObject
+        val nestedObj = (root["metadata_cleaning"]
+            ?: root["metadataCleaning"]
+            ?: root["lyrics_cleaning"]
+            ?: root["lyricsCleaning"]
+            ?: lyricsObj?.get("metadata_cleaning")
+            ?: lyricsObj?.get("metadataCleaning")
+            ?: lyricsObj?.get("lyrics_cleaning")
+            ?: lyricsObj?.get("lyricsCleaning")
+            ?: lyricsObj?.get("cleaning")) as? JsonObject
+
+        val sourceObj = nestedObj ?: root
+        val defaults = LyricsCleaningConfig()
+
+        val rawBrackets = sourceObj.strValue("strip_brackets_regex", "stripBracketsRegex")
+            ?: root.strValue("strip_brackets_regex", "stripBracketsRegex")
+        val rawKeywords = sourceObj.strValue("strip_keywords_regex", "stripKeywordsRegex")
+            ?: root.strValue("strip_keywords_regex", "stripKeywordsRegex")
+        val rawDelimitersEl = sourceObj["title_delimiters"] ?: sourceObj["titleDelimiters"]
+            ?: root["title_delimiters"] ?: root["titleDelimiters"]
+
+        val delimiters = when (rawDelimitersEl) {
+            is JsonArray -> rawDelimitersEl.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.takeIf { d -> d.isNotEmpty() && !InputAndUrlSecurity.hasControlChars(d) } }
+            is JsonPrimitive -> rawDelimitersEl.contentOrNull?.split(',')?.mapNotNull { it.takeIf { d -> d.isNotBlank() && !InputAndUrlSecurity.hasControlChars(d) } }
+            else -> null
+        }?.distinct()?.take(16).orEmpty()
+
+        return sanitizeLyricsCleaningConfig(
+            LyricsCleaningConfig(
+                stripBracketsRegex = rawBrackets ?: defaults.stripBracketsRegex,
+                stripKeywordsRegex = rawKeywords ?: defaults.stripKeywordsRegex,
+                titleDelimiters = if (delimiters.isNotEmpty()) delimiters else defaults.titleDelimiters
+            )
+        )
+    }
+
+    private fun sanitizeLyricsCleaningConfig(cfg: LyricsCleaningConfig): LyricsCleaningConfig {
+        val defaults = LyricsCleaningConfig()
+        val brackets = cfg.stripBracketsRegex
+            .takeIf { it.isNotBlank() && it.length <= 1024 && !InputAndUrlSecurity.hasControlChars(it) && runCatching { Regex(it) }.isSuccess }
+            ?: defaults.stripBracketsRegex
+        val keywords = cfg.stripKeywordsRegex
+            .takeIf { it.isNotBlank() && it.length <= 1024 && !InputAndUrlSecurity.hasControlChars(it) && runCatching { Regex(it) }.isSuccess }
+            ?: defaults.stripKeywordsRegex
+        val delimiters = cfg.titleDelimiters
+            .filter { it.isNotEmpty() && it.length <= 16 && !InputAndUrlSecurity.hasControlChars(it) }
+            .distinct()
+            .ifEmpty { defaults.titleDelimiters }
+        return LyricsCleaningConfig(
+            stripBracketsRegex = brackets,
+            stripKeywordsRegex = keywords,
+            titleDelimiters = delimiters
         )
     }
 
@@ -852,13 +1172,15 @@ object RemoteConfigValidator {
         return cfg.copy(
             id = id,
             displayName = InputAndUrlSecurity.sanitizeSingleLineText(cfg.displayName, 48).ifBlank { id.uppercase() },
+            category = cfg.category.trim().lowercase().ifBlank { "music" },
             adapterType = cfg.adapterType.trim().lowercase().ifBlank { "generic_rest" },
             priority = cfg.priority.coerceIn(0, 10_000),
             endpoints = sanitizedEndpoints,
             timeoutMs = cfg.timeoutMs.coerceIn(1_500L, 30_000L),
             maxRetries = cfg.maxRetries.coerceIn(0, 3),
-            cooldownMs = cfg.cooldownMs.coerceIn(5_000L, 3_600_000L),
+            cooldownMs = cfg.cooldownMs.coerceIn(1_000L, 3_600_000L),
             headers = InputAndUrlSecurity.sanitizeRemoteHeaderMap(cfg.headers),
+            params = InputAndUrlSecurity.sanitizeParamMap(cfg.params),
             routes = sanitizedRoutes,
             categories = cleanCategories
         )
@@ -1020,5 +1342,15 @@ object RemoteConfigValidator {
     private fun defaultCapabilitiesForAdapter(adapterType: String): List<String> = when (adapterType) {
         "newpipe" -> listOf("search", "suggestions", "trending", "artist", "album", "stream")
         else -> listOf("search", "suggestions", "trending", "artist", "album", "stream")
+    }
+
+    private val JSON_NUMBER_REGEX = Regex("^-?(?:0|[1-9]\\d*)(?:\\.\\d+)?(?:[eE][+-]?\\d+)?$")
+
+    private fun isStrictJsonPrimitiveLiteral(trimmed: String): Boolean {
+        return trimmed == "null" ||
+            trimmed == "true" ||
+            trimmed == "false" ||
+            (trimmed.length >= 2 && trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+            JSON_NUMBER_REGEX.matches(trimmed)
     }
 }

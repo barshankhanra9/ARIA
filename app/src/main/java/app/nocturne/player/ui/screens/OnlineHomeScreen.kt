@@ -40,6 +40,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.nocturne.player.data.model.ArtworkShape
+import app.nocturne.player.data.model.OnlineAlbumSummary
 import app.nocturne.player.data.model.OnlineArtistSummary
 import app.nocturne.player.data.model.OnlineDiscoveryCategory
 import app.nocturne.player.data.model.OnlineLibrarySection
@@ -86,7 +87,8 @@ fun OnlineHomeScreen(
     onOpenQueue: () -> Unit,
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
     onOpenLibrarySection: (OnlineLibrarySection) -> Unit,
-    onOpenPlaylist: (OnlinePlaylist) -> Unit
+    onOpenPlaylist: (OnlinePlaylist) -> Unit,
+    onOpenCuratedPlaylist: (OnlineAlbumSummary) -> Unit = {}
 ) {
     val palette = AriaPaperTheme.palette
     val greeting = remember {
@@ -401,7 +403,10 @@ fun OnlineHomeScreen(
                         )
                     }
                     trendingState.tracks.isNotEmpty() -> {
-                        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                            modifier = Modifier.testTag("online_trending_carousel")
+                        ) {
                             items(trendingState.tracks.take(15), key = { it.id }) { track ->
                                 OnlineTrackShelfCard(
                                     track = track,
@@ -411,6 +416,47 @@ fun OnlineHomeScreen(
                                     }
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // New Releases Carousel
+        if (trendingState.newReleases.isNotEmpty()) {
+            item(key = "online_new_releases") {
+                OnlineTrackShelfSection(
+                    eyebrow = "FRESH EDITIONS",
+                    title = "New Releases",
+                    tracks = trendingState.newReleases.take(15),
+                    onSeeAll = null,
+                    onPlayAt = { idx -> onPlayTracks(trendingState.newReleases, idx, false) },
+                    rowModifier = Modifier.testTag("online_new_releases_carousel")
+                )
+            }
+        }
+
+        // Curated Playlists Carousel
+        if (trendingState.curatedPlaylists.isNotEmpty()) {
+            item(key = "online_curated_playlists") {
+                Column {
+                    EditorialSectionHeader(
+                        eyebrow = "EDITORIAL PICKS",
+                        title = "Curated Playlists"
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier.testTag("online_curated_playlists_carousel")
+                    ) {
+                        items(
+                            trendingState.curatedPlaylists.take(15),
+                            key = { "${it.providerType.name}:${it.id}" }
+                        ) { playlist ->
+                            OnlineCuratedPlaylistCard(
+                                playlist = playlist,
+                                onClick = { onOpenCuratedPlaylist(playlist) }
+                            )
                         }
                     }
                 }
@@ -569,7 +615,7 @@ private fun OnlineContinueCard(
                 customCoverUri = track.thumbnailUrl,
                 modifier = Modifier.size(84.dp),
                 mattePadding = 4.dp,
-                targetSizePx = 256
+                targetSizePx = 500
             )
             Spacer(Modifier.width(12.dp))
             Box(
@@ -710,7 +756,8 @@ private fun OnlineTrackShelfSection(
     title: String,
     tracks: List<OnlineTrack>,
     onSeeAll: (() -> Unit)?,
-    onPlayAt: (Int) -> Unit
+    onPlayAt: (Int) -> Unit,
+    rowModifier: Modifier = Modifier
 ) {
     val palette = AriaPaperTheme.palette
     Column {
@@ -722,11 +769,74 @@ private fun OnlineTrackShelfSection(
             } else null
         )
         Spacer(Modifier.height(10.dp))
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = rowModifier
+        ) {
             items(tracks.size) { idx ->
                 OnlineTrackShelfCard(
                     track = tracks[idx],
                     onClick = { onPlayAt(idx) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OnlineCuratedPlaylistCard(
+    playlist: OnlineAlbumSummary,
+    onClick: () -> Unit
+) {
+    val palette = AriaPaperTheme.palette
+    PaperCard(
+        modifier = Modifier
+            .width(148.dp)
+            .testTag("online_curated_playlist_${playlist.id}"),
+        containerColor = palette.paperElevated,
+        elevation = 3.dp,
+        onClick = onClick,
+        contentPadding = PaddingValues(8.dp)
+    ) {
+        PrintedArtwork(
+            trackUri = playlist.thumbnailUrl,
+            customCoverUri = playlist.thumbnailUrl,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f),
+            mattePadding = 3.dp,
+            targetSizePx = 500,
+            contentDescription = "${playlist.title} playlist artwork"
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = playlist.title,
+            style = MaterialTheme.typography.titleSmall,
+            color = palette.inkPrimary,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = playlist.artist.ifBlank { playlist.providerType.displayName },
+            style = MaterialTheme.typography.bodySmall,
+            color = palette.inkSecondary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Spacer(Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            InkStampTag(text = "PLAYLIST", accented = true)
+            if (playlist.trackCount > 0) {
+                Text(
+                    text = "${playlist.trackCount} tracks",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.inkTertiary,
+                    maxLines = 1
                 )
             }
         }
@@ -753,7 +863,7 @@ private fun OnlineTrackShelfCard(
                 .fillMaxWidth()
                 .aspectRatio(1f),
             mattePadding = 3.dp,
-            targetSizePx = 280
+            targetSizePx = 500
         )
         Spacer(Modifier.height(8.dp))
         Text(track.title, style = MaterialTheme.typography.titleSmall, color = palette.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)

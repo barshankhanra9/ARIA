@@ -132,7 +132,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsRepo = SettingsRepository(app)
     private val scanner = MediaLibraryScanner(app)
     private val remoteConfigRepo = OnlineDependencies.getRemoteConfigRepository(app)
-    private val lyricsRepository = LyricsRepository(app, db, remoteConfigRepo)
+    private val lyricsRepository = LyricsRepository(
+        context = app,
+        db = db,
+        remoteConfigRepository = remoteConfigRepo,
+        healthTracker = OnlineDependencies.getHealthTracker()
+    )
 
     val settings: StateFlow<UserSettings> = settingsRepo.settingsFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, UserSettings())
@@ -326,6 +331,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             PlaybackRuntimeBus.offlineSnapshot.collect { snap ->
                 if (snap.mediaItems.isNotEmpty() || _playback.value.queueTracks.isNotEmpty()) {
                     syncOfflinePlaybackFromSnapshot(snap)
+                }
+            }
+        }
+        viewModelScope.launch {
+            PlaybackRuntimeBus.preloadedLyrics.collect { entry ->
+                val curTrack = displayedPlayback.value.playbackUi.currentTrack
+                if (entry != null && curTrack != null && entry.trackUri == curTrack.uriString && entry.lyrics.hasContent) {
+                    _currentLyrics.value = entry.lyrics
                 }
             }
         }
@@ -1150,6 +1163,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     // Lyrics
     fun loadLyricsFor(track: Track, forceRemoteRefresh: Boolean = false) {
         lyricsJob?.cancel()
+        if (!forceRemoteRefresh) {
+            val preloaded = PlaybackRuntimeBus.preloadedLyrics.value
+            if (preloaded != null && preloaded.trackUri == track.uriString && preloaded.lyrics.hasContent) {
+                _currentLyrics.value = preloaded.lyrics
+                return
+            }
+        }
         _currentLyrics.value = LyricsData(isLoading = true)
         lyricsJob = viewModelScope.launch {
             val curSettings = settingsRepo.getSettingsOnce()

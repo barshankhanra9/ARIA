@@ -2,6 +2,10 @@ package app.nocturne.player.ui.screens
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -90,6 +94,7 @@ import app.nocturne.player.ui.components.TactilePaperButton
 import app.nocturne.player.ui.components.formatDuration
 import app.nocturne.player.ui.components.paperGrainBackground
 import app.nocturne.player.ui.theme.AriaPaperTheme
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -484,6 +489,19 @@ fun PaperLyricsViewport(
         else lyrics.syncedLines.indexOfLast { it.timeMs <= adjustedPos }.coerceAtLeast(0)
     }
 
+    LaunchedEffect(listState.isScrollInProgress) {
+        if (listState.isScrollInProgress) {
+            manualScrolling = true
+        }
+    }
+
+    LaunchedEffect(manualScrolling, listState.isScrollInProgress) {
+        if (manualScrolling && !listState.isScrollInProgress) {
+            delay(3_500L)
+            manualScrolling = false
+        }
+    }
+
     LaunchedEffect(activeIdx, manualScrolling, lyrics.syncedLines) {
         if (!manualScrolling && activeIdx >= 0 && lyrics.isSynced) {
             val contextOffset = if (compact) 1 else 2
@@ -514,7 +532,7 @@ fun PaperLyricsViewport(
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = "Checking local tags, cache, and LRCLIB",
+                        text = "Checking local tags, cache, LiriQo, Musixmatch, JioSaavn, and LRCLIB",
                         style = MaterialTheme.typography.bodySmall,
                         color = palette.inkSecondary,
                         textAlign = TextAlign.Center
@@ -554,7 +572,7 @@ fun PaperLyricsViewport(
                             textAlign = TextAlign.Center
                         )
                         Text(
-                            text = "No local .lrc, embedded tags, or LRCLIB match was found for this track.",
+                            text = "No local .lrc, embedded tags, or online lyrics match was found for this track.",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.inkSecondary,
                             textAlign = TextAlign.Center
@@ -608,11 +626,14 @@ fun PaperLyricsViewport(
                     }
                 }
 
-                if (listState.isScrollInProgress) {
-                    manualScrolling = true
-                }
-
-                if (manualScrolling) {
+                AnimatedVisibility(
+                    visible = manualScrolling,
+                    enter = fadeIn(tween(180)),
+                    exit = fadeOut(tween(180)),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 10.dp)
+                ) {
                     TactilePaperButton(
                         text = "Sync",
                         icon = Icons.Rounded.Sync,
@@ -623,10 +644,7 @@ fun PaperLyricsViewport(
                                 scope.launch { listState.animateScrollToItem((activeIdx - contextOffset).coerceAtLeast(0)) }
                             }
                         },
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(bottom = 10.dp)
-                            .testTag("lyrics_sync_btn")
+                        modifier = Modifier.testTag("lyrics_sync_btn")
                     )
                 }
             }
@@ -664,6 +682,12 @@ fun WordSyncedLyricLine(
     onClick: () -> Unit
 ) {
     val palette = AriaPaperTheme.palette
+    val motion = AriaPaperTheme.motion
+    val animatedFontSize by animateFloatAsState(
+        targetValue = if (isActive) (fontSizeSp * 1.16f).coerceAtMost(32f) else fontSizeSp,
+        animationSpec = tween(durationMillis = if (motion.isReduced) 0 else 220),
+        label = "lyric_line_size"
+    )
     val annotated: AnnotatedString = remember(
         line,
         isActive,
@@ -676,7 +700,7 @@ fun WordSyncedLyricLine(
             buildAnnotatedString {
                 withStyle(
                     SpanStyle(
-                        color = palette.inkSecondary.copy(alpha = 0.65f),
+                        color = palette.inkSecondary.copy(alpha = 0.45f),
                         fontWeight = FontWeight.Normal
                     )
                 ) {
@@ -762,8 +786,8 @@ fun WordSyncedLyricLine(
     val containerBg = if (isActive) palette.paperCream.copy(alpha = 0.72f) else androidx.compose.ui.graphics.Color.Transparent
     Text(
         text = annotated,
-        fontSize = fontSizeSp.sp,
-        lineHeight = (fontSizeSp * 1.38f).sp,
+        fontSize = animatedFontSize.sp,
+        lineHeight = (animatedFontSize * 1.38f).sp,
         textAlign = textAlign,
         modifier = Modifier
             .fillMaxWidth()

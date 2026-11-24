@@ -136,6 +136,7 @@ class PipedProvider(
         val rawStreams = obj["audioStreams"]?.jsonArray.orEmpty()
         val streams = rawStreams.mapNotNull { el ->
             val st = el.jsonObject
+            if (st.bool("videoOnly") == true) return@mapNotNull null
             val rawUrl = st.str("url")
             val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
             val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
@@ -145,28 +146,35 @@ class PipedProvider(
             val mime = st.str("mimeType").orEmpty().ifBlank { "audio/mp4" }
             val codec = st.str("codec").orEmpty().ifBlank { st.str("format").orEmpty() }
             val fmt = st.str("format").orEmpty().ifBlank { "AUDIO" }
+            val cleanLabel = if (codec.contains("opus", ignoreCase = true) || mime.contains("webm", ignoreCase = true)) {
+                "Opus ${kbps}k"
+            } else {
+                "${fmt.uppercase()} ${kbps}k"
+            }
             OnlineAudioStream(
                 url = url,
                 bitrateKbps = kbps.coerceAtLeast(32),
                 mimeType = mime,
                 codec = codec,
-                formatLabel = "${fmt.uppercase()} ${kbps}k",
+                formatLabel = cleanLabel,
                 expiresAtMs = StreamQualitySelector.parseExpiryFromUrl(url)
             )
         }
 
         val allowedOrigin = resp.endpointUrl.takeIf { baseUrlsOverride != null }
+        val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
         val selected = StreamQualitySelector.selectBestAudioStream(
             streams = streams,
-            speedTier = speedTier,
-            allowedLoopbackOrigin = allowedOrigin
+            speedTier = effectiveTier,
+            allowedLoopbackOrigin = allowedOrigin,
+            preferWebmOpus = true
         ) ?: throw IllegalStateException("No playable audio streams returned by $displayName")
 
         val title = obj.str("title") ?: track.title
         val uploader = obj.str("uploader") ?: track.artist
         val uploaderUrl = obj.str("uploaderUrl")?.let { normalizeYoutubeUrl(it) } ?: track.artistUrl
         val durationSec = obj.long("duration") ?: 0L
-        val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl")) ?: track.thumbnailUrl
+        val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl"), allowedOrigin) ?: track.thumbnailUrl
         val related = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
             parseStreamItem(it.jsonObject)
         }
@@ -274,7 +282,8 @@ class PipedProvider(
             headers = cfg?.headers ?: emptyMap(),
             timeoutMs = cfg?.timeoutMs ?: 10_000L,
             maxRetries = cfg?.maxRetries ?: 1,
-            cooldownMs = cfg?.cooldownMs ?: 60_000L
+            cooldownMs = cfg?.cooldownMs ?: 60_000L,
+            endpointFailover = cfg?.endpointFailover ?: true
         )
         lastWorkingInstance = resp.endpointUrl
         return resp

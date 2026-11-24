@@ -1,9 +1,12 @@
 package app.nocturne.player.data.online
 
 import android.content.Context
+import app.nocturne.player.data.audio.MetadataCleaner
 import app.nocturne.player.data.model.DynamicProviderConfig
+import app.nocturne.player.data.model.LyricsCleaningConfig
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
+import app.nocturne.player.data.model.OnlineAlbumSummary
 import app.nocturne.player.data.model.OnlineArtistPage
 import app.nocturne.player.data.model.OnlineArtistSummary
 import app.nocturne.player.data.model.OnlineProviderType
@@ -19,11 +22,19 @@ import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.prefs.SettingsRepository
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import java.io.IOException
 import java.util.ArrayDeque
-import kotlin.math.abs
+
+data class HomeDiscoverySections(
+    val trendingCharts: List<OnlineTrack> = emptyList(),
+    val newReleases: List<OnlineTrack> = emptyList(),
+    val curatedPlaylists: List<OnlineAlbumSummary> = emptyList(),
+    val providerType: OnlineProviderType? = null
+)
 
 class OnlineProviderManager(
     private val providers: Map<OnlineProviderType, OnlineMusicProvider>? = null,
@@ -68,6 +79,12 @@ class OnlineProviderManager(
         baseClient = httpClient,
         healthTracker = healthTracker,
         allowLoopbackForTests = allowLoopbackForTests
+    )
+
+    private val playbackResolver = PlaybackResolver(
+        healthTracker = healthTracker,
+        validateUrl = ::validateResolvedStreamUrl,
+        cleaningConfigProvider = { remoteConfigRepository?.lyricsCleaningConfig() ?: LyricsCleaningConfig() }
     )
 
     private val registryLock = Any()
@@ -429,6 +446,40 @@ class OnlineProviderManager(
             emptyList<OnlineArtistSummary>() to null
         }
 
+    suspend fun fetchHomeDiscoverySections(): HomeDiscoverySections = withContext(Dispatchers.IO) {
+        val adapters = ensureDynamicRegistryReady()
+        val jioAdapter = adapters.values.filterIsInstance<JioSaavnProvider>().firstOrNull()
+        coroutineScope {
+            val trendingDeferred = async { runCatching { trending() }.getOrNull() }
+            val newReleasesDeferred = async {
+                runCatching {
+                    if (jioAdapter != null) {
+                        deduplicateTracks(jioAdapter.fetchNewReleases())
+                    } else {
+                        fetchDiscoveryFeed("latest new songs").first
+                    }
+                }.getOrDefault(emptyList())
+            }
+            val playlistsDeferred = async {
+                runCatching {
+                    if (jioAdapter != null) {
+                        jioAdapter.fetchCuratedPlaylists().distinctBy { it.id }
+                    } else {
+                        val albumsAdapter = adapters["jiosaavn"] ?: adapters.values.firstOrNull { it.supportsCapability("album") }
+                        albumsAdapter?.search("top charts", OnlineSearchFilter.ALBUMS, null)?.albums.orEmpty()
+                    }
+                }.getOrDefault(emptyList())
+            }
+            val trendingRes = trendingDeferred.await()
+            HomeDiscoverySections(
+                trendingCharts = trendingRes?.first.orEmpty(),
+                newReleases = newReleasesDeferred.await(),
+                curatedPlaylists = playlistsDeferred.await(),
+                providerType = trendingRes?.second ?: jioAdapter?.providerType
+            )
+        }
+    }
+
     suspend fun resolveStream(
         track: OnlineTrack,
         forceRefresh: Boolean = false
@@ -456,108 +507,14 @@ class OnlineProviderManager(
 
         val adapters = ensureDynamicRegistryReady()
         val speedTier = currentSpeedTier()
-        val nativeIds = selectNativePlaybackCandidates(track, adapters)
-            .filter { it !in allExcludedIds }
-
-        var lastError: Throwable? = null
-        val triedIds = allExcludedIds.toMutableSet()
-
-        for (pid in nativeIds) {
-            val adapter = adapters[pid] ?: continue
-            triedIds.add(pid)
-            val start = System.currentTimeMillis()
-            try {
-                val resolved = adapter.resolveStream(track, speedTier)
-                validateResolvedStreamUrl(resolved.selectedStream.url)
-                healthTracker.recordProviderSuccess(
-                    providerId = pid,
-                    latencyMs = System.currentTimeMillis() - start,
-                    instanceUrl = adapter.activeEndpointFor(OperationType.PLAYBACK),
-                    operation = OperationType.PLAYBACK
-                )
-                val normalized = resolved.copy(
-                    resolvedByProviderId = resolved.resolvedByProviderId.ifBlank { pid },
-                    resolvedByLabel = resolved.resolvedByLabel.ifBlank { adapter.displayName }
-                )
-                streamCache.put(track.id, normalized)
-                return@withContext normalized
-            } catch (t: Throwable) {
-                lastError = t
-                healthTracker.recordProviderFailure(pid, t.message)
-            }
-        }
-
-        val fallbackResolution = resolveCrossProviderMatch(
+        val resolved = playbackResolver.resolve(
             track = track,
             adapters = adapters,
-            alreadyTriedIds = triedIds,
-            speedTier = speedTier
+            speedTier = speedTier,
+            excludedIds = allExcludedIds
         )
-        if (fallbackResolution != null) {
-            streamCache.put(track.id, fallbackResolution)
-            return@withContext fallbackResolution
-        }
-
-        throw lastError ?: IllegalStateException("Unable to resolve stream for ${track.title}")
-    }
-
-    private suspend fun resolveCrossProviderMatch(
-        track: OnlineTrack,
-        adapters: Map<String, OnlineMusicProvider>,
-        alreadyTriedIds: Set<String>,
-        speedTier: NetworkSpeedTier
-    ): OnlineStreamResolution? {
-        val cleanTitle = cleanMetadataQuery(track.title)
-        if (cleanTitle.isBlank() || cleanTitle.equals("Online Track", ignoreCase = true)) {
-            return null
-        }
-        val cleanArtist = cleanMetadataQuery(track.artist)
-            .takeUnless { it.equals(track.providerLabel, ignoreCase = true) || it.equals("YouTube", ignoreCase = true) }
-            .orEmpty()
-        val searchQuery = listOf(cleanTitle, cleanArtist).filter { it.isNotBlank() }.joinToString(" ").trim()
-        if (searchQuery.isBlank()) return null
-
-        val fallbackIds = adapters.keys
-            .filter { it !in alreadyTriedIds }
-            .filter { pid ->
-                val adapter = adapters[pid] ?: return@filter false
-                adapter.supportsCapability("search") && adapter.supportsCapability("stream")
-            }
-
-        if (fallbackIds.isEmpty()) return null
-        val orderedFallbacks = healthTracker.selectOrderedProviderIds(fallbackIds)
-
-        for (pid in orderedFallbacks) {
-            val adapter = adapters[pid] ?: continue
-            val start = System.currentTimeMillis()
-            try {
-                val page = adapter.search(searchQuery, OnlineSearchFilter.SONGS, null)
-                val bestCandidate = pickBestMetadataMatch(track, page.tracks)
-                if (bestCandidate != null) {
-                    val resolved = adapter.resolveStream(bestCandidate, speedTier)
-                    validateResolvedStreamUrl(resolved.selectedStream.url)
-                    healthTracker.recordProviderSuccess(
-                        providerId = pid,
-                        latencyMs = System.currentTimeMillis() - start,
-                        instanceUrl = adapter.activeEndpointFor(OperationType.PLAYBACK),
-                        operation = OperationType.PLAYBACK
-                    )
-                    return resolved.copy(
-                        track = track.copy(
-                            title = track.title.ifBlank { resolved.track.title },
-                            artist = track.artist.ifBlank { resolved.track.artist },
-                            thumbnailUrl = track.thumbnailUrl ?: resolved.track.thumbnailUrl,
-                            durationMs = if (track.durationMs > 0L) track.durationMs else resolved.track.durationMs
-                        ),
-                        resolvedByProviderId = resolved.resolvedByProviderId.ifBlank { pid },
-                        resolvedByLabel = resolved.resolvedByLabel.ifBlank { adapter.displayName }
-                    )
-                }
-            } catch (t: Throwable) {
-                healthTracker.recordProviderFailure(pid, t.message)
-            }
-        }
-        return null
+        streamCache.put(track.id, resolved)
+        resolved
     }
 
     private fun validateResolvedStreamUrl(url: String) {
@@ -725,6 +682,14 @@ class OnlineProviderManager(
         }
 
         val matchingFilter = when (filter) {
+            OnlineSearchFilter.SONGS -> {
+                val jioKeys = adapters.filter { it.key == "jiosaavn" || it.value.providerType == OnlineProviderType.JIOSAAVN }.keys.toList()
+                // Decouple Songs search to JioSaavn only when available so official metadata & 500x500 art are shown without duplicate YouTube videos
+                jioKeys
+            }
+            OnlineSearchFilter.VIDEOS_REMIXES -> {
+                listOf("piped", "invidious", "youtube").filter { adapters.containsKey(it) }
+            }
             OnlineSearchFilter.JIOSAAVN -> adapters.filter { it.key == "jiosaavn" || it.value.providerType == OnlineProviderType.JIOSAAVN }.keys.toList()
             OnlineSearchFilter.AUDIUS -> adapters.filter { it.key == "audius" || it.value.providerType == OnlineProviderType.AUDIUS }.keys.toList()
             OnlineSearchFilter.SOUNDCLOUD -> adapters.filter { it.key == "soundcloud" || it.value.providerType == OnlineProviderType.SOUNDCLOUD }.keys.toList()
@@ -733,6 +698,9 @@ class OnlineProviderManager(
         }
         if (matchingFilter.isNotEmpty()) {
             return healthTracker.selectOrderedProviderIds(matchingFilter)
+        }
+        if (filter == OnlineSearchFilter.VIDEOS_REMIXES) {
+            return emptyList()
         }
 
         val capability = when (filter) {
@@ -815,41 +783,6 @@ class OnlineProviderManager(
             adapters.filterValues { it.providerType == hintProvider }.keys.toList()
         }
         return healthTracker.selectOrderedProviderIds(candidates)
-    }
-
-    private fun pickBestMetadataMatch(target: OnlineTrack, candidates: List<OnlineTrack>): OnlineTrack? {
-        if (candidates.isEmpty()) return null
-        val targetTitleTokens = tokenizeNormalized(cleanMetadataQuery(target.title))
-        val targetArtistTokens = tokenizeNormalized(cleanMetadataQuery(target.artist))
-        if (targetTitleTokens.isEmpty()) return candidates.firstOrNull()
-
-        val scored = candidates.mapNotNull { candidate ->
-            val candTitleTokens = tokenizeNormalized(cleanMetadataQuery(candidate.title))
-            if (candTitleTokens.isEmpty()) return@mapNotNull null
-            val titleOverlap = targetTitleTokens.count { it in candTitleTokens }.toFloat() / targetTitleTokens.size.toFloat()
-            if (titleOverlap < 0.4f) return@mapNotNull null
-
-            val candArtistTokens = tokenizeNormalized(cleanMetadataQuery(candidate.artist))
-            val artistOverlap = if (targetArtistTokens.isNotEmpty() && candArtistTokens.isNotEmpty()) {
-                targetArtistTokens.count { it in candArtistTokens || it in candTitleTokens }.toFloat() /
-                    targetArtistTokens.size.toFloat()
-            } else 0.5f
-
-            val durationBonus = if (target.durationMs > 0L && candidate.durationMs > 0L) {
-                val diffMs = abs(target.durationMs - candidate.durationMs)
-                when {
-                    diffMs <= 5_000L -> 0.4f
-                    diffMs <= 15_000L -> 0.2f
-                    diffMs > 45_000L -> -0.35f
-                    else -> 0f
-                }
-            } else 0f
-
-            val score = titleOverlap * 2.0f + artistOverlap * 1.2f + durationBonus
-            candidate to score
-        }
-
-        return scored.maxByOrNull { it.second }?.takeIf { it.second >= 1.1f }?.first
     }
 
     companion object {

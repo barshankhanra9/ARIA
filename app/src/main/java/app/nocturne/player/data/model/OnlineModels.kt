@@ -25,8 +25,9 @@ enum class OnlineProviderType(val displayName: String, val badge: String) {
 
 @Serializable
 enum class OnlineSearchFilter(val label: String) {
-    ALL("All"),
     SONGS("Songs"),
+    VIDEOS_REMIXES("Videos / Remixes"),
+    ALL("All"),
     ARTISTS("Artists"),
     ALBUMS("Albums & Playlists"),
     JIOSAAVN("JioSaavn"),
@@ -94,8 +95,21 @@ data class OnlineTrack(
     val playCount: Int = 0,
     val lastPlayedAt: Long = 0L,
     val totalListenMs: Long = 0L,
-    val providerId: String = providerType.name.lowercase()
+    val providerId: String = providerType.name.lowercase(),
+    val saavnEncryptedUrl: String? = null
 ) {
+    fun toUnifiedTrack(): UnifiedTrack = UnifiedTrack(
+        id = id,
+        title = title,
+        artist = artist,
+        album = album,
+        artworkUrl = thumbnailUrl,
+        durationMs = durationMs,
+        primarySource = providerType,
+        sourceId = sourceId,
+        saavnEncryptedUrl = saavnEncryptedUrl
+    )
+
     fun effectiveProviderId(): String =
         providerId.ifBlank { providerType.name.lowercase() }
 
@@ -188,6 +202,42 @@ data class OnlineTrack(
             }
         }
     }
+}
+
+@Serializable
+data class UnifiedTrack(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val album: String = "Online Stream",
+    val artworkUrl: String? = null,
+    val durationMs: Long = 0L,
+    val primarySource: OnlineProviderType,
+    val sourceId: String,
+    val saavnEncryptedUrl: String? = null
+) {
+    fun toOnlineTrack(
+        sourceUrl: String = when (primarySource) {
+            OnlineProviderType.JIOSAAVN -> "https://www.jiosaavn.com/song/$sourceId"
+            OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS ->
+                "https://www.youtube.com/watch?v=$sourceId"
+            else -> ""
+        },
+        providerId: String = primarySource.defaultProviderId()
+    ): OnlineTrack = OnlineTrack(
+        id = id,
+        sourceId = sourceId,
+        providerType = primarySource,
+        providerLabel = primarySource.displayName,
+        sourceUrl = sourceUrl,
+        title = title,
+        artist = artist,
+        album = album,
+        durationMs = durationMs,
+        thumbnailUrl = artworkUrl,
+        providerId = providerId,
+        saavnEncryptedUrl = saavnEncryptedUrl
+    )
 }
 
 data class OnlineAudioStream(

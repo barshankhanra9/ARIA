@@ -257,8 +257,8 @@ fun OnlineSearchScreen(
                                     Icon(Icons.Rounded.History, null, tint = palette.accent, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(10.dp))
                                     Text(q, style = MaterialTheme.typography.bodyMedium, color = palette.inkPrimary, modifier = Modifier.weight(1f))
-                                    IconButton(onClick = { onDeleteRecentSearch(q) }, modifier = Modifier.size(32.dp)) {
-                                        Icon(Icons.Rounded.Close, "Remove search", tint = palette.inkTertiary, modifier = Modifier.size(16.dp))
+                                    IconButton(onClick = { onDeleteRecentSearch(q) }, modifier = Modifier.size(48.dp)) {
+                                        Icon(Icons.Rounded.Close, "Remove search", tint = palette.inkTertiary, modifier = Modifier.size(18.dp))
                                     }
                                 }
                             }
