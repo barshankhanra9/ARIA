@@ -14,8 +14,8 @@ jobs:
             -keysize 2048 \
             -validity 10000 \
             -alias my-key-alias \
-            -storepass YOUR_PASSWORD_HERE \
-            -keypass YOUR_PASSWORD_HERE \
+            -storepass Barshan@2007 \
+            -keypass Barshan@2007 \
             -dname "CN=Developer, OU=App, O=Personal, L=City, ST=State, C=IN"
           
           base64 -w 0 release-key.jks > key-base64.txt
