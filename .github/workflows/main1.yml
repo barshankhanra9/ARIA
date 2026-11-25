@@ -1,0 +1,30 @@
+name: Generate Base64 Keystore
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Android Keystore and Base64
+        run: |
+          keytool -genkeypair -v \
+            -keystore release-key.jks \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -alias my-key-alias \
+            -storepass YOUR_PASSWORD_HERE \
+            -keypass YOUR_PASSWORD_HERE \
+            -dname "CN=Developer, OU=App, O=Personal, L=City, ST=State, C=IN"
+          
+          base64 -w 0 release-key.jks > key-base64.txt
+
+      - name: Upload Key Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-signing-key
+          path: |
+            release-key.jks
+            key-base64.txt
+            
