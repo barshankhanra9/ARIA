@@ -287,6 +287,23 @@ class PipedProvider(
         )
     }
 
+    override suspend fun fetchRelatedTracks(track: OnlineTrack, limit: Int): List<OnlineTrack> =
+        withContext(Dispatchers.IO) {
+            val isPipedFamily = track.providerType in setOf(
+                OnlineProviderType.PIPED,
+                OnlineProviderType.YOUTUBE,
+                OnlineProviderType.INVIDIOUS
+            ) || track.effectiveProviderId().equals(providerId, ignoreCase = true)
+            if (!isPipedFamily) return@withContext emptyList()
+            val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
+                ?: return@withContext emptyList()
+            val resp = executeRawWithFallback(OperationType.METADATA, "/streams/${Uri.encode(videoId)}")
+            val obj = json.parseToJsonElement(resp.body).jsonObject
+            obj["relatedStreams"]?.jsonArray.orEmpty()
+                .mapNotNull { parseStreamItem(it.jsonObject) }
+                .take(limit.coerceIn(1, 30))
+        }
+
     private fun getEndpointConfigs(operation: OperationType): List<ProviderEndpointConfig> {
         val baseList = when {
             baseUrlsOverride != null -> baseUrlsOverride.mapIndexedNotNull { idx, raw ->

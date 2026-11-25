@@ -49,6 +49,7 @@ import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.PlaybackMode
 import app.nocturne.player.playback.OnlineEngineSnapshot
+import app.nocturne.player.ui.OnlineRecommendationsUiState
 import app.nocturne.player.ui.OnlineTrendingUiState
 import app.nocturne.player.ui.components.AnimatedInkEqualizer
 import app.nocturne.player.ui.components.EditorialSectionHeader
@@ -73,6 +74,9 @@ import java.util.Locale
 fun OnlineHomeScreen(
     onlineSnapshot: OnlineEngineSnapshot,
     trendingState: OnlineTrendingUiState,
+    recommendationsState: OnlineRecommendationsUiState = OnlineRecommendationsUiState(),
+    onRepeatTracks: List<OnlineTrack> = emptyList(),
+    jumpBackInTracks: List<OnlineTrack> = emptyList(),
     recentlyPlayed: List<OnlineTrack>,
     mostPlayed: List<OnlineTrack>,
     favorites: List<OnlineTrack>,
@@ -101,17 +105,26 @@ fun OnlineHomeScreen(
         }
     }
 
+    val effectiveTrendingTracks = if (trendingState.tracks.isNotEmpty()) {
+        trendingState.tracks
+    } else {
+        recommendationsState.trendingFallback
+    }
+
     val heroTrack = if (trendingState.selectedCategory != OnlineDiscoveryCategory.TRENDING) {
-        trendingState.tracks.firstOrNull()
+        effectiveTrendingTracks.firstOrNull()
             ?: onlineSnapshot.currentTrack
+            ?: jumpBackInTracks.firstOrNull()
             ?: recentlyPlayed.firstOrNull()
     } else {
         onlineSnapshot.currentTrack
-            ?: trendingState.tracks.firstOrNull()
+            ?: recommendationsState.dailyMix.firstOrNull()
+            ?: effectiveTrendingTracks.firstOrNull()
+            ?: jumpBackInTracks.firstOrNull()
             ?: recentlyPlayed.firstOrNull()
     }
     val activeFeedLabel = heroTrack?.providerLabel?.takeIf { it.isNotBlank() }
-        ?: trendingState.tracks.firstOrNull()?.providerLabel?.takeIf { it.isNotBlank() }
+        ?: effectiveTrendingTracks.firstOrNull()?.providerLabel?.takeIf { it.isNotBlank() }
         ?: trendingState.providerUsedLabel
         ?: trendingState.providerUsed?.displayName
 
@@ -362,10 +375,90 @@ fun OnlineHomeScreen(
             }
         }
 
-        // Trending & Selected Category Single-Track Shelf
+        // Personalized Recommendation Shelves (Daily Mix, Because You Listen To, On Repeat, Jump Back In)
+        if (recommendationsState.dailyMix.isNotEmpty()) {
+            item(key = "online_daily_mix") {
+                Column(modifier = Modifier.testTag("online_daily_mix_section")) {
+                    OnlineTrackShelfSection(
+                        eyebrow = "DAILY EDITION · 80/20 MIX",
+                        title = recommendationsState.dailyMixTitle,
+                        tracks = recommendationsState.dailyMix.take(15),
+                        onSeeAll = null,
+                        onPlayAt = { idx -> onPlayTracks(recommendationsState.dailyMix, idx, false) },
+                        rowModifier = Modifier.testTag("online_daily_mix_carousel")
+                    )
+                    if (recommendationsState.dailyMixSubtitle.isNotBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = recommendationsState.dailyMixSubtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+        } else if (recommendationsState.isLoading && (onRepeatTracks.isNotEmpty() || jumpBackInTracks.isNotEmpty())) {
+            item(key = "online_daily_mix_loading") {
+                Column {
+                    EditorialSectionHeader(
+                        eyebrow = "DAILY EDITION · PREPARING MIX",
+                        title = "Made For You (Daily Mix)"
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    PaperSkeletonList(count = 2)
+                }
+            }
+        }
+
+        if (!recommendationsState.becauseYouListenToArtist.isNullOrBlank() &&
+            recommendationsState.becauseYouListenToTracks.isNotEmpty()
+        ) {
+            item(key = "online_because_you_listen") {
+                OnlineTrackShelfSection(
+                    eyebrow = "ARTIST SPOTLIGHT · TASTE MATCH",
+                    title = "Because You Listen To ${recommendationsState.becauseYouListenToArtist}",
+                    tracks = recommendationsState.becauseYouListenToTracks.take(12),
+                    onSeeAll = null,
+                    onPlayAt = { idx ->
+                        onPlayTracks(recommendationsState.becauseYouListenToTracks, idx, false)
+                    },
+                    rowModifier = Modifier.testTag("online_because_artist_carousel")
+                )
+            }
+        }
+
+        if (onRepeatTracks.isNotEmpty()) {
+            item(key = "online_on_repeat") {
+                OnlineTrackShelfSection(
+                    eyebrow = "INSTANT ROOM RECALL · TOP ROTATION",
+                    title = "On Repeat",
+                    tracks = onRepeatTracks.take(12),
+                    onSeeAll = { onOpenLibrarySection(OnlineLibrarySection.MOST_PLAYED) },
+                    onPlayAt = { idx -> onPlayTracks(onRepeatTracks, idx, false) },
+                    rowModifier = Modifier.testTag("online_on_repeat_carousel")
+                )
+            }
+        }
+
+        if (jumpBackInTracks.isNotEmpty()) {
+            item(key = "online_jump_back_in") {
+                OnlineTrackShelfSection(
+                    eyebrow = "INSTANT ROOM RECALL · RECENT",
+                    title = "Jump Back In",
+                    tracks = jumpBackInTracks.take(12),
+                    onSeeAll = { onOpenLibrarySection(OnlineLibrarySection.RECENTLY_PLAYED) },
+                    onPlayAt = { idx -> onPlayTracks(jumpBackInTracks, idx, false) },
+                    rowModifier = Modifier.testTag("online_jump_back_in_carousel")
+                )
+            }
+        }
+
+        // Trending & Selected Category Single-Track Shelf (always shown; primary fallback for brand-new users)
         item(key = "online_trending") {
             val isDefaultTrending = trendingState.selectedCategory == OnlineDiscoveryCategory.TRENDING
-            val shelfLabel = trendingState.tracks.firstOrNull()?.providerLabel?.takeIf { it.isNotBlank() }
+            val shelfLabel = effectiveTrendingTracks.firstOrNull()?.providerLabel?.takeIf { it.isNotBlank() }
                 ?: trendingState.providerUsedLabel
                 ?: trendingState.providerUsed?.displayName
             val shelfEyebrow = buildString {
@@ -390,10 +483,10 @@ fun OnlineHomeScreen(
                 )
                 Spacer(Modifier.height(10.dp))
                 when {
-                    trendingState.isLoading && trendingState.tracks.isEmpty() -> {
+                    (trendingState.isLoading || recommendationsState.isLoading) && effectiveTrendingTracks.isEmpty() -> {
                         PaperSkeletonList(count = 3)
                     }
-                    trendingState.tracks.isEmpty() && !trendingState.errorMessage.isNullOrBlank() -> {
+                    effectiveTrendingTracks.isEmpty() && !trendingState.errorMessage.isNullOrBlank() -> {
                         PaperEmptyState(
                             icon = Icons.Rounded.CloudOff,
                             title = "Could Not Load ${trendingState.selectedCategory.label} Feed",
@@ -402,17 +495,17 @@ fun OnlineHomeScreen(
                             onAction = onRefreshTrending
                         )
                     }
-                    trendingState.tracks.isNotEmpty() -> {
+                    effectiveTrendingTracks.isNotEmpty() -> {
                         LazyRow(
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                             modifier = Modifier.testTag("online_trending_carousel")
                         ) {
-                            items(trendingState.tracks.take(15), key = { it.id }) { track ->
+                            items(effectiveTrendingTracks.take(15), key = { it.id }) { track ->
                                 OnlineTrackShelfCard(
                                     track = track,
                                     onClick = {
-                                        val idx = trendingState.tracks.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-                                        onPlayTracks(trendingState.tracks, idx, false)
+                                        val idx = effectiveTrendingTracks.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
+                                        onPlayTracks(effectiveTrendingTracks, idx, false)
                                     }
                                 )
                             }

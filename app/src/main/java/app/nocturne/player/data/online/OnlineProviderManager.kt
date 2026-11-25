@@ -484,6 +484,199 @@ class OnlineProviderManager(
         }
     }
 
+    suspend fun fetchTrackSuggestions(
+        track: OnlineTrack,
+        limit: Int = 10
+    ): List<OnlineTrack> = withContext(Dispatchers.IO) {
+        val adapters = ensureDynamicRegistryReady()
+        val jioAdapter = adapters.values.firstOrNull {
+            it is JioSaavnProvider || it.providerType == OnlineProviderType.JIOSAAVN
+        }
+        val pipedAdapter = adapters.values.firstOrNull {
+            it is PipedProvider || it.providerType == OnlineProviderType.PIPED
+        }
+
+        val results = mutableListOf<OnlineTrack>()
+
+        // 1. Direct provider match (e.g. JioSaavn /songs/{id}/suggestions or Piped /streams/{id})
+        val directAdapter = adapters[track.effectiveProviderId().lowercase()]
+            ?: adapters.values.firstOrNull { it.providerType == track.providerType }
+        if (directAdapter != null) {
+            runCatching {
+                val start = System.currentTimeMillis()
+                val related = if (directAdapter is JioSaavnProvider) {
+                    directAdapter.fetchSongSuggestions(track.sourceId, limit)
+                } else {
+                    directAdapter.fetchRelatedTracks(track, limit)
+                }
+                healthTracker.recordProviderSuccess(
+                    providerId = directAdapter.providerId,
+                    latencyMs = System.currentTimeMillis() - start,
+                    instanceUrl = directAdapter.activeEndpointFor(OperationType.METADATA),
+                    operation = OperationType.METADATA
+                )
+                related
+            }.onSuccess { list ->
+                results.addAll(list)
+            }.onFailure { err ->
+                healthTracker.recordProviderFailure(directAdapter.providerId, err.message)
+            }
+        }
+
+        // 2. If track wasn't JioSaavn or yielded too few items, cross-query JioSaavn for song + suggestions
+        if (results.size < limit && jioAdapter != null && track.providerType != OnlineProviderType.JIOSAAVN) {
+            val cleanQuery = cleanMetadataQuery("${track.title} ${track.artist}")
+            if (cleanQuery.isNotBlank()) {
+                runCatching {
+                    val searchRes = jioAdapter.search(cleanQuery, OnlineSearchFilter.SONGS, null)
+                    val matched = searchRes.tracks.firstOrNull()
+                    if (matched != null) {
+                        val sugs = if (jioAdapter is JioSaavnProvider) {
+                            jioAdapter.fetchSongSuggestions(matched.sourceId, limit)
+                        } else {
+                            jioAdapter.fetchRelatedTracks(matched, limit)
+                        }
+                        if (sugs.isNotEmpty()) sugs else searchRes.tracks.drop(1)
+                    } else emptyList()
+                }.onSuccess { list ->
+                    results.addAll(list)
+                }
+            }
+        }
+
+        // 3. Piped fallback if still empty or sparse
+        if (results.isEmpty() && pipedAdapter != null && pipedAdapter != directAdapter) {
+            runCatching {
+                if (track.providerType in setOf(OnlineProviderType.PIPED, OnlineProviderType.YOUTUBE, OnlineProviderType.INVIDIOUS)) {
+                    pipedAdapter.fetchRelatedTracks(track, limit)
+                } else {
+                    val cleanQuery = cleanMetadataQuery("${track.title} ${track.artist}")
+                    if (cleanQuery.isNotBlank()) {
+                        pipedAdapter.search(cleanQuery, OnlineSearchFilter.SONGS, null).tracks
+                    } else emptyList()
+                }
+            }.onSuccess { list ->
+                results.addAll(list)
+            }
+        }
+
+        // 4. Fallback to cached stream resolution's relatedTracks if adapters returned nothing
+        if (results.isEmpty()) {
+            streamCache.getIfValid(track.id)?.relatedTracks?.let { results.addAll(it) }
+        }
+
+        filterSingleSongs(deduplicateTracks(results), forceFilter = true)
+            .filterNot { it.id == track.id }
+            .take(limit)
+    }
+
+    suspend fun fetchArtistTopTracks(
+        artistName: String,
+        artistId: String? = null,
+        artistUrl: String? = null,
+        hintProviderType: OnlineProviderType = OnlineProviderType.JIOSAAVN,
+        hintProviderId: String? = null,
+        limit: Int = 15
+    ): List<OnlineTrack> = withContext(Dispatchers.IO) {
+        val cleanArtist = InputAndUrlSecurity.sanitizeSearchQuery(artistName)
+        if (cleanArtist.isBlank()) return@withContext emptyList()
+        val adapters = ensureDynamicRegistryReady()
+        val jioAdapter = adapters.values.firstOrNull {
+            it is JioSaavnProvider || it.providerType == OnlineProviderType.JIOSAAVN
+        }
+        val pipedAdapter = adapters.values.firstOrNull {
+            it is PipedProvider || it.providerType == OnlineProviderType.PIPED
+        }
+
+        val collected = mutableListOf<OnlineTrack>()
+
+        // 1. Try artist detail endpoint if we have an artistId / artistUrl
+        val idOrUrl = artistId?.takeIf { it.isNotBlank() } ?: artistUrl?.takeIf { it.isNotBlank() }
+        if (idOrUrl != null) {
+            runCatching {
+                fetchArtist(idOrUrl, hintProviderType, hintProviderId).tracks
+            }.onSuccess { tracks ->
+                collected.addAll(tracks)
+            }
+        }
+
+        // 2. Query JioSaavn songs for artist top tracks
+        if (collected.size < 6 && jioAdapter != null) {
+            runCatching {
+                val page = jioAdapter.search(cleanArtist, OnlineSearchFilter.SONGS, null)
+                val matchingArtist = page.tracks.filter {
+                    it.artist.contains(cleanArtist, ignoreCase = true)
+                }
+                if (matchingArtist.isNotEmpty()) matchingArtist else page.tracks
+            }.onSuccess { tracks ->
+                collected.addAll(tracks)
+            }
+        }
+
+        // 3. Fallback to Piped if still sparse
+        if (collected.isEmpty() && pipedAdapter != null) {
+            runCatching {
+                pipedAdapter.search(cleanArtist, OnlineSearchFilter.SONGS, null).tracks
+            }.onSuccess { tracks ->
+                collected.addAll(tracks)
+            }
+        }
+
+        filterSingleSongs(deduplicateTracks(collected), forceFilter = true).take(limit)
+    }
+
+    suspend fun fetchRelatedTracksForRadio(
+        seedTrack: OnlineTrack,
+        limit: Int = 15
+    ): List<OnlineTrack> = withContext(Dispatchers.IO) {
+        val adapters = ensureDynamicRegistryReady()
+        val pipedAdapter = adapters.values.firstOrNull {
+            it is PipedProvider || it.providerType == OnlineProviderType.PIPED
+        }
+
+        val collected = mutableListOf<OnlineTrack>()
+        // Check stream cache first for instant related tracks without extra network call if available
+        streamCache.getIfValid(seedTrack.id)?.relatedTracks?.let { collected.addAll(it) }
+
+        if (collected.size < limit) {
+            collected.addAll(fetchTrackSuggestions(seedTrack, limit))
+        }
+
+        if (collected.size < limit && pipedAdapter != null) {
+            runCatching {
+                if (seedTrack.providerType in setOf(OnlineProviderType.PIPED, OnlineProviderType.YOUTUBE, OnlineProviderType.INVIDIOUS)) {
+                    pipedAdapter.fetchRelatedTracks(seedTrack, limit)
+                } else {
+                    val cleanQuery = cleanMetadataQuery("${seedTrack.title} ${seedTrack.artist}")
+                    if (cleanQuery.isNotBlank()) {
+                        pipedAdapter.search(cleanQuery, OnlineSearchFilter.SONGS, null).tracks
+                    } else emptyList()
+                }
+            }.onSuccess { collected.addAll(it) }
+        }
+
+        filterSingleSongs(deduplicateTracks(collected), forceFilter = true)
+            .filterNot { it.id == seedTrack.id }
+            .take(limit)
+    }
+
+    suspend fun fetchTrendingTracksPreferringJioSaavn(limit: Int = 20): List<OnlineTrack> =
+        withContext(Dispatchers.IO) {
+            val adapters = ensureDynamicRegistryReady()
+            val jioAdapter = adapters.values.firstOrNull {
+                it is JioSaavnProvider || it.providerType == OnlineProviderType.JIOSAAVN
+            }
+            if (jioAdapter != null) {
+                val jioTrending = runCatching {
+                    filterSingleSongs(deduplicateTracks(jioAdapter.trending()), forceFilter = true)
+                }.getOrDefault(emptyList())
+                if (jioTrending.isNotEmpty()) return@withContext jioTrending.take(limit)
+            }
+            runCatching {
+                trending().first
+            }.getOrDefault(emptyList()).take(limit)
+        }
+
     suspend fun resolveStream(
         track: OnlineTrack,
         forceRefresh: Boolean = false

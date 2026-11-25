@@ -10,6 +10,8 @@ import app.nocturne.player.data.model.OnlineHistoryEntry
 import app.nocturne.player.data.model.OnlinePlaylist
 import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.recommendation.AffinityRepository
+import app.nocturne.player.data.recommendation.RecommendationEngine
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -17,7 +19,10 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 
-class OnlineLibraryRepository(private val db: AriaDatabase) {
+class OnlineLibraryRepository(
+    private val db: AriaDatabase,
+    private val affinityRepo: AffinityRepository = AffinityRepository(db)
+) {
 
     private val trackDao = db.onlineTrackDao()
     private val playlistDao = db.onlinePlaylistDao()
@@ -108,6 +113,7 @@ class OnlineLibraryRepository(private val db: AriaDatabase) {
             favoritedAt = if (newFav) System.currentTimeMillis() else 0L
         )
         trackDao.upsert(updated)
+        affinityRepo.recordTrackLiked(track, newFav)
         newFav
     }
 
@@ -166,6 +172,7 @@ class OnlineLibraryRepository(private val db: AriaDatabase) {
         )
         if (tracks.isNotEmpty()) {
             playlistDao.replaceEntries(id, tracks.map { it.id })
+            tracks.forEach { affinityRepo.recordTrackAddedToPlaylist(it) }
         }
         id
     }
@@ -194,6 +201,7 @@ class OnlineLibraryRepository(private val db: AriaDatabase) {
         val existingIds = playlistDao.getEntriesForPlaylist(playlistId).map { it.trackId }
         val updated = existingIds + tracks.map { it.id }
         playlistDao.replaceEntries(playlistId, updated)
+        tracks.forEach { affinityRepo.recordTrackAddedToPlaylist(it) }
         playlistDao.getPlaylistsOnce().firstOrNull { it.id == playlistId }?.let { pl ->
             playlistDao.updatePlaylist(
                 pl.copy(
@@ -309,6 +317,12 @@ object OnlineDependencies {
     @Volatile
     private var repository: OnlineLibraryRepository? = null
 
+    @Volatile
+    private var affinityRepository: AffinityRepository? = null
+
+    @Volatile
+    private var recommendationEngine: RecommendationEngine? = null
+
     fun getHealthTracker(): ProviderHealthTracker {
         return healthTracker ?: synchronized(this) {
             healthTracker ?: ProviderHealthTracker().also {
@@ -343,9 +357,37 @@ object OnlineDependencies {
         }
     }
 
+    fun getAffinityRepository(context: Context): AffinityRepository {
+        val appCtx = context.applicationContext
+        return affinityRepository ?: synchronized(this) {
+            affinityRepository ?: AffinityRepository(AriaDatabase.getInstance(appCtx)).also {
+                affinityRepository = it
+            }
+        }
+    }
+
+    fun getRecommendationEngine(context: Context): RecommendationEngine {
+        val appCtx = context.applicationContext
+        val aff = getAffinityRepository(appCtx)
+        val pm = getProviderManager(appCtx)
+        return recommendationEngine ?: synchronized(this) {
+            recommendationEngine ?: RecommendationEngine(
+                affinityRepository = aff,
+                providerManager = pm
+            ).also {
+                recommendationEngine = it
+            }
+        }
+    }
+
     fun getRepository(context: Context): OnlineLibraryRepository {
+        val appCtx = context.applicationContext
+        val aff = getAffinityRepository(appCtx)
         return repository ?: synchronized(this) {
-            repository ?: OnlineLibraryRepository(AriaDatabase.getInstance(context.applicationContext)).also {
+            repository ?: OnlineLibraryRepository(
+                db = AriaDatabase.getInstance(appCtx),
+                affinityRepo = aff
+            ).also {
                 repository = it
             }
         }

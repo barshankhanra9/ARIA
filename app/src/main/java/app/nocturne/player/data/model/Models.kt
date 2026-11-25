@@ -185,6 +185,9 @@ data class UserSettings(
     // Playback Mode
     val activePlaybackMode: PlaybackMode = PlaybackMode.OFFLINE,
 
+    // Online Recommendations & Infinite Radio
+    val infiniteRadioEnabled: Boolean = true,
+
     // Remote Provider Config
     val remoteProviderConfigUrl: String = DEFAULT_REMOTE_CONFIG_URL
 ) {

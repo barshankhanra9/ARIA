@@ -199,6 +199,29 @@ class JioSaavnProvider(
             .mapNotNull { parseAlbumItem(it.jsonObject) }
     }
 
+    suspend fun fetchSongSuggestions(songId: String, limit: Int = 10): List<OnlineTrack> =
+        withContext(Dispatchers.IO) {
+            val safeSourceId = InputAndUrlSecurity.sanitizePathSegment(songId)
+                ?: return@withContext emptyList()
+            val cfg = currentConfig()
+            val boundedLimit = limit.coerceIn(1, 30)
+            val sugResp = executeRawWithFallback(
+                OperationType.METADATA,
+                "/songs/${Uri.encode(safeSourceId)}/suggestions?limit=$boundedLimit"
+            )
+            extractResultsArray(sugResp.body, cfg?.mapping?.resultsPath)
+                .mapNotNull { parseSongItem(it.jsonObject) }
+        }
+
+    override suspend fun fetchRelatedTracks(track: OnlineTrack, limit: Int): List<OnlineTrack> {
+        if (track.providerType != OnlineProviderType.JIOSAAVN &&
+            !track.effectiveProviderId().equals(providerId, ignoreCase = true)
+        ) {
+            return emptyList()
+        }
+        return fetchSongSuggestions(track.sourceId, limit)
+    }
+
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
@@ -248,12 +271,7 @@ class JioSaavnProvider(
         ) ?: throw IOException("No playable audio streams returned by $displayName for ${track.title}")
 
         val related = runCatching {
-            val sugResp = executeRawWithFallback(
-                OperationType.METADATA,
-                "/songs/${Uri.encode(safeSourceId)}/suggestions?limit=10"
-            )
-            extractResultsArray(sugResp.body, cfg?.mapping?.resultsPath)
-                .mapNotNull { parseSongItem(it.jsonObject) }
+            fetchSongSuggestions(safeSourceId, 10)
         }.getOrDefault(emptyList())
 
         OnlineStreamResolution(

@@ -170,6 +170,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
 
     val onlineSnapshot by viewModel.online.snapshot.collectAsStateWithLifecycle()
     val onlineTrending by viewModel.online.trendingState.collectAsStateWithLifecycle()
+    val onlineRecommendations by viewModel.online.recommendationsState.collectAsStateWithLifecycle()
+    val onlineOnRepeat by viewModel.online.onRepeatTracks.collectAsStateWithLifecycle()
+    val onlineJumpBackIn by viewModel.online.jumpBackInTracks.collectAsStateWithLifecycle()
     val onlineSearch by viewModel.online.searchState.collectAsStateWithLifecycle()
     val onlineArtistDetail by viewModel.online.artistDetailState.collectAsStateWithLifecycle()
     val onlineAlbumDetail by viewModel.online.albumDetailState.collectAsStateWithLifecycle()
@@ -433,6 +436,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                 OnlineHomeScreen(
                                     onlineSnapshot = onlineSnapshot,
                                     trendingState = onlineTrending,
+                                    recommendationsState = onlineRecommendations,
+                                    onRepeatTracks = onlineOnRepeat,
+                                    jumpBackInTracks = onlineJumpBackIn,
                                     recentlyPlayed = onlineRecentlyPlayed,
                                     mostPlayed = onlineMostPlayed,
                                     favorites = onlineFavorites,

@@ -169,6 +169,64 @@ data class LyricsCacheEntity(
     val updatedAt: Long = System.currentTimeMillis()
 )
 
+@Entity(
+    tableName = "user_affinity",
+    indices = [
+        Index("artist"),
+        Index("affinityScore"),
+        Index("lastPlayedAt"),
+        Index("playCount")
+    ]
+)
+data class UserAffinityEntity(
+    @PrimaryKey val trackId: String,
+    val artist: String,
+    val artistId: String? = null,
+    val artistUrl: String? = null,
+    val title: String = "",
+    val album: String = "Online Stream",
+    val albumUrl: String? = null,
+    val sourceId: String = "",
+    val providerType: String = "JIOSAAVN",
+    val providerId: String = "jiosaavn",
+    val providerLabel: String = "JioSaavn",
+    val sourceUrl: String = "",
+    val durationMs: Long = 0L,
+    val thumbnailUrl: String? = null,
+    val playCount: Int = 0,
+    val skipCount: Int = 0,
+    val isLiked: Boolean = false,
+    val lastPlayedAt: Long = 0L,
+    val lastSkippedAt: Long = 0L,
+    val affinityScore: Double = 0.0,
+    val lastDecayAt: Long = System.currentTimeMillis()
+)
+
+@Entity(
+    tableName = "artist_affinity",
+    indices = [Index("affinityScore"), Index("lastPlayedAt")]
+)
+data class ArtistAffinityEntity(
+    @PrimaryKey val artistKey: String,
+    val artistName: String,
+    val artistId: String? = null,
+    val artistUrl: String? = null,
+    val providerType: String = "JIOSAAVN",
+    val providerId: String = "jiosaavn",
+    val playCount: Int = 0,
+    val skipCount: Int = 0,
+    val likedCount: Int = 0,
+    val lastPlayedAt: Long = 0L,
+    val affinityScore: Double = 0.0,
+    val lastDecayAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "affinity_state")
+data class AffinityStateEntity(
+    @PrimaryKey val id: Int = 1,
+    val lastDecayAt: Long = System.currentTimeMillis()
+)
+
 @Dao
 interface TrackStatsDao {
     @Query("SELECT * FROM track_stats")
@@ -265,6 +323,9 @@ interface SearchHistoryDao {
 interface OnlineTrackDao {
     @Query("SELECT * FROM online_tracks")
     fun observeAllTracks(): Flow<List<OnlineTrackEntity>>
+
+    @Query("SELECT * FROM online_tracks")
+    suspend fun getAllTracksOnce(): List<OnlineTrackEntity>
 
     @Query("SELECT * FROM online_tracks WHERE isFavorite = 1 ORDER BY favoritedAt DESC")
     fun observeFavorites(): Flow<List<OnlineTrackEntity>>
@@ -366,6 +427,84 @@ interface LyricsCacheDao {
     suspend fun deleteForTrack(trackId: String, cacheKey: String)
 }
 
+@Dao
+interface UserAffinityDao {
+    @Query("SELECT * FROM user_affinity WHERE playCount > 0 ORDER BY playCount DESC, affinityScore DESC, lastPlayedAt DESC LIMIT :limit")
+    fun observeOnRepeatTracks(limit: Int = 12): Flow<List<UserAffinityEntity>>
+
+    @Query("SELECT * FROM user_affinity WHERE lastPlayedAt > 0 ORDER BY lastPlayedAt DESC LIMIT :limit")
+    fun observeJumpBackInTracks(limit: Int = 12): Flow<List<UserAffinityEntity>>
+
+    @Query("SELECT * FROM user_affinity WHERE affinityScore > 0 ORDER BY affinityScore DESC, playCount DESC, lastPlayedAt DESC LIMIT :limit")
+    fun observeTopAffinityTracks(limit: Int = 5): Flow<List<UserAffinityEntity>>
+
+    @Query("SELECT * FROM artist_affinity WHERE affinityScore > 0 ORDER BY affinityScore DESC, playCount DESC, lastPlayedAt DESC LIMIT :limit")
+    fun observeTopArtists(limit: Int = 3): Flow<List<ArtistAffinityEntity>>
+
+    @Query("SELECT * FROM user_affinity WHERE trackId = :trackId LIMIT 1")
+    suspend fun getByTrackId(trackId: String): UserAffinityEntity?
+
+    @Query("SELECT * FROM user_affinity ORDER BY affinityScore DESC, playCount DESC, lastPlayedAt DESC LIMIT :limit")
+    suspend fun getTopAffinityTracks(limit: Int = 5): List<UserAffinityEntity>
+
+    @Query("SELECT * FROM artist_affinity ORDER BY affinityScore DESC, playCount DESC, lastPlayedAt DESC LIMIT :limit")
+    suspend fun getTopArtists(limit: Int = 3): List<ArtistAffinityEntity>
+
+    @Query("SELECT * FROM user_affinity WHERE isLiked = 1 OR playCount > 0 ORDER BY isLiked DESC, affinityScore DESC, playCount DESC LIMIT :limit")
+    suspend fun getFamiliarFavorites(limit: Int = 25): List<UserAffinityEntity>
+
+    @Query("SELECT * FROM user_affinity WHERE playCount > 0 ORDER BY playCount DESC, affinityScore DESC, lastPlayedAt DESC LIMIT :limit")
+    suspend fun getOnRepeatTracksOnce(limit: Int = 12): List<UserAffinityEntity>
+
+    @Query("SELECT * FROM user_affinity WHERE lastPlayedAt > 0 ORDER BY lastPlayedAt DESC LIMIT :limit")
+    suspend fun getJumpBackInTracksOnce(limit: Int = 12): List<UserAffinityEntity>
+
+    @Query("SELECT trackId FROM user_affinity WHERE skipCount > 0 AND lastSkippedAt >= :sinceMs AND lastSkippedAt >= lastPlayedAt AND isLiked = 0")
+    suspend fun getRecentlySkippedTrackIds(sinceMs: Long): List<String>
+
+    @Query("SELECT trackId FROM user_affinity WHERE lastPlayedAt >= :sinceMs")
+    suspend fun getRecentlyPlayedTrackIds(sinceMs: Long): List<String>
+
+    @Query("SELECT trackId FROM online_listening_history WHERE playedAt >= :sinceMs")
+    suspend fun getHistoryTrackIdsSince(sinceMs: Long): List<String>
+
+    @Query("SELECT * FROM user_affinity")
+    suspend fun getAllTrackAffinitiesOnce(): List<UserAffinityEntity>
+
+    @Query("SELECT * FROM artist_affinity WHERE artistKey = :artistKey LIMIT 1")
+    suspend fun getArtistAffinity(artistKey: String): ArtistAffinityEntity?
+
+    @Query("SELECT * FROM artist_affinity")
+    suspend fun getAllArtistAffinitiesOnce(): List<ArtistAffinityEntity>
+
+    @Query("SELECT COUNT(*) FROM user_affinity")
+    suspend fun countTrackedEntries(): Int
+
+    @Query("SELECT * FROM affinity_state WHERE id = 1 LIMIT 1")
+    suspend fun getAffinityState(): AffinityStateEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTrackAffinity(entity: UserAffinityEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertArtistAffinity(entity: ArtistAffinityEntity)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAffinityState(state: AffinityStateEntity)
+
+    @Query("UPDATE user_affinity SET affinityScore = affinityScore * :decayFactor, lastDecayAt = :decayAt")
+    suspend fun applyDecayToTracks(decayFactor: Double, decayAt: Long)
+
+    @Query("UPDATE artist_affinity SET affinityScore = affinityScore * :decayFactor, lastDecayAt = :decayAt")
+    suspend fun applyDecayToArtists(decayFactor: Double, decayAt: Long)
+
+    @Query("DELETE FROM user_affinity")
+    suspend fun clearTrackAffinities()
+
+    @Query("DELETE FROM artist_affinity")
+    suspend fun clearArtistAffinities()
+}
+
 @Database(
     entities = [
         TrackStatsEntity::class,
@@ -378,9 +517,12 @@ interface LyricsCacheDao {
         OnlinePlaylistEntity::class,
         OnlinePlaylistEntryEntity::class,
         OnlineRecentSearchEntity::class,
-        LyricsCacheEntity::class
+        LyricsCacheEntity::class,
+        UserAffinityEntity::class,
+        ArtistAffinityEntity::class,
+        AffinityStateEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class AriaDatabase : RoomDatabase() {
@@ -393,6 +535,7 @@ abstract class AriaDatabase : RoomDatabase() {
     abstract fun onlinePlaylistDao(): OnlinePlaylistDao
     abstract fun onlineSearchHistoryDao(): OnlineSearchHistoryDao
     abstract fun lyricsCacheDao(): LyricsCacheDao
+    abstract fun userAffinityDao(): UserAffinityDao
 
     companion object {
         @Volatile
@@ -501,6 +644,75 @@ abstract class AriaDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `user_affinity` (
+                        `trackId` TEXT NOT NULL,
+                        `artist` TEXT NOT NULL,
+                        `artistId` TEXT,
+                        `artistUrl` TEXT,
+                        `title` TEXT NOT NULL,
+                        `album` TEXT NOT NULL,
+                        `albumUrl` TEXT,
+                        `sourceId` TEXT NOT NULL,
+                        `providerType` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `providerLabel` TEXT NOT NULL,
+                        `sourceUrl` TEXT NOT NULL,
+                        `durationMs` INTEGER NOT NULL,
+                        `thumbnailUrl` TEXT,
+                        `playCount` INTEGER NOT NULL,
+                        `skipCount` INTEGER NOT NULL,
+                        `isLiked` INTEGER NOT NULL,
+                        `lastPlayedAt` INTEGER NOT NULL,
+                        `lastSkippedAt` INTEGER NOT NULL,
+                        `affinityScore` REAL NOT NULL,
+                        `lastDecayAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`trackId`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_user_affinity_artist` ON `user_affinity` (`artist`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_user_affinity_affinityScore` ON `user_affinity` (`affinityScore`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_user_affinity_lastPlayedAt` ON `user_affinity` (`lastPlayedAt`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_user_affinity_playCount` ON `user_affinity` (`playCount`)")
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `artist_affinity` (
+                        `artistKey` TEXT NOT NULL,
+                        `artistName` TEXT NOT NULL,
+                        `artistId` TEXT,
+                        `artistUrl` TEXT,
+                        `providerType` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `playCount` INTEGER NOT NULL,
+                        `skipCount` INTEGER NOT NULL,
+                        `likedCount` INTEGER NOT NULL,
+                        `lastPlayedAt` INTEGER NOT NULL,
+                        `affinityScore` REAL NOT NULL,
+                        `lastDecayAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`artistKey`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_artist_affinity_affinityScore` ON `artist_affinity` (`affinityScore`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_artist_affinity_lastPlayedAt` ON `artist_affinity` (`lastPlayedAt`)")
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `affinity_state` (
+                        `id` INTEGER NOT NULL,
+                        `lastDecayAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): AriaDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -508,7 +720,7 @@ abstract class AriaDatabase : RoomDatabase() {
                     AriaDatabase::class.java,
                     "aria_paper_library.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                     .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }

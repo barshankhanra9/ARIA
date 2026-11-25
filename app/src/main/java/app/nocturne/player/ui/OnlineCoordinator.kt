@@ -83,6 +83,18 @@ data class OnlineAlbumDetailState(
     val errorMessage: String? = null
 )
 
+data class OnlineRecommendationsUiState(
+    val dailyMixTitle: String = "Made For You (Daily Mix)",
+    val dailyMixSubtitle: String = "",
+    val dailyMix: List<OnlineTrack> = emptyList(),
+    val becauseYouListenToArtist: String? = null,
+    val becauseYouListenToTracks: List<OnlineTrack> = emptyList(),
+    val trendingFallback: List<OnlineTrack> = emptyList(),
+    val isBrandNewUser: Boolean = false,
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null
+)
+
 class OnlineCoordinator(
     private val app: Application,
     private val scope: CoroutineScope,
@@ -91,6 +103,8 @@ class OnlineCoordinator(
     private val remoteConfigRepo = OnlineDependencies.getRemoteConfigRepository(app)
     private val providerManager = OnlineDependencies.getProviderManager(app)
     private val repository = OnlineDependencies.getRepository(app)
+    private val affinityRepo = OnlineDependencies.getAffinityRepository(app)
+    private val recommendationEngine = OnlineDependencies.getRecommendationEngine(app)
 
     val remoteConfigStatus: StateFlow<RemoteConfigStatus> = remoteConfigRepo.status
 
@@ -104,6 +118,12 @@ class OnlineCoordinator(
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     val mostPlayed: StateFlow<List<OnlineTrack>> = repository.mostPlayed
+        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+
+    val onRepeatTracks: StateFlow<List<OnlineTrack>> = affinityRepo.onRepeatTracks
+        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+
+    val jumpBackInTracks: StateFlow<List<OnlineTrack>> = affinityRepo.jumpBackInTracks
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     val history: StateFlow<List<OnlineHistoryEntry>> = repository.history
@@ -154,6 +174,9 @@ class OnlineCoordinator(
     private val _trendingState = MutableStateFlow(OnlineTrendingUiState())
     val trendingState: StateFlow<OnlineTrendingUiState> = _trendingState.asStateFlow()
 
+    private val _recommendationsState = MutableStateFlow(OnlineRecommendationsUiState())
+    val recommendationsState: StateFlow<OnlineRecommendationsUiState> = _recommendationsState.asStateFlow()
+
     private val _artistDetailState = MutableStateFlow(OnlineArtistDetailState())
     val artistDetailState: StateFlow<OnlineArtistDetailState> = _artistDetailState.asStateFlow()
 
@@ -176,6 +199,7 @@ class OnlineCoordinator(
     private var liveSearchDebounceJob: Job? = null
     private var searchJob: Job? = null
     private var trendingJob: Job? = null
+    private var recommendationsJob: Job? = null
     private var artistJob: Job? = null
     private var albumJob: Job? = null
 
@@ -183,6 +207,16 @@ class OnlineCoordinator(
         scope.launch {
             remoteConfigRepo.activeConfig.collect {
                 refreshProviderHealth()
+            }
+        }
+        scope.launch {
+            var hadTasteHistory = false
+            affinityRepo.jumpBackInTracks.collect { list ->
+                val hasTasteNow = list.isNotEmpty()
+                if (!hadTasteHistory && hasTasteNow && _recommendationsState.value.dailyMix.isEmpty()) {
+                    refreshRecommendations(force = false)
+                }
+                hadTasteHistory = hasTasteNow
             }
         }
     }
@@ -229,12 +263,49 @@ class OnlineCoordinator(
 
     fun loadTrendingIfNeeded() {
         val cur = _trendingState.value
-        if (cur.isLoading || cur.tracks.isNotEmpty()) return
-        refreshTrending()
+        if (!cur.isLoading && cur.tracks.isEmpty()) {
+            loadCategoryFeed(cur.selectedCategory, clearExisting = false)
+        }
+        val rec = _recommendationsState.value
+        if (!rec.isLoading && rec.dailyMix.isEmpty() && rec.becauseYouListenToTracks.isEmpty() && rec.trendingFallback.isEmpty()) {
+            refreshRecommendations(force = false)
+        }
     }
 
     fun refreshTrending() {
         loadCategoryFeed(_trendingState.value.selectedCategory, clearExisting = false)
+        refreshRecommendations(force = true)
+    }
+
+    fun refreshRecommendations(force: Boolean = false) {
+        if (!force && recommendationsJob?.isActive == true) return
+        recommendationsJob?.cancel()
+        recommendationsJob = scope.launch {
+            _recommendationsState.update { it.copy(isLoading = true, errorMessage = null) }
+            runCatching {
+                recommendationEngine.buildHomeRecommendations(dailyMixTargetSize = 15)
+            }.onSuccess { recs ->
+                _recommendationsState.value = OnlineRecommendationsUiState(
+                    dailyMixTitle = recs.dailyMixTitle,
+                    dailyMixSubtitle = recs.dailyMixSubtitle,
+                    dailyMix = recs.dailyMix,
+                    becauseYouListenToArtist = recs.becauseYouListenToArtist,
+                    becauseYouListenToTracks = recs.becauseYouListenToTracks,
+                    trendingFallback = recs.trendingFallback,
+                    isBrandNewUser = recs.isBrandNewUser,
+                    isLoading = false,
+                    errorMessage = null
+                )
+                refreshProviderHealth()
+            }.onFailure { err ->
+                _recommendationsState.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = err.localizedMessage ?: "Unable to build recommendations"
+                    )
+                }
+            }
+        }
     }
 
     fun selectDiscoveryCategory(category: OnlineDiscoveryCategory) {
@@ -773,6 +844,10 @@ class OnlineCoordinator(
     fun resolveOnlineTrackById(id: String): OnlineTrack? {
         return allTracks.value.firstOrNull { it.id == id }
             ?: snapshot.value.queue.firstOrNull { it.id == id }
+            ?: _recommendationsState.value.dailyMix.firstOrNull { it.id == id }
+            ?: _recommendationsState.value.becauseYouListenToTracks.firstOrNull { it.id == id }
+            ?: onRepeatTracks.value.firstOrNull { it.id == id }
+            ?: jumpBackInTracks.value.firstOrNull { it.id == id }
             ?: _trendingState.value.tracks.firstOrNull { it.id == id }
             ?: _searchState.value.tracks.firstOrNull { it.id == id }
             ?: snapshot.value.relatedTracks.firstOrNull { it.id == id }

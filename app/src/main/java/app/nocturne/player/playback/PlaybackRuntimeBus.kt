@@ -41,6 +41,8 @@ data class OnlineEngineSnapshot(
     val activeStreamLabel: String = "",
     val activeProviderLabel: String = "",
     val relatedTracks: List<OnlineTrack> = emptyList(),
+    val isRadioLoading: Boolean = false,
+    val radioAppendedCount: Int = 0,
     val errorMessage: String? = null
 )
 

@@ -48,6 +48,8 @@ import app.nocturne.player.data.online.OnlineHttpClient
 import app.nocturne.player.data.online.OnlineLibraryRepository
 import app.nocturne.player.data.online.OnlineProviderManager
 import app.nocturne.player.data.prefs.SettingsRepository
+import app.nocturne.player.data.recommendation.AffinityRepository
+import app.nocturne.player.data.recommendation.RecommendationEngine
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import app.nocturne.player.playback.ActiveAudioEngine
 import app.nocturne.player.playback.AudioEffectsManager
@@ -84,6 +86,8 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var database: AriaDatabase
     private lateinit var providerManager: OnlineProviderManager
     private lateinit var onlineRepo: OnlineLibraryRepository
+    private lateinit var affinityRepo: AffinityRepository
+    private lateinit var recommendationEngine: RecommendationEngine
     private lateinit var lyricsRepository: LyricsRepository
 
     // Offline playback engine (existing behavior preserved)
@@ -103,6 +107,7 @@ class PlaybackService : MediaLibraryService() {
     private var onlineProgressJob: Job? = null
     private var crossfadeJob: Job? = null
     private var lyricsPreloadJob: Job? = null
+    private var radioFetchJob: Job? = null
     private var receiversRegistered = false
 
     private data class ResolvedStreamCtx(
@@ -116,6 +121,14 @@ class PlaybackService : MediaLibraryService() {
     private val resolvedStreamContext = ConcurrentHashMap<String, ResolvedStreamCtx>()
     private var lastCountedOnlineId: String? = null
     private var onlineAccumulatedMs: Long = 0L
+
+    private var trackedOnlineTrack: OnlineTrack? = null
+    private var trackedOnlineListenMs: Long = 0L
+    private var trackedOnlineMaxPosMs: Long = 0L
+    private var trackedOnlineEngagedAwarded: Boolean = false
+    private var trackedOnlineCompletedAwarded: Boolean = false
+    private var lastRadioSeedKey: String? = null
+    @Volatile private var pendingRadioAutoAdvance: Boolean = false
 
     private val noisyAndBtReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -151,6 +164,8 @@ class PlaybackService : MediaLibraryService() {
         remoteConfigRepo.triggerStartupRefreshIfNeeded()
         providerManager = OnlineDependencies.getProviderManager(this)
         onlineRepo = OnlineDependencies.getRepository(this)
+        affinityRepo = OnlineDependencies.getAffinityRepository(this)
+        recommendationEngine = OnlineDependencies.getRecommendationEngine(this)
         lyricsRepository = LyricsRepository(
             context = this,
             db = database,
@@ -285,13 +300,21 @@ class PlaybackService : MediaLibraryService() {
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                evaluateOutgoingOnlineTrack(reason)
                 onlineAccumulatedMs = 0L
                 lastCountedOnlineId = null
-                mediaItem?.mediaId?.let { id -> onlineTrackMap[id] }?.let { tr ->
+                val nextTrack = mediaItem?.mediaId?.let { id -> onlineTrackMap[id] }
+                resetOnlineTrackingFor(nextTrack)
+                nextTrack?.let { tr ->
                     preloadLyricsForOnlineTrack(tr)
                 }
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
+                if (onlinePlayer.mediaItemCount > 0 &&
+                    onlinePlayer.currentMediaItemIndex >= onlinePlayer.mediaItemCount - 1
+                ) {
+                    maybeTriggerInfiniteRadio(autoAdvanceAfterAppend = false)
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
@@ -304,6 +327,22 @@ class PlaybackService : MediaLibraryService() {
                     if (activeEngine == ActiveAudioEngine.ONLINE) {
                         attachEffects(onlinePlayer.audioSessionId)
                     }
+                    if (onlinePlayer.mediaItemCount > 0 &&
+                        onlinePlayer.currentMediaItemIndex >= onlinePlayer.mediaItemCount - 1
+                    ) {
+                        maybeTriggerInfiniteRadio(autoAdvanceAfterAppend = false)
+                    }
+                } else if (playbackState == Player.STATE_ENDED) {
+                    val prev = trackedOnlineTrack
+                    if (prev != null && !trackedOnlineCompletedAwarded && trackedOnlineListenMs >= 3_000L) {
+                        trackedOnlineCompletedAwarded = true
+                        val needsPlayIncrement = !trackedOnlineEngagedAwarded
+                        trackedOnlineEngagedAwarded = true
+                        serviceScope.launch(Dispatchers.IO) {
+                            affinityRepo.recordTrackCompleted(prev, incrementPlayCount = needsPlayIncrement)
+                        }
+                    }
+                    maybeTriggerInfiniteRadio(autoAdvanceAfterAppend = true)
                 }
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
@@ -751,6 +790,104 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
+    private fun resetOnlineTrackingFor(track: OnlineTrack?) {
+        trackedOnlineTrack = track
+        trackedOnlineListenMs = 0L
+        trackedOnlineMaxPosMs = 0L
+        trackedOnlineEngagedAwarded = false
+        trackedOnlineCompletedAwarded = false
+    }
+
+    private fun evaluateOutgoingOnlineTrack(reason: Int) {
+        val outgoing = trackedOnlineTrack ?: return
+        if (!::affinityRepo.isInitialized) return
+        if (trackedOnlineCompletedAwarded) return
+
+        val isAutoFinished = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO
+        val isManualSkip = reason == Player.MEDIA_ITEM_TRANSITION_REASON_SEEK ||
+            reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED
+
+        if (isAutoFinished && trackedOnlineListenMs >= 3_000L) {
+            trackedOnlineCompletedAwarded = true
+            val needsPlayIncrement = !trackedOnlineEngagedAwarded
+            trackedOnlineEngagedAwarded = true
+            serviceScope.launch(Dispatchers.IO) {
+                affinityRepo.recordTrackCompleted(outgoing, incrementPlayCount = needsPlayIncrement)
+            }
+        } else if (isManualSkip && trackedOnlineListenMs >= 1_000L && trackedOnlineMaxPosMs < 15_000L) {
+            serviceScope.launch(Dispatchers.IO) {
+                affinityRepo.recordTrackSkippedEarly(outgoing)
+            }
+        }
+    }
+
+    private fun maybeTriggerInfiniteRadio(autoAdvanceAfterAppend: Boolean) {
+        if (!::onlinePlayer.isInitialized || !::recommendationEngine.isInitialized) return
+        if (!currentSettings.infiniteRadioEnabled) return
+        if (onlinePlayer.repeatMode != Player.REPEAT_MODE_OFF) return
+        if (onlinePlayer.mediaItemCount == 0) return
+        val currentIdx = onlinePlayer.currentMediaItemIndex
+        if (currentIdx < onlinePlayer.mediaItemCount - 1) return
+
+        val queueSnapshot = (0 until onlinePlayer.mediaItemCount).mapNotNull { i ->
+            onlineTrackMap[onlinePlayer.getMediaItemAt(i).mediaId]
+        }
+        val lastTrack = queueSnapshot.lastOrNull() ?: return
+        val seedKey = "${lastTrack.id}:${queueSnapshot.size}"
+
+        if (autoAdvanceAfterAppend) {
+            pendingRadioAutoAdvance = true
+        }
+        if (radioFetchJob?.isActive == true) {
+            return
+        }
+        if (lastRadioSeedKey == seedKey && !autoAdvanceAfterAppend) {
+            return
+        }
+        lastRadioSeedKey = seedKey
+
+        PlaybackRuntimeBus.updateOnlineSnapshot { it.copy(isRadioLoading = true) }
+        radioFetchJob = serviceScope.launch {
+            try {
+                val related = runCatching {
+                    recommendationEngine.generateInfiniteRadioTracks(
+                        seedTrack = lastTrack,
+                        currentQueue = queueSnapshot,
+                        count = 10
+                    )
+                }.getOrDefault(emptyList())
+
+                if (related.isNotEmpty() && ::onlinePlayer.isInitialized) {
+                    val insertIndex = onlinePlayer.mediaItemCount
+                    related.forEach { onlineTrackMap[it.id] = it }
+                    val newItems = related.map { buildOnlineMediaItem(it) }
+                    onlinePlayer.addMediaItems(newItems)
+                    PlaybackRuntimeBus.updateOnlineSnapshot {
+                        it.copy(
+                            isRadioLoading = false,
+                            radioAppendedCount = it.radioAppendedCount + related.size
+                        )
+                    }
+                    if (pendingRadioAutoAdvance && insertIndex in 0 until onlinePlayer.mediaItemCount) {
+                        pendingRadioAutoAdvance = false
+                        activateEngine(ActiveAudioEngine.ONLINE, pauseOther = true)
+                        onlinePlayer.seekTo(insertIndex, 0L)
+                        onlinePlayer.prepare()
+                        onlinePlayer.play()
+                    }
+                    syncOnlineSnapshot()
+                    saveOnlineQueueStateAsync()
+                } else {
+                    pendingRadioAutoAdvance = false
+                    PlaybackRuntimeBus.updateOnlineSnapshot { it.copy(isRadioLoading = false) }
+                }
+            } catch (_: Throwable) {
+                pendingRadioAutoAdvance = false
+                PlaybackRuntimeBus.updateOnlineSnapshot { it.copy(isRadioLoading = false) }
+            }
+        }
+    }
+
     private fun startOnlineProgressLoop() {
         if (onlineProgressJob?.isActive == true) return
         onlineProgressJob = serviceScope.launch {
@@ -762,15 +899,40 @@ class PlaybackService : MediaLibraryService() {
                 if (onlinePlayer.isPlaying) {
                     val current = PlaybackRuntimeBus.onlineSnapshot.value.currentTrack
                     if (current != null) {
+                        if (trackedOnlineTrack?.id != current.id) {
+                            resetOnlineTrackingFor(current)
+                        }
                         onlineAccumulatedMs += 250L
+                        trackedOnlineListenMs += 250L
+                        val posMs = onlinePlayer.currentPosition.coerceAtLeast(0L)
+                        if (posMs > trackedOnlineMaxPosMs) {
+                            trackedOnlineMaxPosMs = posMs
+                        }
+
                         if (onlineAccumulatedMs >= 5000L && lastCountedOnlineId != current.id) {
                             lastCountedOnlineId = current.id
+                            trackedOnlineEngagedAwarded = true
                             serviceScope.launch(Dispatchers.IO) {
                                 onlineRepo.recordTrackPlayed(current, 5000L)
+                                affinityRepo.recordTrackEngaged(current)
                             }
                         } else if (onlineAccumulatedMs % 5000L == 0L && lastCountedOnlineId == current.id) {
                             serviceScope.launch(Dispatchers.IO) {
                                 onlineRepo.addListenTime(current.id, 5000L)
+                            }
+                        }
+
+                        val durMs = onlinePlayer.duration.takeIf { it > 0L } ?: current.durationMs
+                        if (!trackedOnlineCompletedAwarded &&
+                            durMs > 0L &&
+                            posMs >= (durMs * 0.80).toLong() &&
+                            (trackedOnlineListenMs >= (durMs * 0.40).toLong() || trackedOnlineListenMs >= 20_000L)
+                        ) {
+                            trackedOnlineCompletedAwarded = true
+                            val needsPlayIncrement = !trackedOnlineEngagedAwarded
+                            trackedOnlineEngagedAwarded = true
+                            serviceScope.launch(Dispatchers.IO) {
+                                affinityRepo.recordTrackCompleted(current, incrementPlayCount = needsPlayIncrement)
                             }
                         }
                     }
@@ -1034,6 +1196,7 @@ class PlaybackService : MediaLibraryService() {
         onlineProgressJob?.cancel()
         crossfadeJob?.cancel()
         lyricsPreloadJob?.cancel()
+        radioFetchJob?.cancel()
         if (receiversRegistered) {
             runCatching { unregisterReceiver(noisyAndBtReceiver) }
             receiversRegistered = false
@@ -1118,6 +1281,9 @@ class PlaybackService : MediaLibraryService() {
         override fun playOnlineTracks(tracks: List<OnlineTrack>, startIndex: Int, shuffle: Boolean) {
             if (tracks.isEmpty()) return
             serviceScope.launch {
+                lastRadioSeedKey = null
+                pendingRadioAutoAdvance = false
+                radioFetchJob?.cancel()
                 tracks.forEach { onlineTrackMap[it.id] = it }
                 val safeIdx = startIndex.coerceIn(tracks.indices)
                 preloadLyricsForOnlineTrack(tracks[safeIdx])
@@ -1168,11 +1334,18 @@ class PlaybackService : MediaLibraryService() {
                 activateEngine(ActiveAudioEngine.ONLINE, pauseOther = true)
                 if (onlinePlayer.hasNextMediaItem()) {
                     onlinePlayer.seekToNextMediaItem()
+                    if (onlinePlayer.playbackState == Player.STATE_IDLE) onlinePlayer.prepare()
+                    onlinePlayer.play()
                 } else if (onlinePlayer.mediaItemCount > 0) {
-                    onlinePlayer.seekToDefaultPosition(0)
+                    if (currentSettings.infiniteRadioEnabled && onlinePlayer.repeatMode == Player.REPEAT_MODE_OFF) {
+                        evaluateOutgoingOnlineTrack(Player.MEDIA_ITEM_TRANSITION_REASON_SEEK)
+                        maybeTriggerInfiniteRadio(autoAdvanceAfterAppend = true)
+                    } else {
+                        onlinePlayer.seekToDefaultPosition(0)
+                        if (onlinePlayer.playbackState == Player.STATE_IDLE) onlinePlayer.prepare()
+                        onlinePlayer.play()
+                    }
                 }
-                if (onlinePlayer.playbackState == Player.STATE_IDLE) onlinePlayer.prepare()
-                onlinePlayer.play()
                 syncOnlineSnapshot()
             }
         }
