@@ -1581,6 +1581,82 @@ class OnlineMusicEngineTest {
         }
     }
 
+    @Test
+    fun invidiousAndPlaybackResolver_failOverPastHtmlResponsesAndPlaybackCapabilityAlias() = runTest {
+        val htmlServer = MockWebServer()
+        val errorJsonServer = MockWebServer()
+        val healthyServer = MockWebServer()
+        htmlServer.start()
+        errorJsonServer.start()
+        healthyServer.start()
+        try {
+            // 1. Capability alias check: "playback" in schema_version:2 must satisfy supportsCapability("stream")
+            val v2Config = app.nocturne.player.data.model.DynamicProviderConfig(
+                id = "piped_primary",
+                adapterType = "piped",
+                enabled = true,
+                capabilities = listOf("search", "playback")
+            )
+            assertTrue(v2Config.supportsCapability("stream"))
+            assertTrue(v2Config.supportsCapability("playback"))
+
+            // 2. Invidious resolveStream fails fast on HTML (without retrying) and error JSON -> lands on healthyServer
+            htmlServer.enqueue(MockResponse().setResponseCode(200).setBody("<!DOCTYPE html><html><body>Website</body></html>"))
+            errorJsonServer.enqueue(MockResponse().setResponseCode(200).setBody("""{"error":"Sign in to confirm","adaptiveFormats":[]}"""))
+            val healthyBase = healthyServer.url("/").toString().trimEnd('/')
+            healthyServer.enqueue(
+                MockResponse()
+                    .setResponseCode(200)
+                    .setBody(
+                        """
+                        {
+                          "title": "Night Drive",
+                          "author": "Synth Artist",
+                          "lengthSeconds": 180,
+                          "adaptiveFormats": [
+                            {
+                              "url": "$healthyBase/audio.webm",
+                              "type": "audio/webm; codecs=\"opus\"",
+                              "bitrate": "160000"
+                            }
+                          ]
+                        }
+                        """.trimIndent()
+                    )
+            )
+
+            val htmlBase = htmlServer.url("/").toString().trimEnd('/')
+            val errJsonBase = errorJsonServer.url("/").toString().trimEnd('/')
+            val tracker = ProviderHealthTracker()
+            val provider = InvidiousProvider(
+                client = OkHttpClient(),
+                baseUrlsOverride = listOf(htmlBase, errJsonBase, healthyBase),
+                healthTracker = tracker,
+                dynamicConfigProvider = {
+                    app.nocturne.player.data.model.DynamicProviderConfig(
+                        id = "invidious_custom",
+                        adapterType = "invidious",
+                        enabled = true,
+                        maxRetries = 2,
+                        capabilities = listOf("search", "playback")
+                    )
+                }
+            )
+
+            val resolution = provider.resolveStream(sampleTrack("dQw4w9WgXcQ"), NetworkSpeedTier.STANDARD)
+            assertEquals("$healthyBase/audio.webm", resolution.selectedStream.url)
+            assertEquals("invidious_custom", resolution.resolvedByProviderId)
+            // HTML response must NOT be retried even when maxRetries = 2
+            assertEquals(1, htmlServer.requestCount)
+            assertEquals(1, errorJsonServer.requestCount)
+            assertEquals(1, healthyServer.requestCount)
+        } finally {
+            runCatching { htmlServer.shutdown() }
+            runCatching { errorJsonServer.shutdown() }
+            runCatching { healthyServer.shutdown() }
+        }
+    }
+
     private fun sampleTrack(
         sourceId: String,
         title: String = "Track $sourceId",

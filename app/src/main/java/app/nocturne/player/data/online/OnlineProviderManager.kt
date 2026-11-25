@@ -87,6 +87,10 @@ class OnlineProviderManager(
         cleaningConfigProvider = { remoteConfigRepository?.lyricsCleaningConfig() ?: LyricsCleaningConfig() }
     )
 
+    private val builtInYouTubeFallback: OnlineMusicProvider by lazy {
+        NewPipeProvider(OnlineProviderType.YOUTUBE)
+    }
+
     private val registryLock = Any()
     private var cachedConfigSnapshot: RemoteProvidersConfig? = null
     private var dynamicAdapters: Map<String, OnlineMusicProvider> = emptyMap()
@@ -506,10 +510,27 @@ class OnlineProviderManager(
         }
 
         val adapters = ensureDynamicRegistryReady()
+        val hasYouTubeAdapter = adapters.values.any { it.providerType == OnlineProviderType.YOUTUBE }
+        val youtubeDisabledRemotely = remoteConfigRepository?.activeConfig?.value
+            ?.providers
+            ?.any {
+                (it.id.equals("youtube", ignoreCase = true) || it.adapterType.equals("newpipe", ignoreCase = true)) && !it.enabled
+            } == true
+        val playbackAdapters = if (
+            providers == null &&
+            !allowLoopbackForTests &&
+            !hasYouTubeAdapter &&
+            !youtubeDisabledRemotely &&
+            "youtube" !in allExcludedIds
+        ) {
+            adapters + ("youtube" to builtInYouTubeFallback)
+        } else {
+            adapters
+        }
         val speedTier = currentSpeedTier()
         val resolved = playbackResolver.resolve(
             track = track,
-            adapters = adapters,
+            adapters = playbackAdapters,
             speedTier = speedTier,
             excludedIds = allExcludedIds
         )
@@ -688,7 +709,10 @@ class OnlineProviderManager(
                 jioKeys
             }
             OnlineSearchFilter.VIDEOS_REMIXES -> {
-                listOf("piped", "invidious", "youtube").filter { adapters.containsKey(it) }
+                val piped = adapters.filter { it.key == "piped" || it.value.providerType == OnlineProviderType.PIPED }.keys
+                val invidious = adapters.filter { it.key == "invidious" || it.value.providerType == OnlineProviderType.INVIDIOUS }.keys
+                val youtube = adapters.filter { it.key == "youtube" || it.value.providerType == OnlineProviderType.YOUTUBE }.keys
+                (piped + invidious + youtube).toList().distinct()
             }
             OnlineSearchFilter.JIOSAAVN -> adapters.filter { it.key == "jiosaavn" || it.value.providerType == OnlineProviderType.JIOSAAVN }.keys.toList()
             OnlineSearchFilter.AUDIUS -> adapters.filter { it.key == "audius" || it.value.providerType == OnlineProviderType.AUDIUS }.keys.toList()
@@ -759,8 +783,16 @@ class OnlineProviderManager(
     ): List<String> {
         val effId = track.effectiveProviderId().lowercase()
         val ytFamily = setOf("youtube", "piped", "invidious")
-        val rawCandidates = if (effId in ytFamily || track.providerType in setOf(OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS)) {
-            listOf("youtube", "piped", "invidious").filter { adapters.containsKey(it) }
+        val rawCandidates = if (effId in ytFamily || track.providerType in setOf(
+                OnlineProviderType.YOUTUBE,
+                OnlineProviderType.PIPED,
+                OnlineProviderType.INVIDIOUS
+            )
+        ) {
+            val youtube = adapters.filter { it.key == "youtube" || it.value.providerType == OnlineProviderType.YOUTUBE }.keys
+            val piped = adapters.filter { it.key == "piped" || it.value.providerType == OnlineProviderType.PIPED }.keys
+            val invidious = adapters.filter { it.key == "invidious" || it.value.providerType == OnlineProviderType.INVIDIOUS }.keys
+            (youtube + piped + invidious).toList().distinct()
         } else if (adapters.containsKey(effId)) {
             listOf(effId)
         } else {
@@ -775,8 +807,16 @@ class OnlineProviderManager(
         adapters: Map<String, OnlineMusicProvider>
     ): List<String> {
         val ytFamily = setOf("youtube", "piped", "invidious")
-        val candidates = if (targetId in ytFamily || hintProvider in setOf(OnlineProviderType.YOUTUBE, OnlineProviderType.PIPED, OnlineProviderType.INVIDIOUS)) {
-            listOf("youtube", "piped", "invidious").filter { adapters.containsKey(it) }
+        val candidates = if (targetId in ytFamily || hintProvider in setOf(
+                OnlineProviderType.YOUTUBE,
+                OnlineProviderType.PIPED,
+                OnlineProviderType.INVIDIOUS
+            )
+        ) {
+            val youtube = adapters.filter { it.key == "youtube" || it.value.providerType == OnlineProviderType.YOUTUBE }.keys
+            val piped = adapters.filter { it.key == "piped" || it.value.providerType == OnlineProviderType.PIPED }.keys
+            val invidious = adapters.filter { it.key == "invidious" || it.value.providerType == OnlineProviderType.INVIDIOUS }.keys
+            (youtube + piped + invidious).toList().distinct()
         } else if (adapters.containsKey(targetId)) {
             listOf(targetId)
         } else {

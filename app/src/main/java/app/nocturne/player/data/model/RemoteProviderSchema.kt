@@ -183,7 +183,20 @@ data class DynamicProviderConfig(
     fun supportsCapability(cap: String): Boolean {
         if (!enabled) return false
         if (capabilities.isEmpty()) return true
-        return capabilities.any { it.equals(cap, ignoreCase = true) || it.equals("all", ignoreCase = true) }
+        val normalizedTarget = normalizeCapability(cap)
+        return capabilities.any {
+            val norm = normalizeCapability(it)
+            norm == normalizedTarget || norm == "all"
+        }
+    }
+
+    private fun normalizeCapability(raw: String): String = when (raw.trim().lowercase()) {
+        "playback", "stream", "streams", "play", "audio" -> "stream"
+        "artists", "artist" -> "artist"
+        "albums", "album", "playlists", "playlist" -> "album"
+        "suggestions", "suggest", "autocomplete" -> "suggestions"
+        "trending", "charts" -> "trending"
+        else -> raw.trim().lowercase()
     }
 
     fun endpointsFor(operation: OperationType): List<ProviderEndpointConfig> =

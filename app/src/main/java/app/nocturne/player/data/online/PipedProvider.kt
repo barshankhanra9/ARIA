@@ -130,71 +130,113 @@ class PipedProvider(
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Piped video ID")
-        val resp = executeRawWithFallback(OperationType.PLAYBACK, "/streams/${Uri.encode(videoId)}")
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-
-        val rawStreams = obj["audioStreams"]?.jsonArray.orEmpty()
-        val streams = rawStreams.mapNotNull { el ->
-            val st = el.jsonObject
-            if (st.bool("videoOnly") == true) return@mapNotNull null
-            val rawUrl = st.str("url")
-            val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
-            val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
-                ?: return@mapNotNull null
-            val bps = st.int("bitrate") ?: 128_000
-            val kbps = if (bps > 1000) bps / 1000 else bps
-            val mime = st.str("mimeType").orEmpty().ifBlank { "audio/mp4" }
-            val codec = st.str("codec").orEmpty().ifBlank { st.str("format").orEmpty() }
-            val fmt = st.str("format").orEmpty().ifBlank { "AUDIO" }
-            val cleanLabel = if (codec.contains("opus", ignoreCase = true) || mime.contains("webm", ignoreCase = true)) {
-                "Opus ${kbps}k"
-            } else {
-                "${fmt.uppercase()} ${kbps}k"
-            }
-            OnlineAudioStream(
-                url = url,
-                bitrateKbps = kbps.coerceAtLeast(32),
-                mimeType = mime,
-                codec = codec,
-                formatLabel = cleanLabel,
-                expiresAtMs = StreamQualitySelector.parseExpiryFromUrl(url)
-            )
-        }
-
-        val allowedOrigin = resp.endpointUrl.takeIf { baseUrlsOverride != null }
+        val endpoints = getEndpointConfigs(OperationType.PLAYBACK)
+        val cfg = currentConfig()
+        val endpointFailover = cfg?.endpointFailover ?: true
+        val cooldownMs = cfg?.cooldownMs ?: 60_000L
+        val orderedUrls = healthTracker.selectOrderedEndpoints(
+            providerId = providerId,
+            operation = OperationType.PLAYBACK,
+            configuredEndpoints = endpoints.map { it.url }
+        ).let { if (endpointFailover) it else it.take(1) }
+        val epByUrl = endpoints.associateBy { it.url.trimEnd('/') }
+        val path = "/streams/${Uri.encode(videoId)}"
         val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
-        val selected = StreamQualitySelector.selectBestAudioStream(
-            streams = streams,
-            speedTier = effectiveTier,
-            allowedLoopbackOrigin = allowedOrigin,
-            preferWebmOpus = true
-        ) ?: throw IllegalStateException("No playable audio streams returned by $displayName")
 
-        val title = obj.str("title") ?: track.title
-        val uploader = obj.str("uploader") ?: track.artist
-        val uploaderUrl = obj.str("uploaderUrl")?.let { normalizeYoutubeUrl(it) } ?: track.artistUrl
-        val durationSec = obj.long("duration") ?: 0L
-        val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl"), allowedOrigin) ?: track.thumbnailUrl
-        val related = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
-            parseStreamItem(it.jsonObject)
+        var lastError: Throwable? = null
+        for (epUrl in orderedUrls) {
+            val epCfg = epByUrl[epUrl] ?: ProviderEndpointConfig(url = epUrl)
+            try {
+                val resp = executor.executeRawGet(
+                    providerId = providerId,
+                    operation = OperationType.PLAYBACK,
+                    configuredEndpoints = listOf(epCfg),
+                    pathAndQuery = path,
+                    headers = cfg?.headers ?: emptyMap(),
+                    timeoutMs = cfg?.timeoutMs ?: 10_000L,
+                    maxRetries = cfg?.maxRetries ?: 1,
+                    cooldownMs = cooldownMs,
+                    endpointFailover = false
+                )
+                val obj = json.parseToJsonElement(resp.body).jsonObject
+                if (!obj.str("error").isNullOrBlank()) {
+                    throw IllegalStateException(obj.str("error") ?: "Piped stream error")
+                }
+
+                val rawStreams = obj["audioStreams"]?.jsonArray.orEmpty()
+                val streams = rawStreams.mapNotNull { el ->
+                    val st = el.jsonObject
+                    if (st.bool("videoOnly") == true) return@mapNotNull null
+                    val rawUrl = st.str("url")
+                    val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
+                    val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
+                        ?: return@mapNotNull null
+                    val bps = st.int("bitrate") ?: 128_000
+                    val kbps = if (bps > 1000) bps / 1000 else bps
+                    val mime = st.str("mimeType").orEmpty().ifBlank { "audio/mp4" }
+                    val codec = st.str("codec").orEmpty().ifBlank { st.str("format").orEmpty() }
+                    val fmt = st.str("format").orEmpty().ifBlank { "AUDIO" }
+                    val cleanLabel = if (codec.contains("opus", ignoreCase = true) || mime.contains("webm", ignoreCase = true)) {
+                        "Opus ${kbps}k"
+                    } else {
+                        "${fmt.uppercase()} ${kbps}k"
+                    }
+                    OnlineAudioStream(
+                        url = url,
+                        bitrateKbps = kbps.coerceAtLeast(32),
+                        mimeType = mime,
+                        codec = codec,
+                        formatLabel = cleanLabel,
+                        expiresAtMs = StreamQualitySelector.parseExpiryFromUrl(url)
+                    )
+                }
+
+                val allowedOrigin = resp.endpointUrl.takeIf { baseUrlsOverride != null }
+                val selected = StreamQualitySelector.selectBestAudioStream(
+                    streams = streams,
+                    speedTier = effectiveTier,
+                    allowedLoopbackOrigin = allowedOrigin,
+                    preferWebmOpus = true
+                ) ?: throw IllegalStateException("No playable audio streams returned by $displayName")
+
+                lastWorkingInstance = resp.endpointUrl
+                val title = obj.str("title") ?: track.title
+                val uploader = obj.str("uploader") ?: track.artist
+                val uploaderUrl = obj.str("uploaderUrl")?.let { normalizeYoutubeUrl(it) } ?: track.artistUrl
+                val durationSec = obj.long("duration") ?: 0L
+                val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl"), allowedOrigin) ?: track.thumbnailUrl
+                val related = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
+                    parseStreamItem(it.jsonObject)
+                }
+
+                return@withContext OnlineStreamResolution(
+                    track = track.copy(
+                        title = title,
+                        artist = uploader,
+                        artistUrl = uploaderUrl,
+                        durationMs = if (durationSec > 0L) durationSec * 1000L else track.durationMs,
+                        thumbnailUrl = thumb,
+                        isLive = obj.bool("livestream") ?: track.isLive
+                    ),
+                    streams = streams,
+                    selectedStream = selected,
+                    relatedTracks = related,
+                    resolvedBy = OnlineProviderType.PIPED,
+                    resolvedByProviderId = providerId,
+                    resolvedByLabel = displayName
+                )
+            } catch (t: Throwable) {
+                lastError = t
+                healthTracker.recordEndpointFailure(
+                    providerId = providerId,
+                    operation = OperationType.PLAYBACK,
+                    endpointUrl = epUrl,
+                    error = t.message,
+                    customCooldownMs = cooldownMs
+                )
+            }
         }
-
-        OnlineStreamResolution(
-            track = track.copy(
-                title = title,
-                artist = uploader,
-                artistUrl = uploaderUrl,
-                durationMs = if (durationSec > 0L) durationSec * 1000L else track.durationMs,
-                thumbnailUrl = thumb,
-                isLive = obj.bool("livestream") ?: track.isLive
-            ),
-            streams = streams,
-            selectedStream = selected,
-            relatedTracks = related,
-            resolvedBy = OnlineProviderType.PIPED,
-            resolvedByProviderId = providerId,
-            resolvedByLabel = displayName
-        )
+        throw lastError ?: IllegalStateException("No playable audio streams returned by $displayName")
     }
 
     override suspend fun fetchArtist(artistIdOrUrl: String): OnlineArtistPage = withContext(Dispatchers.IO) {

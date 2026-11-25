@@ -95,7 +95,7 @@ class DynamicHttpExecutor(
                         }
                         val bodyStr = InputAndUrlSecurity.readBodyBounded(resp.body)
                         if (bodyStr.isBlank() || bodyStr.trimStart().startsWith("<")) {
-                            throw IOException("Invalid or HTML response from $endpointUrl")
+                            throw InvalidResponseFormatException("Invalid or HTML response from $endpointUrl")
                         }
                         bodyStr
                     }
@@ -190,7 +190,7 @@ class DynamicHttpExecutor(
                         }
                         val str = InputAndUrlSecurity.readBodyBounded(resp.body)
                         if (str.isBlank() || str.trimStart().startsWith("<")) {
-                            throw IOException("Invalid or HTML response from $endpointUrl")
+                            throw InvalidResponseFormatException("Invalid or HTML response from $endpointUrl")
                         }
                         str
                     }
@@ -371,12 +371,14 @@ class DynamicHttpExecutor(
     private fun isTransientFailure(t: Throwable): Boolean {
         return when (t) {
             is HttpStatusException -> false
+            is InvalidResponseFormatException -> false
             is IOException -> true
             else -> false
         }
     }
 
     class HttpStatusException(val code: Int, message: String) : IOException(message)
+    class InvalidResponseFormatException(message: String) : IOException(message)
 
     companion object {
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()

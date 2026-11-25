@@ -135,75 +135,117 @@ class InvidiousProvider(
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Invidious video ID")
-        val resp = executeRawWithFallback(OperationType.PLAYBACK, "/api/v1/videos/${Uri.encode(videoId)}")
-        val instanceUrl = resp.endpointUrl
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-
-        val allowedTestOrigin = instanceUrl.takeIf { baseUrlsOverride != null }
-        val adaptive = obj["adaptiveFormats"]?.jsonArray.orEmpty()
-        val streams = adaptive.mapNotNull { item ->
-            val fmt = item.jsonObject
-            val type = fmt.str("type").orEmpty()
-            if (!type.startsWith("audio/")) return@mapNotNull null
-            val rawUrl = fmt.str("url")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val resolvedUrl = resolveInstanceMediaUrl(instanceUrl, rawUrl) ?: return@mapNotNull null
-            val bitrateBits = fmt.str("bitrate")?.toIntOrNull() ?: fmt.int("bitrate") ?: 128_000
-            val kbps = (bitrateBits / 1000).coerceAtLeast(32)
-            val container = fmt.str("container").orEmpty().ifBlank {
-                if ("webm" in type) "WEBM" else "M4A"
-            }
-            val encoding = fmt.str("encoding").orEmpty().ifBlank {
-                type.substringAfter("codecs=\"").substringBefore("\"")
-            }
-            val cleanLabel = if (encoding.contains("opus", ignoreCase = true) || type.contains("webm", ignoreCase = true)) {
-                "Opus ${kbps}k"
-            } else {
-                "${container.uppercase()} ${kbps}k"
-            }
-            OnlineAudioStream(
-                url = resolvedUrl,
-                bitrateKbps = kbps,
-                mimeType = type.substringBefore(";"),
-                codec = encoding,
-                formatLabel = cleanLabel,
-                expiresAtMs = StreamQualitySelector.parseExpiryFromUrl(resolvedUrl)
-            )
-        }
-
+        val endpoints = getEndpointConfigs(OperationType.PLAYBACK)
+        val cfg = currentConfig()
+        val endpointFailover = cfg?.endpointFailover ?: true
+        val cooldownMs = cfg?.cooldownMs ?: 60_000L
+        val orderedUrls = healthTracker.selectOrderedEndpoints(
+            providerId = providerId,
+            operation = OperationType.PLAYBACK,
+            configuredEndpoints = endpoints.map { it.url }
+        ).let { if (endpointFailover) it else it.take(1) }
+        val epByUrl = endpoints.associateBy { it.url.trimEnd('/') }
+        val path = "/api/v1/videos/${Uri.encode(videoId)}"
         val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
-        val selected = StreamQualitySelector.selectBestAudioStream(
-            streams = streams,
-            speedTier = effectiveTier,
-            allowedLoopbackOrigin = allowedTestOrigin,
-            preferWebmOpus = true
-        ) ?: throw IllegalStateException("No audio stream returned by $displayName")
 
-        val title = obj.str("title") ?: track.title
-        val author = obj.str("author") ?: track.artist
-        val authorId = obj.str("authorId") ?: track.artistId
-        val durSec = obj.long("lengthSeconds") ?: 0L
-        val thumbs = obj["videoThumbnails"]?.jsonArray
-        val thumb = pickInvidiousThumb(thumbs, instanceUrl) ?: track.thumbnailUrl
-        val related = obj["recommendedVideos"]?.jsonArray.orEmpty().mapNotNull {
-            parseRecommendedObject(it.jsonObject, instanceUrl)
+        var lastError: Throwable? = null
+        for (epUrl in orderedUrls) {
+            val epCfg = epByUrl[epUrl] ?: ProviderEndpointConfig(url = epUrl)
+            try {
+                val resp = executor.executeRawGet(
+                    providerId = providerId,
+                    operation = OperationType.PLAYBACK,
+                    configuredEndpoints = listOf(epCfg),
+                    pathAndQuery = path,
+                    headers = cfg?.headers ?: emptyMap(),
+                    timeoutMs = cfg?.timeoutMs ?: 10_000L,
+                    maxRetries = cfg?.maxRetries ?: 1,
+                    cooldownMs = cooldownMs,
+                    endpointFailover = false
+                )
+                val instanceUrl = resp.endpointUrl
+                val obj = json.parseToJsonElement(resp.body).jsonObject
+                if (!obj.str("error").isNullOrBlank()) {
+                    throw IllegalStateException(obj.str("error") ?: "Invidious stream error")
+                }
+
+                val allowedTestOrigin = instanceUrl.takeIf { baseUrlsOverride != null }
+                val adaptive = obj["adaptiveFormats"]?.jsonArray.orEmpty()
+                val streams = adaptive.mapNotNull { item ->
+                    val fmt = item.jsonObject
+                    val type = fmt.str("type").orEmpty()
+                    if (!type.startsWith("audio/")) return@mapNotNull null
+                    val rawUrl = fmt.str("url")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val resolvedUrl = resolveInstanceMediaUrl(instanceUrl, rawUrl) ?: return@mapNotNull null
+                    val bitrateBits = fmt.str("bitrate")?.toIntOrNull() ?: fmt.int("bitrate") ?: 128_000
+                    val kbps = (bitrateBits / 1000).coerceAtLeast(32)
+                    val container = fmt.str("container").orEmpty().ifBlank {
+                        if ("webm" in type) "WEBM" else "M4A"
+                    }
+                    val encoding = fmt.str("encoding").orEmpty().ifBlank {
+                        type.substringAfter("codecs=\"").substringBefore("\"")
+                    }
+                    val cleanLabel = if (encoding.contains("opus", ignoreCase = true) || type.contains("webm", ignoreCase = true)) {
+                        "Opus ${kbps}k"
+                    } else {
+                        "${container.uppercase()} ${kbps}k"
+                    }
+                    OnlineAudioStream(
+                        url = resolvedUrl,
+                        bitrateKbps = kbps,
+                        mimeType = type.substringBefore(";"),
+                        codec = encoding,
+                        formatLabel = cleanLabel,
+                        expiresAtMs = StreamQualitySelector.parseExpiryFromUrl(resolvedUrl)
+                    )
+                }
+
+                val selected = StreamQualitySelector.selectBestAudioStream(
+                    streams = streams,
+                    speedTier = effectiveTier,
+                    allowedLoopbackOrigin = allowedTestOrigin,
+                    preferWebmOpus = true
+                ) ?: throw IllegalStateException("No audio stream returned by $displayName")
+
+                lastWorkingInstance = instanceUrl
+                val title = obj.str("title") ?: track.title
+                val author = obj.str("author") ?: track.artist
+                val authorId = obj.str("authorId") ?: track.artistId
+                val durSec = obj.long("lengthSeconds") ?: 0L
+                val thumbs = obj["videoThumbnails"]?.jsonArray
+                val thumb = pickInvidiousThumb(thumbs, instanceUrl) ?: track.thumbnailUrl
+                val related = obj["recommendedVideos"]?.jsonArray.orEmpty().mapNotNull {
+                    parseRecommendedObject(it.jsonObject, instanceUrl)
+                }
+
+                return@withContext OnlineStreamResolution(
+                    track = track.copy(
+                        title = title,
+                        artist = author,
+                        artistId = authorId,
+                        artistUrl = authorId?.let { "https://www.youtube.com/channel/$it" } ?: track.artistUrl,
+                        durationMs = if (durSec > 0L) durSec * 1000L else track.durationMs,
+                        thumbnailUrl = thumb
+                    ),
+                    streams = streams,
+                    selectedStream = selected,
+                    relatedTracks = related,
+                    resolvedBy = OnlineProviderType.INVIDIOUS,
+                    resolvedByProviderId = providerId,
+                    resolvedByLabel = displayName
+                )
+            } catch (t: Throwable) {
+                lastError = t
+                healthTracker.recordEndpointFailure(
+                    providerId = providerId,
+                    operation = OperationType.PLAYBACK,
+                    endpointUrl = epUrl,
+                    error = t.message,
+                    customCooldownMs = cooldownMs
+                )
+            }
         }
-
-        OnlineStreamResolution(
-            track = track.copy(
-                title = title,
-                artist = author,
-                artistId = authorId,
-                artistUrl = authorId?.let { "https://www.youtube.com/channel/$it" } ?: track.artistUrl,
-                durationMs = if (durSec > 0L) durSec * 1000L else track.durationMs,
-                thumbnailUrl = thumb
-            ),
-            streams = streams,
-            selectedStream = selected,
-            relatedTracks = related,
-            resolvedBy = OnlineProviderType.INVIDIOUS,
-            resolvedByProviderId = providerId,
-            resolvedByLabel = displayName
-        )
+        throw lastError ?: IllegalStateException("No audio stream returned by $displayName")
     }
 
     override suspend fun fetchArtist(artistIdOrUrl: String): OnlineArtistPage = withContext(Dispatchers.IO) {

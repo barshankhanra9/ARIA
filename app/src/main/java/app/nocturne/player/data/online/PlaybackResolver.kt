@@ -102,17 +102,20 @@ class PlaybackResolver(
 
         if (eligibleIds.isEmpty()) return null
 
-        // Enforce explicit fallback order: Piped -> Invidious -> remaining healthy providers
+        // Enforce explicit fallback order: Piped -> Invidious -> YouTube (NewPipe) -> remaining healthy providers
         val pipedIds = eligibleIds.filter {
             it == "piped" || adapters[it]?.providerType == OnlineProviderType.PIPED
         }
         val invidiousIds = eligibleIds.filter {
             it == "invidious" || adapters[it]?.providerType == OnlineProviderType.INVIDIOUS
         }
+        val youtubeIds = eligibleIds.filter {
+            it == "youtube" || adapters[it]?.providerType == OnlineProviderType.YOUTUBE
+        }
         val otherIds = healthTracker.selectOrderedProviderIds(
-            eligibleIds.filter { it !in pipedIds && it !in invidiousIds }
+            eligibleIds.filter { it !in pipedIds && it !in invidiousIds && it !in youtubeIds }
         )
-        val orderedFallbacks = pipedIds + invidiousIds + otherIds
+        val orderedFallbacks = pipedIds + invidiousIds + youtubeIds + otherIds
 
         for (pid in orderedFallbacks) {
             val adapter = adapters[pid] ?: continue
@@ -192,7 +195,10 @@ class PlaybackResolver(
                 OnlineProviderType.INVIDIOUS
             )
         ) {
-            listOf("piped", "invidious", "youtube").filter { adapters.containsKey(it) }
+            val piped = adapters.filter { it.key == "piped" || it.value.providerType == OnlineProviderType.PIPED }.keys
+            val invidious = adapters.filter { it.key == "invidious" || it.value.providerType == OnlineProviderType.INVIDIOUS }.keys
+            val youtube = adapters.filter { it.key == "youtube" || it.value.providerType == OnlineProviderType.YOUTUBE }.keys
+            (piped + invidious + youtube).toList().distinct()
         } else if (adapters.containsKey(effId)) {
             listOf(effId)
         } else {
