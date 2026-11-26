@@ -244,6 +244,9 @@ class RecommendationEngine(
         val skippedIds = affinityRepository.getRecentlySkippedTrackIds()
 
         val queueIds = currentQueue.mapTo(HashSet()) { it.id }
+        val queueSourceKeys = currentQueue
+            .filter { it.sourceId.isNotBlank() }
+            .mapTo(HashSet()) { "${it.providerType.name}:${it.sourceId}" }
         val queueSignatures = currentQueue.mapTo(HashSet()) {
             AffinityRepository.trackSignature(it.title, it.artist)
         }
@@ -261,6 +264,7 @@ class RecommendationEngine(
 
         fun isEligible(track: OnlineTrack): Boolean {
             if (track.id in queueIds) return false
+            if (track.sourceId.isNotBlank() && "${track.providerType.name}:${track.sourceId}" in queueSourceKeys) return false
             if (track.id in skippedIds) return false
             val sig = AffinityRepository.trackSignature(track.title, track.artist)
             if (sig in queueSignatures) return false

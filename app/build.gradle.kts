@@ -94,16 +94,14 @@ android {
         abi {
             isEnable = true
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            include("armeabi-v7a", "arm64-v8a")
             isUniversalApk = true
         }
     }
 
     val abiVersionCodes = mapOf(
         "armeabi-v7a" to 1,
-        "arm64-v8a" to 2,
-        "x86" to 3,
-        "x86_64" to 4
+        "arm64-v8a" to 2
     )
 
     applicationVariants.all {

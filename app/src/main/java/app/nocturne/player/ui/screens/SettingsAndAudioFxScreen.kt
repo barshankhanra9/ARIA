@@ -17,41 +17,31 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Backup
-import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Equalizer
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Palette
-import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Restore
-import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Tune
-import androidx.compose.material.icons.rounded.Warning
-import androidx.compose.material.icons.rounded.WifiTethering
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -63,18 +53,14 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.nocturne.player.BuildConfig
@@ -83,14 +69,8 @@ import app.nocturne.player.data.model.AnimationIntensity
 import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.ArtworkTapAction
 import app.nocturne.player.data.model.AudioEngineTelemetry
-import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.model.PaperAccent
-import app.nocturne.player.data.model.ProviderConnectivityTestResult
-import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
-import app.nocturne.player.data.model.RemoteConfigConnectionState
-import app.nocturne.player.data.model.RemoteConfigErrorType
 import app.nocturne.player.data.model.RemoteConfigStatus
-import app.nocturne.player.data.model.RemoteConfigUrlHelper
 import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.ReplayGainMode
 import app.nocturne.player.data.model.SortField
@@ -108,9 +88,6 @@ import app.nocturne.player.ui.components.PaperFilterChip
 import app.nocturne.player.ui.components.TactilePaperButton
 import app.nocturne.player.ui.components.paperGrainBackground
 import app.nocturne.player.ui.theme.AriaPaperTheme
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import kotlin.math.roundToInt
 
 @Composable
@@ -127,26 +104,13 @@ fun SettingsScreen(
     onImportBackup: (Uri) -> Unit,
     remoteConfig: RemoteProvidersConfig = RemoteProvidersConfig.DEFAULT,
     remoteConfigStatus: RemoteConfigStatus = RemoteConfigStatus(),
-    remoteConfigConnectionState: RemoteConfigConnectionState = RemoteConfigConnectionState.Idle,
-    providerDiagnostics: List<ProviderDiagnosticsSnapshot> = emptyList(),
-    providerTestResults: Map<String, ProviderConnectivityTestResult> = emptyMap(),
-    isTestingProviders: Boolean = false,
-    isRefreshingRemoteConfig: Boolean = false,
     lastRemoteConfigError: String? = null,
-    onSaveRemoteConfigUrl: (String) -> Unit = {},
-    onTestRemoteConfigUrl: (String) -> Unit = {},
-    onRefreshRemoteConfig: (String?) -> Unit = {},
-    onClearRemoteConfigFeedback: () -> Unit = {},
-    onRollbackRemoteConfig: () -> Unit = {},
-    onTestProvider: (String) -> Unit = {},
-    onTestAllProviders: () -> Unit = {}
+    onOpenStreamingConfig: () -> Unit = {}
 ) {
     val palette = AriaPaperTheme.palette
-    val keyboard = LocalSoftwareKeyboardController.current
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showPrivacyDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
-    val syncTimeFormatter = remember { SimpleDateFormat("MMM d · HH:mm:ss", Locale.getDefault()) }
 
     val exportBackupLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json")
@@ -493,474 +457,88 @@ fun SettingsScreen(
             }
         }
 
-        // 5. REMOTE PROVIDERS & CONFIG
+        // 5. STREAMING & REMOTE CONFIG ENTRY CARD
         item {
-            SettingsCategoryCard(title = "Streaming & Remote Config", icon = Icons.Rounded.CloudSync) {
-                val activeSourceUrl = remoteConfigStatus.sourceUrl.ifBlank { settings.remoteProviderConfigUrl }
-                val sourceMeta = remember(activeSourceUrl) {
-                    RemoteConfigUrlHelper.parseSourceMetadata(activeSourceUrl)
-                }
-                val categories = remember(remoteConfigStatus.categories, remoteConfig) {
-                    remoteConfigStatus.categories.ifEmpty { remoteConfig.distinctCategories() }
-                }
-                val totalProviders = if (remoteConfig.providers.isNotEmpty()) {
-                    remoteConfig.providers.size
-                } else {
-                    remoteConfigStatus.providerCount
-                }
-                val enabledProviders = if (remoteConfig.providers.isNotEmpty()) {
-                    remoteConfig.enabledProviders().size
-                } else {
-                    remoteConfigStatus.enabledProviderCount
-                }
-                val lyricsEndpointsCount = if (remoteConfig.lrclib.isNotEmpty()) {
-                    remoteConfig.lrclib.size
-                } else {
-                    remoteConfigStatus.lyricsEndpointCount
-                }
+            val totalMusic = if (remoteConfig.providers.isNotEmpty()) {
+                remoteConfig.providers.size
+            } else {
+                remoteConfigStatus.providerCount
+            }
+            val enabledMusic = if (remoteConfig.providers.isNotEmpty()) {
+                remoteConfig.enabledProviders().size
+            } else {
+                remoteConfigStatus.enabledProviderCount
+            }
+            val resolvedLyrics = remember(remoteConfig) {
+                remoteConfig.resolvedLyricsProvidersForDiagnostics()
+            }
+            val totalLyrics = if (resolvedLyrics.isNotEmpty()) {
+                resolvedLyrics.size
+            } else {
+                remoteConfigStatus.totalLyricsProviderCount
+            }
+            val enabledLyrics = if (resolvedLyrics.isNotEmpty()) {
+                resolvedLyrics.count { it.enabled }
+            } else {
+                remoteConfigStatus.enabledLyricsProviderCount
+            }
+            val effectiveError = remoteConfigStatus.lastError?.takeIf { it.isNotBlank() }
+                ?: lastRemoteConfigError?.takeIf { it.isNotBlank() }
+            val syncLabel = when {
+                effectiveError != null -> "Sync warning"
+                remoteConfigStatus.wasNotModified304 -> "Up to date"
+                remoteConfigStatus.isFromCache -> "Cached"
+                remoteConfigStatus.lastSyncedAtMs > 0L -> "Synced"
+                else -> "Pending sync"
+            }
+            val overrideSuffix = if (remoteConfigStatus.hasLocalOverrides) " · Overridden" else ""
+            val subtitleText = "$syncLabel • $enabledMusic/$totalMusic music, $enabledLyrics/$totalLyrics lyrics$overrideSuffix"
 
-                PaperDebossedWell(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("github_config_status_card"),
-                    cornerRadius = 12.dp,
-                    contentPadding = PaddingValues(12.dp)
-                ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "GITHUB PROVIDER CONFIGURATION",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = palette.accent,
-                                modifier = Modifier.weight(1f)
-                            )
-                            val syncBadge = when {
-                                remoteConfigStatus.wasNotModified304 -> "304 UP-TO-DATE"
-                                remoteConfigStatus.isFromCache -> "CACHED"
-                                else -> "SYNCED"
-                            }
-                            InkStampTag(
-                                text = syncBadge,
-                                accented = !remoteConfigStatus.isFromCache
-                            )
-                        }
-
-                        val sourceHeadline = buildString {
-                            append(sourceMeta.repositoryDisplay)
-                            if (sourceMeta.fileName.isNotBlank()) {
-                                append(" · ")
-                                append(sourceMeta.fileName)
-                            }
-                            if (!sourceMeta.branchOrRef.isNullOrBlank()) {
-                                append(" (")
-                                append(sourceMeta.branchOrRef)
-                                append(")")
-                            }
-                        }
-                        Text(
-                            text = sourceHeadline,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold,
-                            color = palette.inkPrimary,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.testTag("remote_config_source_summary")
-                        )
-
-                        val syncTimeText = if (remoteConfigStatus.lastSyncedAtMs > 0L) {
-                            syncTimeFormatter.format(Date(remoteConfigStatus.lastSyncedAtMs))
-                        } else {
-                            "Pending initial sync"
-                        }
-                        Text(
-                            text = "Config v${remoteConfigStatus.configVersion} · Schema v${remoteConfigStatus.schemaVersion} · $syncTimeText",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = palette.inkSecondary,
-                            modifier = Modifier.testTag("remote_config_version_summary")
-                        )
-                        Text(
-                            text = "$enabledProviders/$totalProviders providers enabled · Lyrics endpoints: $lyricsEndpointsCount",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.inkPrimary,
-                            modifier = Modifier.testTag("remote_config_counts_summary")
-                        )
-
-                        if (categories.isNotEmpty()) {
-                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                Text(
-                                    text = "PROVIDER CATEGORIES",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = palette.accent
-                                )
-                                LazyRow(
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                    modifier = Modifier.testTag("remote_config_categories_row")
-                                ) {
-                                    items(categories) { category ->
-                                        InkStampTag(text = category, accented = false)
-                                    }
-                                }
-                            }
-                        }
-
-                        val effectiveError = remoteConfigStatus.lastError?.takeIf { it.isNotBlank() }
-                            ?: lastRemoteConfigError?.takeIf { it.isNotBlank() }
-                        if (effectiveError != null) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier.testTag("remote_config_status_error")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Warning,
-                                    contentDescription = "Configuration warning",
-                                    tint = palette.danger,
-                                    modifier = Modifier.size(15.dp)
-                                )
-                                val errorPrefix = if (remoteConfigStatus.lastErrorType != RemoteConfigErrorType.NONE) {
-                                    "${remoteConfigStatus.lastErrorType.label}: "
-                                } else {
-                                    ""
-                                }
-                                Text(
-                                    text = "$errorPrefix$effectiveError",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = palette.danger
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(12.dp))
-                var draftUrl by rememberSaveable { mutableStateOf(settings.remoteProviderConfigUrl) }
-                LaunchedEffect(settings.remoteProviderConfigUrl) {
-                    draftUrl = settings.remoteProviderConfigUrl
-                }
-
-                val isBusy = isRefreshingRemoteConfig ||
-                    remoteConfigConnectionState is RemoteConfigConnectionState.Testing ||
-                    remoteConfigConnectionState is RemoteConfigConnectionState.Saving
-                val hasUnsavedDraft = draftUrl.trim() != settings.remoteProviderConfigUrl.trim()
-
+            PaperCard(
+                containerColor = palette.paperElevated,
+                elevation = 3.dp,
+                cornerRadius = 16.dp,
+                contentPadding = PaddingValues(16.dp),
+                onClick = onOpenStreamingConfig,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .sizeIn(minHeight = 48.dp)
+                    .testTag("open_streaming_remote_config_card")
+            ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "PROVIDER JSON URL",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.accent
+                    Icon(
+                        imageVector = Icons.Rounded.CloudSync,
+                        contentDescription = "Streaming and Remote Config",
+                        tint = palette.accent,
+                        modifier = Modifier.size(22.dp)
                     )
-                    if (draftUrl.trim() != UserSettings.DEFAULT_REMOTE_CONFIG_URL) {
-                        TextButton(
-                            onClick = {
-                                draftUrl = UserSettings.DEFAULT_REMOTE_CONFIG_URL
-                                onClearRemoteConfigFeedback()
-                            },
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                            modifier = Modifier.testTag("remote_config_reset_default_btn")
-                        ) {
-                            Text(
-                                text = "Reset Default",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = palette.accent
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-
-                OutlinedTextField(
-                    value = draftUrl,
-                    onValueChange = { updated ->
-                        draftUrl = updated
-                        if (remoteConfigConnectionState !is RemoteConfigConnectionState.Idle) {
-                            onClearRemoteConfigFeedback()
-                        }
-                    },
-                    placeholder = {
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = UserSettings.DEFAULT_REMOTE_CONFIG_URL,
+                            text = "Streaming & Remote Config",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = palette.inkPrimary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                    },
-                    leadingIcon = {
-                        Icon(
-                            imageVector = Icons.Rounded.Link,
-                            contentDescription = null,
-                            tint = palette.accent
-                        )
-                    },
-                    trailingIcon = {
-                        if (draftUrl.isNotEmpty()) {
-                            IconButton(
-                                onClick = {
-                                    draftUrl = ""
-                                    onClearRemoteConfigFeedback()
-                                }
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Close,
-                                    contentDescription = "Clear URL",
-                                    tint = palette.inkSecondary
-                                )
-                            }
-                        }
-                    },
-                    maxLines = 3,
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Uri,
-                        imeAction = ImeAction.Done
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onDone = { keyboard?.hide() }
-                    ),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = palette.accent,
-                        unfocusedBorderColor = palette.divider,
-                        focusedContainerColor = palette.paperBackground,
-                        unfocusedContainerColor = palette.paperBackground,
-                        focusedTextColor = palette.inkPrimary,
-                        unfocusedTextColor = palette.inkPrimary
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .testTag("remote_config_url_input")
-                )
-
-                if (hasUnsavedDraft) {
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = "Edited URL is not active yet. Test Connection or Save URL to validate JSON and schema first.",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.inkSecondary,
-                        modifier = Modifier.testTag("remote_config_unsaved_hint")
-                    )
-                }
-
-                Spacer(Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    TactilePaperButton(
-                        text = if (remoteConfigConnectionState is RemoteConfigConnectionState.Saving) "Saving…" else "Save URL",
-                        icon = Icons.Rounded.Save,
-                        enabled = !isBusy && draftUrl.isNotBlank(),
-                        onClick = {
-                            keyboard?.hide()
-                            onSaveRemoteConfigUrl(draftUrl)
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("remote_config_save_url_btn")
-                    )
-                    TactilePaperButton(
-                        text = if (remoteConfigConnectionState is RemoteConfigConnectionState.Testing) "Testing…" else "Test Connection",
-                        icon = Icons.Rounded.WifiTethering,
-                        filled = false,
-                        enabled = !isBusy && draftUrl.isNotBlank(),
-                        onClick = {
-                            keyboard?.hide()
-                            onTestRemoteConfigUrl(draftUrl)
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("remote_config_test_connection_btn")
-                    )
-                }
-
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    TactilePaperButton(
-                        text = if (isRefreshingRemoteConfig) "Syncing…" else "Refresh Config",
-                        icon = Icons.Rounded.Refresh,
-                        filled = false,
-                        enabled = !isBusy,
-                        onClick = {
-                            keyboard?.hide()
-                            onRefreshRemoteConfig(null)
-                        },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("remote_config_refresh_btn")
-                    )
-                    if (remoteConfigStatus.canRollback) {
-                        TactilePaperButton(
-                            text = "Rollback",
-                            icon = Icons.Rounded.Restore,
-                            filled = false,
-                            enabled = !isBusy,
-                            onClick = onRollbackRemoteConfig,
-                            modifier = Modifier
-                                .weight(1f)
-                                .testTag("remote_config_rollback_btn")
+                        Text(
+                            text = subtitleText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (effectiveError != null) palette.danger else palette.inkSecondary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("streaming_config_entry_subtitle")
                         )
                     }
-                    TactilePaperButton(
-                        text = if (isTestingProviders) "Testing…" else "Test All",
-                        icon = Icons.Rounded.PlayArrow,
-                        filled = false,
-                        enabled = !isTestingProviders && !isBusy,
-                        onClick = onTestAllProviders,
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("remote_test_all_btn")
+                    Spacer(Modifier.width(8.dp))
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                        contentDescription = "Open Streaming & Remote Config",
+                        tint = palette.inkSecondary
                     )
-                }
-
-                if (remoteConfigConnectionState !is RemoteConfigConnectionState.Idle) {
-                    Spacer(Modifier.height(10.dp))
-                    PaperDebossedWell(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("remote_config_feedback_card"),
-                        cornerRadius = 12.dp,
-                        contentPadding = PaddingValues(12.dp)
-                    ) {
-                        when (val state = remoteConfigConnectionState) {
-                            is RemoteConfigConnectionState.Testing,
-                            is RemoteConfigConnectionState.Saving -> {
-                                val actionTitle = if (state is RemoteConfigConnectionState.Saving) {
-                                    "VALIDATING & SAVING URL…"
-                                } else {
-                                    "TESTING CONNECTION…"
-                                }
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp,
-                                        color = palette.accent
-                                    )
-                                    Column(Modifier.weight(1f)) {
-                                        Text(
-                                            text = actionTitle,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = palette.accent
-                                        )
-                                        Text(
-                                            text = "Validating URL, fetching JSON, and verifying provider schema…",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = palette.inkSecondary
-                                        )
-                                    }
-                                }
-                            }
-                            is RemoteConfigConnectionState.Success -> {
-                                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Rounded.CheckCircle,
-                                            contentDescription = "Connection valid",
-                                            tint = palette.accent,
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                        Text(
-                                            text = state.actionLabel,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            fontWeight = FontWeight.Bold,
-                                            color = palette.accent,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        InkStampTag(text = "${state.latencyMs}ms", accented = true)
-                                    }
-                                    val metaLine = buildString {
-                                        append(state.sourceMetadata.repositoryDisplay)
-                                        if (state.sourceMetadata.fileName.isNotBlank()) {
-                                            append(" · ")
-                                            append(state.sourceMetadata.fileName)
-                                        }
-                                    }
-                                    Text(
-                                        text = "$metaLine · Config v${state.configVersion} · Schema v${state.schemaVersion}",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = palette.inkPrimary
-                                    )
-                                    Text(
-                                        text = "${state.enabledProviders}/${state.totalProviders} providers enabled · Lyrics endpoints: ${state.lyricsEndpointCount}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = palette.inkSecondary
-                                    )
-                                    if (state.categories.isNotEmpty()) {
-                                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                            items(state.categories) { cat ->
-                                                InkStampTag(text = cat, accented = false)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            is RemoteConfigConnectionState.Error -> {
-                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Rounded.Warning,
-                                            contentDescription = "Connection error",
-                                            tint = palette.danger,
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                        InkStampTag(
-                                            text = state.errorType.label.ifBlank { "Error" },
-                                            accented = false
-                                        )
-                                    }
-                                    Text(
-                                        text = state.message,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = palette.danger
-                                    )
-                                    Text(
-                                        text = "Last working URL and active configuration were preserved.",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = palette.inkSecondary
-                                    )
-                                }
-                            }
-                            RemoteConfigConnectionState.Idle -> Unit
-                        }
-                    }
-                }
-
-                if (providerDiagnostics.isNotEmpty()) {
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        text = "PROVIDER & ENDPOINT DIAGNOSTICS",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.accent
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        providerDiagnostics.forEach { diag ->
-                            ProviderDiagnosticsCard(
-                                diagnostics = diag,
-                                testResult = providerTestResults[diag.providerId.lowercase()],
-                                isTesting = isTestingProviders,
-                                onTestProvider = { onTestProvider(diag.providerId) }
-                            )
-                        }
-                    }
                 }
             }
         }
@@ -1392,156 +970,4 @@ private fun SettingsSwitchRow(
             )
         )
     }
-}
-
-@Composable
-private fun ProviderDiagnosticsCard(
-    diagnostics: ProviderDiagnosticsSnapshot,
-    testResult: ProviderConnectivityTestResult?,
-    isTesting: Boolean,
-    onTestProvider: () -> Unit
-) {
-    val palette = AriaPaperTheme.palette
-    val maxCooldownMs = diagnostics.operationHealth.values
-        .flatten()
-        .maxOfOrNull { it.cooldownRemainingMs } ?: 0L
-    val healthLabel = when {
-        !diagnostics.enabled -> "DISABLED"
-        !diagnostics.isAvailable && maxCooldownMs > 0L -> "COOLDOWN ${(maxCooldownMs / 1000L).coerceAtLeast(1L)}s"
-        !diagnostics.isAvailable -> "UNAVAILABLE"
-        else -> "HEALTHY"
-    }
-
-    PaperDebossedWell(
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("provider_diag_card_${diagnostics.providerId}"),
-        cornerRadius = 12.dp,
-        contentPadding = PaddingValues(10.dp)
-    ) {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        text = diagnostics.displayName,
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = palette.inkPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "${diagnostics.providerId} · ${diagnostics.adapterType} · Priority #${diagnostics.priority}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.inkSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                Spacer(Modifier.width(8.dp))
-                InkStampTag(
-                    text = healthLabel,
-                    accented = diagnostics.enabled && diagnostics.isAvailable
-                )
-            }
-
-            val activeHosts = buildList {
-                diagnostics.activeSearchEndpoint?.let { add("Search: ${compactHostLabel(it)}") }
-                diagnostics.activeMetadataEndpoint?.let { add("Meta: ${compactHostLabel(it)}") }
-                diagnostics.activePlaybackEndpoint?.let { add("Stream: ${compactHostLabel(it)}") }
-            }
-            if (activeHosts.isNotEmpty()) {
-                Text(
-                    text = activeHosts.joinToString(" · "),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = palette.inkPrimary
-                )
-            }
-
-            diagnostics.operationHealth.entries.forEach { (op, endpoints) ->
-                if (endpoints.isNotEmpty()) {
-                    Text(
-                        text = op.label.uppercase(),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.accent
-                    )
-                    endpoints.forEach { ep ->
-                        val statusPart = when {
-                            ep.cooldownRemainingMs > 0L -> "Cooldown ${(ep.cooldownRemainingMs / 1000L).coerceAtLeast(1L)}s"
-                            ep.consecutiveFailures > 0 -> "Fails ${ep.consecutiveFailures}"
-                            else -> "OK"
-                        }
-                        val latencyPart = if (ep.ewmaLatencyMs > 0L) " · ${ep.ewmaLatencyMs}ms" else ""
-                        Text(
-                            text = "• [P${ep.priority}] ${compactHostLabel(ep.url)} · $statusPart$latencyPart",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (ep.isHealthy) palette.inkPrimary else palette.danger,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        if (!ep.lastError.isNullOrBlank()) {
-                            Text(
-                                text = "  ${ep.lastError}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = palette.inkSecondary,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (testResult != null) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Icon(
-                        imageVector = if (testResult.success) Icons.Rounded.CheckCircle else Icons.Rounded.Warning,
-                        contentDescription = null,
-                        tint = if (testResult.success) palette.accent else palette.danger,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Text(
-                        text = buildString {
-                            append(if (testResult.success) "Reachable (${testResult.latencyMs}ms)" else "Test failed")
-                            testResult.testedEndpoint?.let { append(" · ${compactHostLabel(it)}") }
-                            if (testResult.failoverAttempts > 0) append(" · ${testResult.failoverAttempts} failover(s)")
-                            testResult.errorSummary?.let { append(" · $it") }
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (testResult.success) palette.inkPrimary else palette.danger
-                    )
-                }
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
-            ) {
-                TextButton(
-                    onClick = onTestProvider,
-                    enabled = !isTesting && diagnostics.enabled,
-                    modifier = Modifier.testTag("test_provider_btn_${diagnostics.providerId}")
-                ) {
-                    Text(
-                        text = "Test ${diagnostics.displayName}",
-                        color = if (diagnostics.enabled) palette.accent else palette.inkTertiary
-                    )
-                }
-            }
-        }
-    }
-}
-
-private fun compactHostLabel(rawUrl: String): String {
-    return runCatching {
-        val parsed = Uri.parse(rawUrl)
-        parsed.host?.takeIf { it.isNotBlank() } ?: rawUrl
-    }.getOrDefault(rawUrl)
 }

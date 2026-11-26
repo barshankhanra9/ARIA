@@ -3,6 +3,7 @@ package app.nocturne.player.data.online
 import app.nocturne.player.data.model.DynamicLyricsProviderConfig
 import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.LyricsCleaningConfig
+import app.nocturne.player.data.model.ProviderLocalOverride
 import app.nocturne.player.data.model.RemoteConfigErrorType
 import app.nocturne.player.data.model.RemoteConfigStatus
 import app.nocturne.player.data.model.RemoteProvidersConfig
@@ -15,6 +16,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -54,6 +57,15 @@ class RemoteConfigRepository(
         .writeTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .callTimeout(TIMEOUT_SECONDS, TimeUnit.SECONDS)
         .build()
+
+    @Volatile
+    private var rawActiveConfig: RemoteProvidersConfig = RemoteProvidersConfig.DEFAULT
+    @Volatile
+    private var rawPreviousConfig: RemoteProvidersConfig? = null
+    @Volatile
+    private var musicOverridesCache: Map<String, ProviderLocalOverride> = emptyMap()
+    @Volatile
+    private var lyricsOverridesCache: Map<String, ProviderLocalOverride> = emptyMap()
 
     private val _activeConfig = MutableStateFlow(RemoteProvidersConfig.DEFAULT)
     val activeConfig: StateFlow<RemoteProvidersConfig> = _activeConfig.asStateFlow()
@@ -99,25 +111,34 @@ class RemoteConfigRepository(
         val (etag, lastModified, lastSyncMs) = runCatching {
             settingsRepository.getRemoteConfigHttpMetadata()
         }.getOrDefault(Triple(null, null, 0L))
-        val configuredUrl = resolveConfiguredUrl()
+        val settings = runCatching { settingsRepository.getSettingsOnce() }.getOrDefault(UserSettings())
+        val configuredUrl = settings.remoteProviderConfigUrl.trim().let {
+            if (it == UserSettings.LEGACY_REMOTE_CONFIG_URL || it.isBlank()) UserSettings.DEFAULT_REMOTE_CONFIG_URL else it
+        }
 
-        val sanitizedActive = cached?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
+        val sanitizedRaw = cached?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
             ?: RemoteProvidersConfig.DEFAULT
-        val sanitizedPrev = prev?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
+        val sanitizedPrevRaw = prev?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
 
         configMutex.withLock {
             if (stateUpdatedExplicitly.get()) return
-            _activeConfig.value = sanitizedActive
-            _previousConfig.value = sanitizedPrev
+            musicOverridesCache = settings.musicProviderOverrides
+            lyricsOverridesCache = settings.lyricsProviderOverrides
+            rawActiveConfig = sanitizedRaw
+            rawPreviousConfig = sanitizedPrevRaw
+            val effectiveActive = applyLocalOverrides(sanitizedRaw, musicOverridesCache, lyricsOverridesCache)
+            val effectivePrev = sanitizedPrevRaw?.let { applyLocalOverrides(it, musicOverridesCache, lyricsOverridesCache) }
+            _activeConfig.value = effectiveActive
+            _previousConfig.value = effectivePrev
             if (lastSyncMs > 0L) {
                 lastRefreshMs.set(lastSyncMs)
             }
             updateStatus(
-                config = sanitizedActive,
-                previous = sanitizedPrev,
-                etag = etag ?: sanitizedActive.etag,
-                lastModified = lastModified ?: sanitizedActive.lastModified,
-                lastSyncedAtMs = lastSyncMs.takeIf { it > 0L } ?: sanitizedActive.updatedAtMs,
+                config = effectiveActive,
+                previous = effectivePrev,
+                etag = etag ?: sanitizedRaw.etag,
+                lastModified = lastModified ?: sanitizedRaw.lastModified,
+                lastSyncedAtMs = lastSyncMs.takeIf { it > 0L } ?: sanitizedRaw.updatedAtMs,
                 isFromCache = cached != null,
                 was304 = false,
                 error = _lastFetchError.value,
@@ -156,6 +177,15 @@ class RemoteConfigRepository(
     fun providerDefaults(): app.nocturne.player.data.model.ProviderDefaultsConfig = _activeConfig.value.providerDefaults
 
     fun enabledProviders(): List<DynamicProviderConfig> = _activeConfig.value.enabledProviders()
+
+    fun hasMusicProviderOverride(providerId: String): Boolean =
+        musicOverridesCache.containsKey(providerId.lowercase())
+
+    fun hasLyricsProviderOverride(providerId: String): Boolean =
+        lyricsOverridesCache.containsKey(providerId.lowercase())
+
+    fun hasAnyLocalOverrides(): Boolean =
+        musicOverridesCache.isNotEmpty() || lyricsOverridesCache.isNotEmpty()
 
     fun triggerStartupRefreshIfNeeded() {
         if (startupTriggered.compareAndSet(false, true)) {
@@ -217,7 +247,10 @@ class RemoteConfigRepository(
         }
     }
 
-    suspend fun saveAndActivateUrl(candidateUrl: String): ConfigOperationResult = withContext(Dispatchers.IO) {
+    suspend fun saveAndActivateUrl(
+        candidateUrl: String,
+        resetOverrides: Boolean = false
+    ): ConfigOperationResult = withContext(Dispatchers.IO) {
         _isRefreshing.value = true
         try {
             val result = testConnection(candidateUrl)
@@ -225,28 +258,46 @@ class RemoteConfigRepository(
                 return@withContext result
             }
             val now = System.currentTimeMillis()
-            val fetched = result.config
+            val fetchedRaw = result.config
             configMutex.withLock {
                 stateUpdatedExplicitly.set(true)
                 lastRefreshMs.set(now)
-                settingsRepository.updateSettings { it.copy(remoteProviderConfigUrl = result.url) }
-                settingsRepository.saveRemoteProvidersConfig(fetched, sourceUrl = result.url)
+                if (resetOverrides) {
+                    musicOverridesCache = emptyMap()
+                    lyricsOverridesCache = emptyMap()
+                }
+                settingsRepository.updateSettings { cur ->
+                    val withUrl = cur.copy(remoteProviderConfigUrl = result.url)
+                    if (resetOverrides) {
+                        withUrl.copy(
+                            musicProviderOverrides = emptyMap(),
+                            lyricsProviderOverrides = emptyMap()
+                        )
+                    } else {
+                        withUrl
+                    }
+                }
+                settingsRepository.saveRemoteProvidersConfig(fetchedRaw, sourceUrl = result.url)
                 settingsRepository.saveRemoteConfigHttpMetadata(
-                    etag = fetched.etag,
-                    lastModified = fetched.lastModified,
-                    syncedAtMs = fetched.updatedAtMs,
+                    etag = fetchedRaw.etag,
+                    lastModified = fetchedRaw.lastModified,
+                    syncedAtMs = fetchedRaw.updatedAtMs,
                     sourceUrl = result.url
                 )
-                val newPrev = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
-                _activeConfig.value = fetched
-                _previousConfig.value = newPrev
+                val newPrevRaw = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
+                rawActiveConfig = fetchedRaw
+                rawPreviousConfig = newPrevRaw
+                val effective = applyLocalOverrides(fetchedRaw, musicOverridesCache, lyricsOverridesCache)
+                val effectivePrev = newPrevRaw?.let { applyLocalOverrides(it, musicOverridesCache, lyricsOverridesCache) }
+                _activeConfig.value = effective
+                _previousConfig.value = effectivePrev
                 _lastFetchError.value = null
                 updateStatus(
-                    config = fetched,
-                    previous = newPrev,
-                    etag = fetched.etag,
-                    lastModified = fetched.lastModified,
-                    lastSyncedAtMs = fetched.updatedAtMs,
+                    config = effective,
+                    previous = effectivePrev,
+                    etag = fetchedRaw.etag,
+                    lastModified = fetchedRaw.lastModified,
+                    lastSyncedAtMs = fetchedRaw.updatedAtMs,
                     isFromCache = false,
                     was304 = false,
                     error = null,
@@ -262,24 +313,48 @@ class RemoteConfigRepository(
 
     suspend fun refreshNow(
         customUrl: String? = null,
-        force: Boolean = true
+        force: Boolean = true,
+        resetOverrides: Boolean = false
     ): RemoteProvidersConfig = withContext(Dispatchers.IO) {
         _isRefreshing.value = true
         _lastFetchError.value = null
 
-        val cached = runCatching { settingsRepository.getCachedRemoteProvidersConfig() }.getOrNull()
-        val prevCached = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
+        if (resetOverrides) {
+            configMutex.withLock {
+                musicOverridesCache = emptyMap()
+                lyricsOverridesCache = emptyMap()
+                settingsRepository.updateSettings {
+                    it.copy(
+                        musicProviderOverrides = emptyMap(),
+                        lyricsProviderOverrides = emptyMap()
+                    )
+                }
+            }
+        }
+
+        val cachedRaw = runCatching { settingsRepository.getCachedRemoteProvidersConfig() }.getOrNull()
+        val prevCachedRaw = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
         val (cachedEtag, cachedLastMod, cachedSyncMs) = runCatching {
             settingsRepository.getRemoteConfigHttpMetadata()
         }.getOrDefault(Triple(null, null, 0L))
         val cachedMetaUrl = runCatching { settingsRepository.getRemoteConfigMetadataSourceUrl() }.getOrNull()
 
-        val baseline = cached?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
-            ?: _activeConfig.value
-        if (cached != null && _activeConfig.value != baseline) {
+        val rawBaseline = cachedRaw?.let { RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback) }
+            ?: rawActiveConfig
+        val baseline = applyLocalOverrides(rawBaseline, musicOverridesCache, lyricsOverridesCache)
+        val effectivePrev = prevCachedRaw?.let {
+            applyLocalOverrides(
+                RemoteConfigValidator.sanitizePersistedConfig(it, allowTestLoopback),
+                musicOverridesCache,
+                lyricsOverridesCache
+            )
+        }
+        rawActiveConfig = rawBaseline
+        rawPreviousConfig = prevCachedRaw
+        if (cachedRaw != null && _activeConfig.value != baseline) {
             _activeConfig.value = baseline
         }
-        _previousConfig.value = prevCached
+        _previousConfig.value = effectivePrev
 
         val configuredUrl = resolveConfiguredUrl()
         val rawTargetUrl = (customUrl ?: configuredUrl).trim()
@@ -291,11 +366,11 @@ class RemoteConfigRepository(
                 _isRefreshing.value = false
                 updateStatus(
                     config = baseline,
-                    previous = prevCached,
+                    previous = effectivePrev,
                     etag = cachedEtag,
                     lastModified = cachedLastMod,
                     lastSyncedAtMs = cachedSyncMs,
-                    isFromCache = cached != null,
+                    isFromCache = cachedRaw != null,
                     was304 = false,
                     error = urlCheck.reason,
                     errorType = RemoteConfigErrorType.URL_ERROR,
@@ -319,8 +394,8 @@ class RemoteConfigRepository(
         return@withContext try {
             when (val result = fetchAndValidateConfig(
                 url = targetUrl,
-                currentEtag = if (canUseConditionalHeaders) (cachedEtag ?: baseline.etag) else null,
-                currentLastModified = if (canUseConditionalHeaders) (cachedLastMod ?: baseline.lastModified) else null
+                currentEtag = if (canUseConditionalHeaders) (cachedEtag ?: rawBaseline.etag) else null,
+                currentLastModified = if (canUseConditionalHeaders) (cachedLastMod ?: rawBaseline.lastModified) else null
             )) {
                 is FetchOutcome.NotModified -> {
                     settingsRepository.saveRemoteConfigHttpMetadata(
@@ -333,7 +408,7 @@ class RemoteConfigRepository(
                     _isRefreshing.value = false
                     updateStatus(
                         config = baseline,
-                        previous = prevCached,
+                        previous = effectivePrev,
                         etag = result.etag ?: cachedEtag,
                         lastModified = result.lastModified ?: cachedLastMod,
                         lastSyncedAtMs = now,
@@ -346,21 +421,26 @@ class RemoteConfigRepository(
                     baseline
                 }
                 is FetchOutcome.Updated -> {
-                    val fetched = result.config
+                    val fetchedRaw = result.config
+                    var resolvedEffective = fetchedRaw
                     configMutex.withLock {
                         stateUpdatedExplicitly.set(true)
-                        settingsRepository.saveRemoteProvidersConfig(fetched, sourceUrl = targetUrl)
-                        val newPrev = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
-                        _activeConfig.value = fetched
-                        _previousConfig.value = newPrev
+                        settingsRepository.saveRemoteProvidersConfig(fetchedRaw, sourceUrl = targetUrl)
+                        val newPrevRaw = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
+                        rawActiveConfig = fetchedRaw
+                        rawPreviousConfig = newPrevRaw
+                        resolvedEffective = applyLocalOverrides(fetchedRaw, musicOverridesCache, lyricsOverridesCache)
+                        val resolvedPrev = newPrevRaw?.let { applyLocalOverrides(it, musicOverridesCache, lyricsOverridesCache) }
+                        _activeConfig.value = resolvedEffective
+                        _previousConfig.value = resolvedPrev
                         _lastFetchError.value = null
                         _isRefreshing.value = false
                         updateStatus(
-                            config = fetched,
-                            previous = newPrev,
-                            etag = fetched.etag,
-                            lastModified = fetched.lastModified,
-                            lastSyncedAtMs = fetched.updatedAtMs,
+                            config = resolvedEffective,
+                            previous = resolvedPrev,
+                            etag = fetchedRaw.etag,
+                            lastModified = fetchedRaw.lastModified,
+                            lastSyncedAtMs = fetchedRaw.updatedAtMs,
                             isFromCache = false,
                             was304 = false,
                             error = null,
@@ -368,7 +448,7 @@ class RemoteConfigRepository(
                             sourceUrl = targetUrl
                         )
                     }
-                    fetched
+                    resolvedEffective
                 }
             }
         } catch (t: Throwable) {
@@ -377,11 +457,11 @@ class RemoteConfigRepository(
             _isRefreshing.value = false
             updateStatus(
                 config = baseline,
-                previous = prevCached,
+                previous = effectivePrev,
                 etag = cachedEtag,
                 lastModified = cachedLastMod,
                 lastSyncedAtMs = cachedSyncMs,
-                isFromCache = cached != null,
+                isFromCache = cachedRaw != null,
                 was304 = false,
                 error = safeErr,
                 errorType = errType,
@@ -396,25 +476,243 @@ class RemoteConfigRepository(
         configMutex.withLock {
             stateUpdatedExplicitly.set(true)
             val restored = settingsRepository.rollbackRemoteProvidersConfig() ?: return@withContext null
-            val sanitized = RemoteConfigValidator.sanitizePersistedConfig(restored, allowTestLoopback)
-            val newPrev = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
-            _activeConfig.value = sanitized
-            _previousConfig.value = newPrev
+            val sanitizedRaw = RemoteConfigValidator.sanitizePersistedConfig(restored, allowTestLoopback)
+            val newPrevRaw = runCatching { settingsRepository.getPreviousRemoteProvidersConfig() }.getOrNull()
+            rawActiveConfig = sanitizedRaw
+            rawPreviousConfig = newPrevRaw
+            val effective = applyLocalOverrides(sanitizedRaw, musicOverridesCache, lyricsOverridesCache)
+            val effectivePrev = newPrevRaw?.let { applyLocalOverrides(it, musicOverridesCache, lyricsOverridesCache) }
+            _activeConfig.value = effective
+            _previousConfig.value = effectivePrev
             _lastFetchError.value = null
             updateStatus(
-                config = sanitized,
-                previous = newPrev,
-                etag = sanitized.etag,
-                lastModified = sanitized.lastModified,
-                lastSyncedAtMs = sanitized.updatedAtMs,
+                config = effective,
+                previous = effectivePrev,
+                etag = sanitizedRaw.etag,
+                lastModified = sanitizedRaw.lastModified,
+                lastSyncedAtMs = sanitizedRaw.updatedAtMs,
                 isFromCache = true,
                 was304 = false,
                 error = null,
                 errorType = RemoteConfigErrorType.NONE,
                 sourceUrl = configuredUrl
             )
-            sanitized
+            effective
         }
+    }
+
+    suspend fun toggleMusicProviderEnabled(providerId: String) = withContext(Dispatchers.IO) {
+        val key = providerId.trim().lowercase()
+        if (key.isBlank()) return@withContext
+        configMutex.withLock {
+            stateUpdatedExplicitly.set(true)
+            val currentEffective = _activeConfig.value.providerById(key) ?: return@withContext
+            val rawMatch = rawActiveConfig.providerById(key)
+            val newEnabled = !currentEffective.enabled
+            val updatedMap = musicOverridesCache.toMutableMap()
+            val prevOv = updatedMap[key]
+            val candidateOv = ProviderLocalOverride(
+                enabled = if (rawMatch != null && newEnabled == rawMatch.enabled) null else newEnabled,
+                priority = prevOv?.priority
+            )
+            if (candidateOv.enabled == null && candidateOv.priority == null) {
+                updatedMap.remove(key)
+            } else {
+                updatedMap[key] = candidateOv
+            }
+            persistAndApplyOverridesLocked(musicOv = updatedMap, lyricsOv = lyricsOverridesCache)
+        }
+    }
+
+    suspend fun moveMusicProviderPriority(providerId: String, delta: Int) = withContext(Dispatchers.IO) {
+        val key = providerId.trim().lowercase()
+        if (key.isBlank() || delta == 0) return@withContext
+        configMutex.withLock {
+            stateUpdatedExplicitly.set(true)
+            val ordered = _activeConfig.value.providers.sortedBy { it.priority }.toMutableList()
+            val idx = ordered.indexOfFirst { it.id.equals(key, ignoreCase = true) }
+            if (idx < 0) return@withContext
+            val targetIdx = (idx + if (delta < 0) -1 else 1).coerceIn(0, ordered.lastIndex)
+            if (targetIdx == idx) return@withContext
+            val moved = ordered.removeAt(idx)
+            ordered.add(targetIdx, moved)
+
+            val updatedMap = musicOverridesCache.toMutableMap()
+            ordered.forEachIndexed { position, cfg ->
+                val cid = cfg.id.lowercase()
+                val normalizedPriority = (position + 1) * 10
+                val prevOv = updatedMap[cid]
+                updatedMap[cid] = ProviderLocalOverride(
+                    enabled = prevOv?.enabled,
+                    priority = normalizedPriority
+                )
+            }
+            persistAndApplyOverridesLocked(musicOv = updatedMap, lyricsOv = lyricsOverridesCache)
+        }
+    }
+
+    suspend fun toggleLyricsProviderEnabled(providerId: String) = withContext(Dispatchers.IO) {
+        val key = providerId.trim().lowercase()
+        if (key.isBlank()) return@withContext
+        configMutex.withLock {
+            stateUpdatedExplicitly.set(true)
+            val currentList = _activeConfig.value.resolvedLyricsProvidersForDiagnostics()
+            val currentEffective = currentList.firstOrNull { it.id.equals(key, ignoreCase = true) }
+                ?: return@withContext
+            val rawMatch = rawActiveConfig.resolvedLyricsProvidersForDiagnostics()
+                .firstOrNull { it.id.equals(key, ignoreCase = true) }
+            val newEnabled = !currentEffective.enabled
+            val updatedMap = lyricsOverridesCache.toMutableMap()
+            val prevOv = updatedMap[key]
+            val isExplicitRemote = rawActiveConfig.lyricsProviders.any { it.id.equals(key, ignoreCase = true) }
+            val candidateOv = ProviderLocalOverride(
+                enabled = if (isExplicitRemote && rawMatch != null && newEnabled == rawMatch.enabled) null else newEnabled,
+                priority = prevOv?.priority
+            )
+            if (candidateOv.enabled == null && candidateOv.priority == null) {
+                updatedMap.remove(key)
+            } else {
+                updatedMap[key] = candidateOv
+            }
+            persistAndApplyOverridesLocked(musicOv = musicOverridesCache, lyricsOv = updatedMap)
+        }
+    }
+
+    suspend fun moveLyricsProviderPriority(providerId: String, delta: Int) = withContext(Dispatchers.IO) {
+        val key = providerId.trim().lowercase()
+        if (key.isBlank() || delta == 0) return@withContext
+        configMutex.withLock {
+            stateUpdatedExplicitly.set(true)
+            val ordered = _activeConfig.value.resolvedLyricsProvidersForDiagnostics().toMutableList()
+            val idx = ordered.indexOfFirst { it.id.equals(key, ignoreCase = true) }
+            if (idx < 0) return@withContext
+            val targetIdx = (idx + if (delta < 0) -1 else 1).coerceIn(0, ordered.lastIndex)
+            if (targetIdx == idx) return@withContext
+            val moved = ordered.removeAt(idx)
+            ordered.add(targetIdx, moved)
+
+            val updatedMap = lyricsOverridesCache.toMutableMap()
+            ordered.forEachIndexed { position, cfg ->
+                val cid = cfg.id.lowercase()
+                val normalizedPriority = (position + 1) * 10
+                val prevOv = updatedMap[cid]
+                updatedMap[cid] = ProviderLocalOverride(
+                    enabled = prevOv?.enabled,
+                    priority = normalizedPriority
+                )
+            }
+            persistAndApplyOverridesLocked(musicOv = musicOverridesCache, lyricsOv = updatedMap)
+        }
+    }
+
+    suspend fun resetProviderOverrides() = withContext(Dispatchers.IO) {
+        configMutex.withLock {
+            stateUpdatedExplicitly.set(true)
+            persistAndApplyOverridesLocked(musicOv = emptyMap(), lyricsOv = emptyMap())
+        }
+    }
+
+    private suspend fun persistAndApplyOverridesLocked(
+        musicOv: Map<String, ProviderLocalOverride>,
+        lyricsOv: Map<String, ProviderLocalOverride>
+    ) {
+        musicOverridesCache = musicOv
+        lyricsOverridesCache = lyricsOv
+        settingsRepository.updateSettings {
+            it.copy(
+                musicProviderOverrides = musicOv,
+                lyricsProviderOverrides = lyricsOv
+            )
+        }
+        val effective = applyLocalOverrides(rawActiveConfig, musicOv, lyricsOv)
+        val effectivePrev = rawPreviousConfig?.let { applyLocalOverrides(it, musicOv, lyricsOv) }
+        _activeConfig.value = effective
+        _previousConfig.value = effectivePrev
+        val curStatus = _status.value
+        updateStatus(
+            config = effective,
+            previous = effectivePrev,
+            etag = curStatus.etag,
+            lastModified = curStatus.lastModified,
+            lastSyncedAtMs = curStatus.lastSyncedAtMs,
+            isFromCache = curStatus.isFromCache,
+            was304 = curStatus.wasNotModified304,
+            error = curStatus.lastError,
+            errorType = curStatus.lastErrorType,
+            sourceUrl = curStatus.sourceUrl
+        )
+    }
+
+    private fun applyLocalOverrides(
+        raw: RemoteProvidersConfig,
+        musicOverrides: Map<String, ProviderLocalOverride>,
+        lyricsOverrides: Map<String, ProviderLocalOverride>
+    ): RemoteProvidersConfig {
+        if (musicOverrides.isEmpty() && lyricsOverrides.isEmpty()) return raw
+
+        val overriddenProviders = raw.providers.mapIndexed { idx, prov ->
+            val ov = musicOverrides[prov.id.lowercase()]
+            val next = if (ov != null) {
+                prov.copy(
+                    enabled = ov.enabled ?: prov.enabled,
+                    priority = ov.priority ?: prov.priority
+                )
+            } else {
+                prov
+            }
+            idx to next
+        }.sortedWith(compareBy({ it.second.priority }, { it.first })).map { it.second }
+
+        val baseLyrics = raw.lyricsProviders.toMutableList()
+        val hasSaavnLyricsOv = lyricsOverrides.containsKey("jiosaavn_lyrics")
+        val hasExplicitSaavn = baseLyrics.any {
+            it.id.equals("jiosaavn_lyrics", ignoreCase = true) ||
+                it.id.equals("jiosaavnlyrics", ignoreCase = true) ||
+                it.adapterType.equals("jiosaavn_lyrics", ignoreCase = true) ||
+                it.id.equals("jiosaavn", ignoreCase = true)
+        }
+        if (hasSaavnLyricsOv && !hasExplicitSaavn) {
+            val saavnMusic = overriddenProviders.firstOrNull {
+                it.id.equals("jiosaavn", ignoreCase = true) || it.adapterType.equals("jiosaavn", ignoreCase = true)
+            }
+            if (saavnMusic != null) {
+                baseLyrics += DynamicLyricsProviderConfig(
+                    id = "jiosaavn_lyrics",
+                    displayName = "${saavnMusic.displayName} Lyrics",
+                    category = "lyrics",
+                    adapterType = "jiosaavn_lyrics",
+                    enabled = saavnMusic.enabled,
+                    priority = saavnMusic.priority,
+                    capabilities = saavnMusic.capabilities,
+                    endpoints = saavnMusic.endpoints,
+                    instances = saavnMusic.baseUrls(),
+                    timeoutMs = saavnMusic.timeoutMs,
+                    maxRetries = saavnMusic.maxRetries,
+                    cooldownMs = saavnMusic.cooldownMs,
+                    endpointFailover = saavnMusic.endpointFailover,
+                    headers = saavnMusic.headers,
+                    params = saavnMusic.params
+                )
+            }
+        }
+
+        val overriddenLyrics = baseLyrics.mapIndexed { idx, lp ->
+            val ov = lyricsOverrides[lp.id.lowercase()]
+            val next = if (ov != null) {
+                lp.copy(
+                    enabled = ov.enabled ?: lp.enabled,
+                    priority = ov.priority ?: lp.priority
+                )
+            } else {
+                lp
+            }
+            idx to next
+        }.sortedWith(compareBy({ it.second.priority }, { it.first })).map { it.second }
+
+        return raw.copy(
+            providers = overriddenProviders,
+            lyricsProviders = overriddenLyrics
+        )
     }
 
     internal sealed interface FetchOutcome {
@@ -517,6 +815,7 @@ class RemoteConfigRepository(
         errorType: RemoteConfigErrorType = RemoteConfigErrorType.NONE,
         sourceUrl: String = _status.value.sourceUrl
     ) {
+        val resolvedLyrics = config.resolvedLyricsProvidersForDiagnostics()
         _status.value = RemoteConfigStatus(
             sourceUrl = sourceUrl,
             schemaVersion = config.schemaVersion,
@@ -531,6 +830,9 @@ class RemoteConfigRepository(
             providerCount = config.providers.size,
             enabledProviderCount = config.providers.count { it.enabled },
             lyricsEndpointCount = config.lrclib.size,
+            totalLyricsProviderCount = resolvedLyrics.size,
+            enabledLyricsProviderCount = resolvedLyrics.count { it.enabled },
+            hasLocalOverrides = musicOverridesCache.isNotEmpty() || lyricsOverridesCache.isNotEmpty(),
             categories = config.distinctCategories(),
             lastError = error,
             lastErrorType = errorType

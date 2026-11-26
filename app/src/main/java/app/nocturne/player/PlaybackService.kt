@@ -36,6 +36,7 @@ import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionResult
 import app.nocturne.player.data.audio.LyricsRepository
+import app.nocturne.player.data.audio.MetadataCleaner
 import app.nocturne.player.data.audio.TagAndLyricsEngine
 import app.nocturne.player.data.db.AriaDatabase
 import app.nocturne.player.data.model.OnlineProviderType
@@ -857,15 +858,33 @@ class PlaybackService : MediaLibraryService() {
                     )
                 }.getOrDefault(emptyList())
 
-                if (related.isNotEmpty() && ::onlinePlayer.isInitialized) {
+                val existingTracks = if (::onlinePlayer.isInitialized) {
+                    (0 until onlinePlayer.mediaItemCount).mapNotNull { i ->
+                        onlineTrackMap[onlinePlayer.getMediaItemAt(i).mediaId]
+                    }
+                } else emptyList()
+                val existingIds = existingTracks.mapTo(HashSet()) { it.id }
+                val existingSourceKeys = existingTracks
+                    .filter { it.sourceId.isNotBlank() }
+                    .mapTo(HashSet()) { "${it.providerType.name}:${it.sourceId}" }
+                val existingSignatures = existingTracks.mapTo(HashSet()) {
+                    MetadataCleaner.strictTrackDedupKey(it.title, it.artist)
+                }
+                val filteredRelated = OnlineProviderManager.deduplicateTracks(related).filterNot { cand ->
+                    cand.id in existingIds ||
+                        (cand.sourceId.isNotBlank() && "${cand.providerType.name}:${cand.sourceId}" in existingSourceKeys) ||
+                        MetadataCleaner.strictTrackDedupKey(cand.title, cand.artist) in existingSignatures
+                }
+
+                if (filteredRelated.isNotEmpty() && ::onlinePlayer.isInitialized) {
                     val insertIndex = onlinePlayer.mediaItemCount
-                    related.forEach { onlineTrackMap[it.id] = it }
-                    val newItems = related.map { buildOnlineMediaItem(it) }
+                    filteredRelated.forEach { onlineTrackMap[it.id] = it }
+                    val newItems = filteredRelated.map { buildOnlineMediaItem(it) }
                     onlinePlayer.addMediaItems(newItems)
                     PlaybackRuntimeBus.updateOnlineSnapshot {
                         it.copy(
                             isRadioLoading = false,
-                            radioAppendedCount = it.radioAppendedCount + related.size
+                            radioAppendedCount = it.radioAppendedCount + filteredRelated.size
                         )
                     }
                     if (pendingRadioAutoAdvance && insertIndex in 0 until onlinePlayer.mediaItemCount) {
@@ -1296,6 +1315,90 @@ class PlaybackService : MediaLibraryService() {
                 syncOnlineSnapshot()
                 startOnlineProgressLoop()
                 saveOnlineQueueStateAsync()
+            }
+        }
+
+        override fun playSingleTrackForRadio(track: OnlineTrack) {
+            serviceScope.launch {
+                pendingRadioAutoAdvance = false
+                radioFetchJob?.cancel()
+                // Guard against maybeTriggerInfiniteRadio double-firing before coordinator radio tracks arrive
+                lastRadioSeedKey = "${track.id}:1"
+                onlineTrackMap[track.id] = track
+                preloadLyricsForOnlineTrack(track)
+                val item = buildOnlineMediaItem(track)
+                activateEngine(ActiveAudioEngine.ONLINE, pauseOther = true)
+                onlinePlayer.shuffleModeEnabled = false
+                onlinePlayer.setMediaItems(listOf(item), 0, 0L)
+                onlinePlayer.prepare()
+                onlinePlayer.play()
+                PlaybackRuntimeBus.updateOnlineSnapshot {
+                    it.copy(
+                        isRadioLoading = true,
+                        radioAppendedCount = 0,
+                        relatedTracks = emptyList()
+                    )
+                }
+                syncOnlineSnapshot()
+                startOnlineProgressLoop()
+                saveOnlineQueueStateAsync()
+            }
+        }
+
+        override fun appendRadioTracksIfSeedActive(seedTrackId: String, tracks: List<OnlineTrack>) {
+            serviceScope.launch {
+                if (!::onlinePlayer.isInitialized || onlinePlayer.mediaItemCount == 0) {
+                    PlaybackRuntimeBus.updateOnlineSnapshot { it.copy(isRadioLoading = false) }
+                    return@launch
+                }
+                val activeId = onlinePlayer.currentMediaItem?.mediaId
+                if (activeId != seedTrackId) {
+                    PlaybackRuntimeBus.updateOnlineSnapshot { it.copy(isRadioLoading = false) }
+                    return@launch
+                }
+                val currentQueue = (0 until onlinePlayer.mediaItemCount).mapNotNull { i ->
+                    onlineTrackMap[onlinePlayer.getMediaItemAt(i).mediaId]
+                }
+                val existingIds = currentQueue.mapTo(HashSet()) { it.id }
+                val existingSourceKeys = currentQueue
+                    .filter { it.sourceId.isNotBlank() }
+                    .mapTo(HashSet()) { "${it.providerType.name}:${it.sourceId}" }
+                val existingSignatures = currentQueue.mapTo(HashSet()) {
+                    MetadataCleaner.strictTrackDedupKey(it.title, it.artist)
+                }
+                val uniqueNew = OnlineProviderManager.deduplicateTracks(tracks).filterNot { cand ->
+                    cand.id in existingIds ||
+                        (cand.sourceId.isNotBlank() && "${cand.providerType.name}:${cand.sourceId}" in existingSourceKeys) ||
+                        MetadataCleaner.strictTrackDedupKey(cand.title, cand.artist) in existingSignatures
+                }
+
+                if (uniqueNew.isNotEmpty()) {
+                    val insertIndex = onlinePlayer.mediaItemCount
+                    uniqueNew.forEach { onlineTrackMap[it.id] = it }
+                    onlinePlayer.addMediaItems(uniqueNew.map { buildOnlineMediaItem(it) })
+                    lastRadioSeedKey = "${uniqueNew.last().id}:${onlinePlayer.mediaItemCount}"
+                    PlaybackRuntimeBus.updateOnlineSnapshot {
+                        it.copy(
+                            isRadioLoading = false,
+                            radioAppendedCount = uniqueNew.size,
+                            relatedTracks = uniqueNew
+                        )
+                    }
+                    if (pendingRadioAutoAdvance && insertIndex in 0 until onlinePlayer.mediaItemCount) {
+                        pendingRadioAutoAdvance = false
+                        activateEngine(ActiveAudioEngine.ONLINE, pauseOther = true)
+                        onlinePlayer.seekTo(insertIndex, 0L)
+                        onlinePlayer.prepare()
+                        onlinePlayer.play()
+                    }
+                    syncOnlineSnapshot()
+                    saveOnlineQueueStateAsync()
+                } else {
+                    pendingRadioAutoAdvance = false
+                    PlaybackRuntimeBus.updateOnlineSnapshot {
+                        it.copy(isRadioLoading = false, radioAppendedCount = 0, relatedTracks = emptyList())
+                    }
+                }
             }
         }
 

@@ -3,6 +3,7 @@ package app.nocturne.player.data.security
 import android.net.Uri
 import app.nocturne.player.data.model.HomeSectionConfig
 import app.nocturne.player.data.model.HomeSectionId
+import app.nocturne.player.data.model.ProviderLocalOverride
 import app.nocturne.player.data.model.UserSettings
 import okhttp3.Dns
 import okhttp3.HttpUrl
@@ -550,7 +551,24 @@ object InputAndUrlSecurity {
             replayGainPreampDb = raw.replayGainPreampDb.coerceIn(-15f, 15f),
             lyricsFontSizeSp = raw.lyricsFontSizeSp.coerceIn(12f, 36f),
             lyricsSyncOffsetMs = raw.lyricsSyncOffsetMs.coerceIn(-30_000L, 30_000L),
-            remoteProviderConfigUrl = validatedConfigUrl
+            remoteProviderConfigUrl = validatedConfigUrl,
+            musicProviderOverrides = sanitizeProviderOverrides(raw.musicProviderOverrides),
+            lyricsProviderOverrides = sanitizeProviderOverrides(raw.lyricsProviderOverrides)
         )
+    }
+
+    private fun sanitizeProviderOverrides(
+        raw: Map<String, ProviderLocalOverride>
+    ): Map<String, ProviderLocalOverride> {
+        if (raw.isEmpty()) return emptyMap()
+        val result = linkedMapOf<String, ProviderLocalOverride>()
+        for ((k, v) in raw.entries.take(32)) {
+            val id = sanitizeProviderId(k) ?: continue
+            result[id] = ProviderLocalOverride(
+                enabled = v.enabled,
+                priority = v.priority?.coerceIn(0, 10_000)
+            )
+        }
+        return result
     }
 }

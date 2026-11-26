@@ -4,6 +4,7 @@ import app.nocturne.player.data.model.LrcLine
 import app.nocturne.player.data.model.LyricsData
 import app.nocturne.player.data.model.LyricsSource
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.ProviderConnectivityTestResult
 import app.nocturne.player.data.online.ProviderHealthTracker
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import okhttp3.OkHttpClient
@@ -77,11 +78,12 @@ internal object LyricsHttpUtil {
         healthTracker: ProviderHealthTracker,
         providerId: String,
         endpoints: List<String>,
-        endpointFailover: Boolean = true
+        endpointFailover: Boolean = true,
+        operation: OperationType = OperationType.LYRICS
     ): List<String> {
         val ordered = healthTracker.selectOrderedEndpoints(
             providerId = providerId,
-            operation = OperationType.METADATA,
+            operation = operation,
             configuredEndpoints = endpoints
         )
         return if (endpointFailover) ordered else ordered.take(1)
@@ -98,7 +100,9 @@ internal object LyricsHttpUtil {
         maxRetries: Int = 1,
         cooldownMs: Long = 60_000L,
         maxBytes: Long = 1024L * 1024L,
-        allowLoopback: Boolean = false
+        allowLoopback: Boolean = false,
+        operation: OperationType = OperationType.LYRICS,
+        recordClientErrorsAsFailure: Boolean = false
     ): EndpointFetchResult {
         val allowedOrigin = fullUrl.takeIf { allowLoopback }
         val safeUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(fullUrl, allowedOrigin)
@@ -119,6 +123,7 @@ internal object LyricsHttpUtil {
                 if (!cookie.isNullOrBlank() && !InputAndUrlSecurity.hasControlChars(cookie)) {
                     reqBuilder.header("Cookie", cookie)
                 }
+                var shouldBreak = false
                 timedClient.newCall(reqBuilder.build()).execute().use { resp ->
                     val code = resp.code
                     if (code in 200..299) {
@@ -127,20 +132,27 @@ internal object LyricsHttpUtil {
                             throw IOException("Invalid or HTML response from $baseEndpoint")
                         }
                         val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
-                        healthTracker.recordEndpointSuccess(providerId, OperationType.METADATA, baseEndpoint, latencyMs)
+                        healthTracker.recordEndpointSuccess(providerId, operation, baseEndpoint, latencyMs)
                         return EndpointFetchResult.Success(body)
                     }
                     if (code == 404) {
                         val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
-                        healthTracker.recordEndpointSuccess(providerId, OperationType.METADATA, baseEndpoint, latencyMs)
+                        healthTracker.recordEndpointSuccess(providerId, operation, baseEndpoint, latencyMs)
                         return EndpointFetchResult.NotFound(code)
                     }
                     lastError = "HTTP $code"
                     val isServerOrRateError = code >= 500 || code == 429 || code == 408
                     if (!isServerOrRateError) {
-                        return EndpointFetchResult.NotFound(code)
+                        if (recordClientErrorsAsFailure) {
+                            shouldBreak = true
+                        } else {
+                            return EndpointFetchResult.NotFound(code)
+                        }
                     }
                     // Retryable server/rate error falls through to failure handling below
+                }
+                if (shouldBreak) {
+                    break
                 }
             } catch (e: IOException) {
                 lastError = e.message ?: "IO error"
@@ -155,13 +167,94 @@ internal object LyricsHttpUtil {
 
         healthTracker.recordEndpointFailure(
             providerId = providerId,
-            operation = OperationType.METADATA,
+            operation = operation,
             endpointUrl = baseEndpoint,
             error = lastError,
             endpointFailureThreshold = 1,
             customCooldownMs = cooldownMs
         )
         return EndpointFetchResult.EndpointFailure(lastError ?: "Endpoint failed")
+    }
+
+    fun probeEndpoint(
+        healthTracker: ProviderHealthTracker,
+        providerId: String,
+        displayName: String,
+        baseEndpoint: String,
+        probeUrl: String,
+        timedClient: OkHttpClient,
+        headers: Map<String, String> = emptyMap(),
+        cookie: String? = null,
+        cooldownMs: Long = 60_000L,
+        allowLoopback: Boolean = false,
+        mirrorToProviderId: String? = null
+    ): ProviderConnectivityTestResult {
+        val startNs = System.nanoTime()
+        val result = executeJsonGetWithHealth(
+            healthTracker = healthTracker,
+            providerId = providerId,
+            baseEndpoint = baseEndpoint,
+            fullUrl = probeUrl,
+            timedClient = timedClient,
+            headers = headers,
+            cookie = cookie,
+            maxRetries = 0,
+            cooldownMs = cooldownMs,
+            maxBytes = 256L * 1024L,
+            allowLoopback = allowLoopback,
+            operation = OperationType.LYRICS,
+            recordClientErrorsAsFailure = true
+        )
+        val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+        return when (result) {
+            is EndpointFetchResult.Success -> {
+                if (!mirrorToProviderId.isNullOrBlank()) {
+                    healthTracker.recordEndpointSuccess(mirrorToProviderId, OperationType.LYRICS, baseEndpoint, latencyMs)
+                }
+                ProviderConnectivityTestResult(
+                    providerId = providerId,
+                    displayName = displayName,
+                    success = true,
+                    testedEndpoint = baseEndpoint,
+                    latencyMs = latencyMs,
+                    details = "HTTP 200 OK in ${latencyMs}ms"
+                )
+            }
+            is EndpointFetchResult.NotFound -> {
+                if (!mirrorToProviderId.isNullOrBlank()) {
+                    healthTracker.recordEndpointSuccess(mirrorToProviderId, OperationType.LYRICS, baseEndpoint, latencyMs)
+                }
+                ProviderConnectivityTestResult(
+                    providerId = providerId,
+                    displayName = displayName,
+                    success = true,
+                    testedEndpoint = baseEndpoint,
+                    latencyMs = latencyMs,
+                    details = "Reachable (HTTP ${result.statusCode}) in ${latencyMs}ms"
+                )
+            }
+            is EndpointFetchResult.EndpointFailure -> {
+                if (!mirrorToProviderId.isNullOrBlank()) {
+                    healthTracker.recordEndpointFailure(
+                        providerId = mirrorToProviderId,
+                        operation = OperationType.LYRICS,
+                        endpointUrl = baseEndpoint,
+                        error = result.reason,
+                        endpointFailureThreshold = 1,
+                        customCooldownMs = cooldownMs
+                    )
+                }
+                ProviderConnectivityTestResult(
+                    providerId = providerId,
+                    displayName = displayName,
+                    success = false,
+                    testedEndpoint = baseEndpoint,
+                    latencyMs = latencyMs,
+                    errorSummary = result.reason,
+                    details = result.reason
+                )
+            }
+        }
     }
 
     fun formatLrcTimestamp(timeMs: Long): String {

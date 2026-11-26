@@ -19,9 +19,8 @@ import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import okhttp3.OkHttpClient
 import java.io.IOException
 
@@ -69,8 +68,8 @@ class AudiusProvider(
         when (filter) {
             OnlineSearchFilter.ARTISTS -> {
                 val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/users/search?query=$encodedQ&app_name=$APP_NAME")
-                val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
-                val artists = data.mapNotNull { parseUserItem(it.jsonObject) }
+                val data = json.parseObjectOrNull(resp.body)?.objArray("data").orEmpty()
+                val artists = data.mapNotNull { it.asObjectOrNull()?.let(::parseUserItem) }
                 OnlineSearchPage(
                     query = query,
                     artists = artists,
@@ -81,8 +80,8 @@ class AudiusProvider(
             }
             OnlineSearchFilter.ALBUMS -> {
                 val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/playlists/search?query=$encodedQ&app_name=$APP_NAME")
-                val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
-                val albums = data.mapNotNull { parsePlaylistItem(it.jsonObject) }
+                val data = json.parseObjectOrNull(resp.body)?.objArray("data").orEmpty()
+                val albums = data.mapNotNull { it.asObjectOrNull()?.let(::parsePlaylistItem) }
                 OnlineSearchPage(
                     query = query,
                     albums = albums,
@@ -93,8 +92,8 @@ class AudiusProvider(
             }
             else -> {
                 val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/tracks/search?query=$encodedQ&app_name=$APP_NAME")
-                val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
-                val tracks = data.mapNotNull { parseTrackItem(it.jsonObject) }
+                val data = json.parseObjectOrNull(resp.body)?.objArray("data").orEmpty()
+                val tracks = data.mapNotNull { it.asObjectOrNull()?.let(::parseTrackItem) }
                 OnlineSearchPage(
                     query = query,
                     tracks = tracks,
@@ -110,14 +109,14 @@ class AudiusProvider(
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (safeQuery.isBlank()) return@withContext emptyList()
         val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/tracks/search?query=${Uri.encode(safeQuery)}&app_name=$APP_NAME")
-        val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
-        data.mapNotNull { it.jsonObject.str("title") }.distinct().take(8)
+        val data = json.parseObjectOrNull(resp.body)?.objArray("data").orEmpty()
+        data.mapNotNull { it.asObjectOrNull()?.str("title") }.distinct().take(8)
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
         val resp = executeRawWithFallback(OperationType.SEARCH, "/v1/tracks/trending?app_name=$APP_NAME")
-        val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
-        data.mapNotNull { parseTrackItem(it.jsonObject) }
+        val data = json.parseObjectOrNull(resp.body)?.objArray("data").orEmpty()
+        data.mapNotNull { it.asObjectOrNull()?.let(::parseTrackItem) }
     }
 
     override suspend fun resolveStream(
@@ -140,7 +139,7 @@ class AudiusProvider(
 
         if (infoResp != null) {
             runCatching {
-                val dataObj = json.parseToJsonElement(infoResp.body).jsonObject["data"]?.jsonObject
+                val dataObj = json.parseObjectOrNull(infoResp.body)?.objObject("data")
                 if (dataObj != null) {
                     parseTrackItem(dataObj)?.let { updated ->
                         resolvedTrack = updated.copy(
@@ -192,18 +191,18 @@ class AudiusProvider(
             ?: throw IllegalArgumentException("Invalid Audius artist ID")
         val encodedUserId = Uri.encode(userId)
         val tracksResp = executeRawWithFallback(OperationType.METADATA, "/v1/users/$encodedUserId/tracks?app_name=$APP_NAME")
-        val tracksData = json.parseToJsonElement(tracksResp.body).jsonObject["data"]?.jsonArray.orEmpty()
-        val tracks = tracksData.mapNotNull { parseTrackItem(it.jsonObject) }
+        val tracksData = json.parseObjectOrNull(tracksResp.body)?.objArray("data").orEmpty()
+        val tracks = tracksData.mapNotNull { it.asObjectOrNull()?.let(::parseTrackItem) }
         val userObj = runCatching {
             val uResp = executeRawWithFallback(OperationType.METADATA, "/v1/users/$encodedUserId?app_name=$APP_NAME")
-            json.parseToJsonElement(uResp.body).jsonObject["data"]?.jsonObject
+            json.parseObjectOrNull(uResp.body)?.objObject("data")
         }.getOrNull()
 
         OnlineArtistPage(
             id = userId,
             name = userObj?.str("name") ?: tracks.firstOrNull()?.artist ?: "Audius Artist",
             url = "https://audius.co/${Uri.encode(userObj?.str("handle") ?: userId)}",
-            avatarUrl = pickArtwork(userObj?.get("profile_picture") as? JsonObject),
+            avatarUrl = pickArtwork(userObj?.objObject("profile_picture")),
             subscriberCountText = userObj?.long("follower_count")?.takeIf { it > 0L }?.let { "${it / 1000}K" }.orEmpty(),
             description = userObj?.str("bio").orEmpty(),
             tracks = tracks,
@@ -218,15 +217,22 @@ class AudiusProvider(
         val plId = InputAndUrlSecurity.sanitizePathSegment(rawId)
             ?: throw IllegalArgumentException("Invalid Audius playlist ID")
         val resp = executeRawWithFallback(OperationType.METADATA, "/v1/playlists/${Uri.encode(plId)}/tracks?app_name=$APP_NAME")
-        val data = json.parseToJsonElement(resp.body).jsonObject["data"]?.jsonArray.orEmpty()
-        val tracks = data.mapNotNull { parseTrackItem(it.jsonObject) }
+        val rootObj = json.parseObjectOrNull(resp.body)
+        val dataEl = rootObj?.get("data")
+        val dataObj = dataEl.asObjectOrNull() ?: (dataEl.asArrayOrNull()?.firstOrNull().asObjectOrNull())
+        val tracksArr = when (dataEl) {
+            is JsonArray -> dataEl
+            is JsonObject -> dataEl.objArray("tracks") ?: JsonArray(emptyList())
+            else -> JsonArray(emptyList())
+        }
+        val tracks = tracksArr.mapNotNull { it.asObjectOrNull()?.let(::parseTrackItem) }
         OnlineAlbumPage(
             id = plId,
-            title = "$displayName Collection",
-            artist = tracks.firstOrNull()?.artist ?: displayName,
+            title = dataObj?.str("playlist_name") ?: dataObj?.str("name") ?: "$displayName Collection",
+            artist = dataObj?.objObject("user")?.str("name") ?: tracks.firstOrNull()?.artist ?: displayName,
             url = albumIdOrUrl,
-            thumbnailUrl = tracks.firstOrNull()?.thumbnailUrl,
-            description = "",
+            thumbnailUrl = pickArtwork(dataObj?.objObject("artwork")) ?: tracks.firstOrNull()?.thumbnailUrl,
+            description = dataObj?.str("description").orEmpty(),
             tracks = tracks,
             providerType = OnlineProviderType.AUDIUS,
             providerId = providerId

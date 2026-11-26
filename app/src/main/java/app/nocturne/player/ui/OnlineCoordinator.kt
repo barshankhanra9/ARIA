@@ -3,6 +3,8 @@ package app.nocturne.player.ui
 import android.app.Application
 import android.content.Intent
 import app.nocturne.player.PlaybackService
+import app.nocturne.player.data.audio.MetadataCleaner
+import app.nocturne.player.data.model.LyricsProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
 import app.nocturne.player.data.model.OnlineArtistPage
@@ -189,8 +191,14 @@ class OnlineCoordinator(
     private val _providerDiagnostics = MutableStateFlow<List<ProviderDiagnosticsSnapshot>>(emptyList())
     val providerDiagnostics: StateFlow<List<ProviderDiagnosticsSnapshot>> = _providerDiagnostics.asStateFlow()
 
+    private val _lyricsProviderDiagnostics = MutableStateFlow<List<LyricsProviderDiagnosticsSnapshot>>(emptyList())
+    val lyricsProviderDiagnostics: StateFlow<List<LyricsProviderDiagnosticsSnapshot>> = _lyricsProviderDiagnostics.asStateFlow()
+
     private val _providerTestResults = MutableStateFlow<Map<String, ProviderConnectivityTestResult>>(emptyMap())
     val providerTestResults: StateFlow<Map<String, ProviderConnectivityTestResult>> = _providerTestResults.asStateFlow()
+
+    private val _lyricsProviderTestResults = MutableStateFlow<Map<String, ProviderConnectivityTestResult>>(emptyMap())
+    val lyricsProviderTestResults: StateFlow<Map<String, ProviderConnectivityTestResult>> = _lyricsProviderTestResults.asStateFlow()
 
     private val _isTestingProviders = MutableStateFlow(false)
     val isTestingProviders: StateFlow<Boolean> = _isTestingProviders.asStateFlow()
@@ -202,6 +210,7 @@ class OnlineCoordinator(
     private var recommendationsJob: Job? = null
     private var artistJob: Job? = null
     private var albumJob: Job? = null
+    private var radioFetchJob: Job? = null
 
     init {
         scope.launch {
@@ -224,6 +233,7 @@ class OnlineCoordinator(
     fun refreshProviderHealth() {
         _providerHealth.value = providerManager.getHealthSnapshots()
         _providerDiagnostics.value = providerManager.getProviderDiagnostics()
+        _lyricsProviderDiagnostics.value = providerManager.getLyricsProviderDiagnostics()
     }
 
     fun testProviderConnectivity(providerId: String) {
@@ -245,20 +255,102 @@ class OnlineCoordinator(
         }
     }
 
+    fun testLyricsProviderConnectivity(providerId: String) {
+        if (_isTestingProviders.value) return
+        scope.launch {
+            _isTestingProviders.value = true
+            try {
+                val res = providerManager.testLyricsProviderConnectivity(providerId)
+                _lyricsProviderTestResults.update { it + (providerId.lowercase() to res) }
+                refreshProviderHealth()
+                if (res.success) {
+                    emitMessage("${res.displayName} reachable (${res.latencyMs} ms)")
+                } else {
+                    emitMessage("${res.displayName}: ${res.errorSummary ?: "Failed"}")
+                }
+            } finally {
+                _isTestingProviders.value = false
+            }
+        }
+    }
+
     fun testAllProvidersConnectivity() {
         if (_isTestingProviders.value) return
         scope.launch {
             _isTestingProviders.value = true
             try {
-                val results = providerManager.testAllProvidersConnectivity()
-                _providerTestResults.value = results.associateBy { it.providerId.lowercase() }
+                val musicResults = providerManager.testAllProvidersConnectivity()
+                val lyricsResults = providerManager.testAllLyricsProvidersConnectivity()
+                _providerTestResults.value = musicResults.associateBy { it.providerId.lowercase() }
+                _lyricsProviderTestResults.value = lyricsResults.associateBy { it.providerId.lowercase() }
                 refreshProviderHealth()
-                val okCount = results.count { it.success }
-                emitMessage("Tested ${results.size} providers: $okCount reachable")
+                val all = musicResults + lyricsResults
+                val okCount = all.count { it.success }
+                emitMessage("Tested ${musicResults.size} music & ${lyricsResults.size} lyrics providers: $okCount reachable")
             } finally {
                 _isTestingProviders.value = false
             }
         }
+    }
+
+    fun buildDiagnosticsReportText(): String {
+        refreshProviderHealth()
+        val st = remoteConfigStatus.value
+        val musicDiags = _providerDiagnostics.value
+        val lyricsDiags = _lyricsProviderDiagnostics.value
+        return buildString {
+            appendLine("=== ARIA Streaming & Provider Diagnostics ===")
+            appendLine("Config URL: ${st.sourceUrl}")
+            appendLine("Config v${st.configVersion} (Schema v${st.schemaVersion}) | Synced: ${if (st.lastSyncedAtMs > 0L) java.util.Date(st.lastSyncedAtMs).toString() else "Pending"}")
+            appendLine("Local Overrides Active: ${st.hasLocalOverrides}")
+            appendLine("Music Providers: ${st.enabledProviderCount}/${st.providerCount} enabled")
+            appendLine("Lyrics Providers: ${st.enabledLyricsProviderCount}/${st.totalLyricsProviderCount} enabled")
+            if (!st.lastError.isNullOrBlank()) {
+                appendLine("Last Config Error: ${st.lastErrorType.label}: ${st.lastError}")
+            }
+            appendLine()
+            appendLine("--- MUSIC PROVIDERS (${musicDiags.size}) ---")
+            musicDiags.forEach { d ->
+                val state = when {
+                    !d.enabled -> "DISABLED"
+                    !d.isAvailable -> "COOLDOWN/UNAVAILABLE"
+                    else -> "HEALTHY"
+                }
+                appendLine("[#${d.priority}] ${d.displayName} (${d.providerId}/${d.adapterType}) - $state${if (d.hasLocalOverride) " [OVERRIDE]" else ""}")
+                d.operationHealth.forEach { (op, eps) ->
+                    eps.forEach { ep ->
+                        val epStatus = when {
+                            ep.cooldownRemainingMs > 0L -> "COOLDOWN ${ep.cooldownRemainingMs / 1000}s"
+                            ep.consecutiveFailures > 0 -> "FAILS(${ep.consecutiveFailures})"
+                            else -> "OK"
+                        }
+                        val lat = if (ep.ewmaLatencyMs > 0L) "${ep.ewmaLatencyMs}ms" else "-"
+                        val err = ep.lastError?.takeIf { it.isNotBlank() }?.let { " | err=$it" }.orEmpty()
+                        appendLine("  ${op.label.uppercase()} [P${ep.priority}] ${ep.url} -> $epStatus ($lat)$err")
+                    }
+                }
+            }
+            appendLine()
+            appendLine("--- LYRICS PROVIDERS (${lyricsDiags.size}) ---")
+            lyricsDiags.forEach { d ->
+                val state = when {
+                    !d.enabled -> "DISABLED"
+                    !d.isHealthy -> "DEGRADED"
+                    else -> "HEALTHY"
+                }
+                appendLine("[#${d.priority}] ${d.displayName} (${d.providerId}/${d.adapterType}) - $state${if (d.hasLocalOverride) " [OVERRIDE]" else ""}")
+                d.endpoints.forEach { ep ->
+                    val epStatus = when {
+                        ep.cooldownRemainingMs > 0L -> "COOLDOWN ${ep.cooldownRemainingMs / 1000}s"
+                        ep.consecutiveFailures > 0 -> "FAILS(${ep.consecutiveFailures})"
+                        else -> "OK"
+                    }
+                    val lat = if (ep.ewmaLatencyMs > 0L) "${ep.ewmaLatencyMs}ms" else "-"
+                    val err = ep.lastError?.takeIf { it.isNotBlank() }?.let { " | err=$it" }.orEmpty()
+                    appendLine("  LYRICS [P${ep.priority}] ${ep.url} -> $epStatus ($lat)$err")
+                }
+            }
+        }.trim()
     }
 
     fun loadTrendingIfNeeded() {
@@ -687,6 +779,73 @@ class OnlineCoordinator(
                         isPlaying = false
                     )
                 }
+            }
+        }
+    }
+
+    fun playSearchResultAsRadio(track: OnlineTrack) {
+        radioFetchJob?.cancel()
+        radioFetchJob = scope.launch {
+            repository.upsertTrackPreservingStats(track)
+            val bridge = ensureOnlineBridge()
+            if (bridge != null) {
+                bridge.playSingleTrackForRadio(track)
+            } else {
+                PlaybackRuntimeBus.updateOnlineSnapshot {
+                    it.copy(
+                        currentTrack = track,
+                        queue = listOf(track),
+                        currentIndex = 0,
+                        isPlaying = false,
+                        isRadioLoading = true,
+                        radioAppendedCount = 0,
+                        relatedTracks = emptyList()
+                    )
+                }
+            }
+
+            try {
+                val rawRadio = runCatching {
+                    recommendationEngine.generateInfiniteRadioTracks(
+                        seedTrack = track,
+                        currentQueue = listOf(track),
+                        count = 15
+                    )
+                }.getOrDefault(emptyList()).ifEmpty {
+                    runCatching {
+                        providerManager.fetchRelatedTracksForRadio(track, limit = 15)
+                    }.getOrDefault(emptyList())
+                }
+
+                val seedDedupKey = MetadataCleaner.strictTrackDedupKey(track.title, track.artist)
+                val dedupedCandidates = OnlineProviderManager.deduplicateTracks(rawRadio).filterNot { cand ->
+                    cand.id == track.id ||
+                        (track.sourceId.isNotBlank() && cand.sourceId == track.sourceId && cand.providerType == track.providerType) ||
+                        MetadataCleaner.strictTrackDedupKey(cand.title, cand.artist) == seedDedupKey
+                }
+
+                dedupedCandidates.take(20).forEach { repository.upsertTrackPreservingStats(it) }
+
+                val activeBridge = PlaybackRuntimeBus.onlineBridge ?: ensureOnlineBridge()
+                if (activeBridge != null) {
+                    activeBridge.appendRadioTracksIfSeedActive(track.id, dedupedCandidates)
+                } else {
+                    PlaybackRuntimeBus.updateOnlineSnapshot { prev ->
+                        if (prev.currentTrack?.id == track.id && prev.queue.size <= 1) {
+                            val updatedQueue = listOf(track) + dedupedCandidates
+                            prev.copy(
+                                queue = updatedQueue,
+                                relatedTracks = dedupedCandidates,
+                                isRadioLoading = false,
+                                radioAppendedCount = dedupedCandidates.size
+                            )
+                        } else {
+                            prev.copy(isRadioLoading = false)
+                        }
+                    }
+                }
+            } finally {
+                PlaybackRuntimeBus.updateOnlineSnapshot { it.copy(isRadioLoading = false) }
             }
         }
     }

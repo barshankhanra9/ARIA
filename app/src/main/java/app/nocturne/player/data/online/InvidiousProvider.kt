@@ -20,15 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.longOrNull
 import okhttp3.OkHttpClient
 
 class InvidiousProvider(
@@ -81,16 +73,19 @@ class InvidiousProvider(
         }
         val encodedQ = Uri.encode(safeQuery)
         val resp = executeRawWithFallback(OperationType.SEARCH, "/api/v1/search?q=$encodedQ&page=$page&type=$typeParam")
-        val arr = json.parseToJsonElement(resp.body).jsonArray
+        val parsed = json.parseElementOrNull(resp.body)
+        val arr = parsed.asArrayOrNull()
+            ?: parsed.asObjectOrNull()?.let { it.objArray("items") ?: it.objArray("results") ?: it.objArray("videos") }
+            ?: JsonArray(emptyList())
 
         val tracks = mutableListOf<OnlineTrack>()
         val artists = mutableListOf<OnlineArtistSummary>()
         val albums = mutableListOf<OnlineAlbumSummary>()
 
         arr.forEach { el ->
-            val obj = el.jsonObject
+            val obj = el.asObjectOrNull() ?: return@forEach
             when (obj.str("type")) {
-                "video" -> parseVideoObject(obj)?.let { tracks.add(it) }
+                "video", null -> parseVideoObject(obj)?.let { tracks.add(it) }
                 "channel" -> parseChannelObject(obj)?.let { artists.add(it) }
                 "playlist" -> parsePlaylistObject(obj)?.let { albums.add(it) }
             }
@@ -115,8 +110,8 @@ class InvidiousProvider(
         if (safeQuery.isBlank()) return@withContext emptyList()
         val encodedQ = Uri.encode(safeQuery)
         val resp = executeRawWithFallback(OperationType.SEARCH, "/api/v1/search/suggestions?q=$encodedQ")
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-        obj["suggestions"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull } ?: emptyList()
+        val obj = json.parseObjectOrNull(resp.body) ?: return@withContext emptyList()
+        obj.objArray("suggestions")?.mapNotNull { it.extractText() } ?: emptyList()
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
@@ -125,8 +120,8 @@ class InvidiousProvider(
         }.getOrElse {
             executeRawWithFallback(OperationType.SEARCH, "/api/v1/popular")
         }
-        val arr = json.parseToJsonElement(resp.body).jsonArray
-        arr.mapNotNull { parseVideoObject(it.jsonObject) }
+        val arr = json.parseArrayOrNull(resp.body) ?: JsonArray(emptyList())
+        arr.mapNotNull { it.asObjectOrNull()?.let { v -> parseVideoObject(v) } }
     }
 
     override suspend fun resolveStream(
@@ -164,18 +159,19 @@ class InvidiousProvider(
                     endpointFailover = false
                 )
                 val instanceUrl = resp.endpointUrl
-                val obj = json.parseToJsonElement(resp.body).jsonObject
+                val obj = json.parseObjectOrNull(resp.body)
+                    ?: throw IllegalStateException("Malformed stream JSON from $displayName")
                 if (!obj.str("error").isNullOrBlank()) {
                     throw IllegalStateException(obj.str("error") ?: "Invidious stream error")
                 }
 
                 val allowedTestOrigin = instanceUrl.takeIf { baseUrlsOverride != null }
-                val adaptive = obj["adaptiveFormats"]?.jsonArray.orEmpty()
+                val adaptive = obj.objArray("adaptiveFormats").orEmpty()
                 val streams = adaptive.mapNotNull { item ->
-                    val fmt = item.jsonObject
+                    val fmt = item.asObjectOrNull() ?: return@mapNotNull null
                     val type = fmt.str("type").orEmpty()
                     if (!type.startsWith("audio/")) return@mapNotNull null
-                    val rawUrl = fmt.str("url")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    val rawUrl = fmt.strUrl("url")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                     val resolvedUrl = resolveInstanceMediaUrl(instanceUrl, rawUrl) ?: return@mapNotNull null
                     val bitrateBits = fmt.str("bitrate")?.toIntOrNull() ?: fmt.int("bitrate") ?: 128_000
                     val kbps = (bitrateBits / 1000).coerceAtLeast(32)
@@ -212,10 +208,10 @@ class InvidiousProvider(
                 val author = obj.str("author") ?: track.artist
                 val authorId = obj.str("authorId") ?: track.artistId
                 val durSec = obj.long("lengthSeconds") ?: 0L
-                val thumbs = obj["videoThumbnails"]?.jsonArray
+                val thumbs = obj.objArray("videoThumbnails")
                 val thumb = pickInvidiousThumb(thumbs, instanceUrl) ?: track.thumbnailUrl
-                val related = obj["recommendedVideos"]?.jsonArray.orEmpty().mapNotNull {
-                    parseRecommendedObject(it.jsonObject, instanceUrl)
+                val related = obj.objArray("recommendedVideos").orEmpty().mapNotNull {
+                    it.asObjectOrNull()?.let { rec -> parseRecommendedObject(rec, instanceUrl) }
                 }
 
                 return@withContext OnlineStreamResolution(
@@ -253,19 +249,19 @@ class InvidiousProvider(
             ?: throw IllegalArgumentException("Invalid Invidious channel ID")
         val resp = executeRawWithFallback(OperationType.METADATA, "/api/v1/channels/${Uri.encode(channelId)}")
         val instanceUrl = resp.endpointUrl
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-        val videos = obj["latestVideos"]?.jsonArray.orEmpty().mapNotNull {
-            parseVideoObject(it.jsonObject, instanceUrl)
+        val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
+        val videos = obj.objArray("latestVideos").orEmpty().mapNotNull {
+            it.asObjectOrNull()?.let { v -> parseVideoObject(v, instanceUrl) }
         }
-        val avatar = obj["authorThumbnails"]?.jsonArray?.lastOrNull()?.jsonObject?.str("url")
+        val avatar = obj.objArray("authorThumbnails")?.lastOrNull().asObjectOrNull()?.strUrl("url")
             ?.let { resolveInstanceMediaUrl(instanceUrl, it) }
-        val banner = obj["authorBanners"]?.jsonArray?.firstOrNull()?.jsonObject?.str("url")
+        val banner = obj.objArray("authorBanners")?.firstOrNull().asObjectOrNull()?.strUrl("url")
             ?.let { resolveInstanceMediaUrl(instanceUrl, it) }
         val subCount = obj.long("subCount") ?: 0L
 
         OnlineArtistPage(
             id = channelId,
-            name = obj.str("author") ?: "Artist",
+            name = obj.str("author") ?: obj.str("name") ?: "Artist",
             url = "https://www.youtube.com/channel/${Uri.encode(channelId)}",
             avatarUrl = avatar,
             bannerUrl = banner,
@@ -283,16 +279,21 @@ class InvidiousProvider(
             ?: throw IllegalArgumentException("Invalid Invidious playlist ID")
         val resp = executeRawWithFallback(OperationType.METADATA, "/api/v1/playlists/${Uri.encode(playlistId)}")
         val instanceUrl = resp.endpointUrl
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-        val videos = obj["videos"]?.jsonArray.orEmpty().mapNotNull {
-            parseVideoObject(it.jsonObject, instanceUrl)
+        val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
+        val videosArr = obj.objArray("videos")
+            ?: obj.objArray("items")
+            ?: obj.objArray("relatedStreams")
+            ?: JsonArray(emptyList())
+        val videos = videosArr.mapNotNull {
+            it.asObjectOrNull()?.let { v -> parseVideoObject(v, instanceUrl) }
         }
         OnlineAlbumPage(
             id = playlistId,
-            title = obj.str("title") ?: "Playlist",
-            artist = obj.str("author") ?: displayName,
+            title = obj.str("title") ?: obj.str("name") ?: "Playlist",
+            artist = obj.str("author") ?: obj.str("uploader") ?: displayName,
             url = "https://www.youtube.com/playlist?list=${Uri.encode(playlistId)}",
-            thumbnailUrl = obj.str("playlistThumbnail")?.let { resolveInstanceMediaUrl(instanceUrl, it) }
+            thumbnailUrl = obj.strUrl("playlistThumbnail")?.let { resolveInstanceMediaUrl(instanceUrl, it) }
+                ?: obj.strUrl("thumbnails")?.let { resolveInstanceMediaUrl(instanceUrl, it) }
                 ?: videos.firstOrNull()?.thumbnailUrl,
             description = obj.str("description").orEmpty(),
             tracks = videos,
@@ -351,7 +352,7 @@ class InvidiousProvider(
         val author = obj.str("author") ?: "YouTube"
         val authorId = obj.str("authorId")
         val lengthSec = obj.long("lengthSeconds") ?: 0L
-        val thumb = pickInvidiousThumb(obj["videoThumbnails"]?.jsonArray, baseUrl)
+        val thumb = pickInvidiousThumb(obj.objArray("videoThumbnails"), baseUrl)
             ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
         return OnlineTrack(
             id = OnlineTrack.canonicalId(OnlineProviderType.YOUTUBE, id),
@@ -378,7 +379,7 @@ class InvidiousProvider(
         val title = obj.str("title") ?: return null
         val author = obj.str("author") ?: "YouTube"
         val lengthSec = obj.long("lengthSeconds") ?: 0L
-        val thumb = pickInvidiousThumb(obj["videoThumbnails"]?.jsonArray, baseUrl)
+        val thumb = pickInvidiousThumb(obj.objArray("videoThumbnails"), baseUrl)
             ?: "https://i.ytimg.com/vi/$id/hqdefault.jpg"
         return OnlineTrack(
             id = OnlineTrack.canonicalId(OnlineProviderType.YOUTUBE, id),
@@ -397,7 +398,7 @@ class InvidiousProvider(
 
     private fun parseChannelObject(obj: JsonObject): OnlineArtistSummary? {
         val id = obj.str("authorId")?.takeIf { it.isNotBlank() } ?: return null
-        val thumbRaw = obj["authorThumbnails"]?.jsonArray?.lastOrNull()?.jsonObject?.str("url")
+        val thumbRaw = obj.objArray("authorThumbnails")?.lastOrNull().asObjectOrNull()?.strUrl("url")
             ?.let { if (it.startsWith("//")) "https:$it" else it }
         val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(thumbRaw, thumbRaw?.takeIf { baseUrlsOverride != null })
         return OnlineArtistSummary(
@@ -413,13 +414,13 @@ class InvidiousProvider(
 
     private fun parsePlaylistObject(obj: JsonObject): OnlineAlbumSummary? {
         val id = obj.str("playlistId")?.takeIf { it.isNotBlank() } ?: return null
-        val thumbRaw = obj.str("playlistThumbnail")
+        val thumbRaw = (obj.strUrl("playlistThumbnail") ?: obj.strUrl("thumbnails"))
             ?.let { if (it.startsWith("//")) "https:$it" else it }
         val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(thumbRaw, thumbRaw?.takeIf { baseUrlsOverride != null })
         return OnlineAlbumSummary(
             id = id,
-            title = obj.str("title") ?: "Playlist",
-            artist = obj.str("author") ?: "YouTube",
+            title = obj.str("title") ?: obj.str("name") ?: "Playlist",
+            artist = obj.str("author") ?: obj.str("uploader") ?: "YouTube",
             url = "https://www.youtube.com/playlist?list=$id",
             thumbnailUrl = thumb,
             trackCount = obj.int("videoCount") ?: 0,
@@ -430,9 +431,11 @@ class InvidiousProvider(
 
     private fun pickInvidiousThumb(thumbs: JsonArray?, baseUrl: String?): String? {
         if (thumbs == null || thumbs.isEmpty()) return null
-        val url = thumbs.firstOrNull { it.jsonObject.str("quality") in listOf("medium", "high", "sddefault", "hqdefault") }
-            ?.jsonObject?.str("url")
-            ?: thumbs.firstOrNull()?.jsonObject?.str("url")
+        val objects = thumbs.mapNotNull { it.asObjectOrNull() }
+        val url = objects.firstOrNull { it.str("quality") in listOf("medium", "high", "sddefault", "hqdefault") }
+            ?.strUrl("url")
+            ?: objects.firstOrNull()?.strUrl("url")
+            ?: thumbs.extractUrlString()
             ?: return null
         return if (baseUrl != null) {
             resolveInstanceMediaUrl(baseUrl, url)
@@ -466,15 +469,3 @@ class InvidiousProvider(
         }.getOrNull() ?: idOrUrl
     }
 }
-
-internal fun JsonObject.str(key: String): String? =
-    (this[key] as? JsonElement)?.jsonPrimitive?.contentOrNull
-
-internal fun JsonObject.long(key: String): Long? =
-    (this[key] as? JsonElement)?.jsonPrimitive?.longOrNull
-
-internal fun JsonObject.int(key: String): Int? =
-    (this[key] as? JsonElement)?.jsonPrimitive?.intOrNull
-
-internal fun JsonObject.bool(key: String): Boolean? =
-    (this[key] as? JsonElement)?.jsonPrimitive?.booleanOrNull

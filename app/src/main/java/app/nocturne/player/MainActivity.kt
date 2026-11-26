@@ -115,6 +115,7 @@ import app.nocturne.player.ui.screens.QueueManagementSheet
 import app.nocturne.player.ui.screens.RelatedTracksSheet
 import app.nocturne.player.ui.screens.SearchScreen
 import app.nocturne.player.ui.screens.SettingsScreen
+import app.nocturne.player.ui.screens.StreamingRemoteConfigScreen
 import app.nocturne.player.ui.screens.TagEditorScreen
 import app.nocturne.player.ui.theme.AriaPaperTheme
 import app.nocturne.player.ui.theme.ModernPaperTheme
@@ -184,7 +185,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     val onlinePlaylists by viewModel.online.playlists.collectAsStateWithLifecycle()
     val onlineRecentSearches by viewModel.online.recentSearches.collectAsStateWithLifecycle()
     val providerDiagnostics by viewModel.online.providerDiagnostics.collectAsStateWithLifecycle()
+    val lyricsProviderDiagnostics by viewModel.online.lyricsProviderDiagnostics.collectAsStateWithLifecycle()
     val providerTestResults by viewModel.online.providerTestResults.collectAsStateWithLifecycle()
+    val lyricsProviderTestResults by viewModel.online.lyricsProviderTestResults.collectAsStateWithLifecycle()
     val isTestingProviders by viewModel.online.isTestingProviders.collectAsStateWithLifecycle()
 
     var currentTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
@@ -203,6 +206,7 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     var showRelatedSheet by remember { mutableStateOf(false) }
     var showLyricsDialog by remember { mutableStateOf(false) }
     var showAudioFxDialog by remember { mutableStateOf(false) }
+    var showStreamingConfigScreen by rememberSaveable { mutableStateOf(false) }
     var tagEditorTrack by remember { mutableStateOf<Track?>(null) }
     var contextMenuTrack by remember { mutableStateOf<Track?>(null) }
     var onlineContextMenuTrack by remember { mutableStateOf<OnlineTrack?>(null) }
@@ -404,6 +408,7 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                         enabled = currentTab != AppTab.HOME &&
                             !showNowPlaying &&
                             !showAudioFxDialog &&
+                            !showStreamingConfigScreen &&
                             !showLyricsDialog &&
                             tagEditorTrack == null &&
                             libraryDrill == null &&
@@ -611,7 +616,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onClearSearch = { viewModel.online.clearSearch() },
                                     onDeleteRecentSearch = { viewModel.online.deleteRecentSearch(it) },
                                     onClearSearchHistory = { viewModel.online.clearSearchHistory() },
-                                    onPlayTracks = { list, idx -> viewModel.online.playTracks(list, idx, false) },
+                                    onPlayTracks = { list, idx ->
+                                        list.getOrNull(idx)?.let { viewModel.online.playSearchResultAsRadio(it) }
+                                    },
                                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
                                     onOpenContextMenu = { onlineContextMenuTrack = it },
                                     onOpenArtist = { urlOrId, p, pid ->
@@ -706,19 +713,11 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                 onImportBackup = { viewModel.importFullBackup(it) },
                                 remoteConfig = remoteConfig,
                                 remoteConfigStatus = remoteConfigStatus,
-                                providerDiagnostics = providerDiagnostics,
-                                providerTestResults = providerTestResults,
-                                isTestingProviders = isTestingProviders,
-                                isRefreshingRemoteConfig = isRefreshingRemoteConfig,
                                 lastRemoteConfigError = lastRemoteConfigError,
-                                remoteConfigConnectionState = remoteConfigConnectionState,
-                                onSaveRemoteConfigUrl = { viewModel.saveRemoteConfigUrl(it) },
-                                onTestRemoteConfigUrl = { viewModel.testRemoteConfigUrl(it) },
-                                onClearRemoteConfigFeedback = { viewModel.clearRemoteConfigConnectionState() },
-                                onRefreshRemoteConfig = { viewModel.refreshRemoteConfig(it) },
-                                onRollbackRemoteConfig = { viewModel.rollbackRemoteConfig() },
-                                onTestProvider = { viewModel.online.testProviderConnectivity(it) },
-                                onTestAllProviders = { viewModel.online.testAllProvidersConnectivity() }
+                                onOpenStreamingConfig = {
+                                    viewModel.online.refreshProviderHealth()
+                                    showStreamingConfigScreen = true
+                                }
                             )
                         }
                     }
@@ -900,6 +899,49 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     onUpdateSettings = { viewModel.updateSettings(it) },
                     onPreviewPreset = { viewModel.previewEqPreset(it) },
                     onDismiss = { showAudioFxDialog = false }
+                )
+            }
+
+            // Full-screen Streaming & Remote Config Sub-Screen
+            AnimatedVisibility(
+                visible = showStreamingConfigScreen,
+                enter = slideInHorizontally(tween(motion.durationMs)) { it / 3 } + fadeIn(tween(motion.durationMs)),
+                exit = slideOutHorizontally(tween(motion.durationMs)) { it / 3 } + fadeOut(tween(motion.durationMs))
+            ) {
+                StreamingRemoteConfigScreen(
+                    settings = settings,
+                    remoteConfig = remoteConfig,
+                    remoteConfigStatus = remoteConfigStatus,
+                    remoteConfigConnectionState = remoteConfigConnectionState,
+                    providerDiagnostics = providerDiagnostics,
+                    lyricsProviderDiagnostics = lyricsProviderDiagnostics,
+                    providerTestResults = providerTestResults,
+                    lyricsProviderTestResults = lyricsProviderTestResults,
+                    isTestingProviders = isTestingProviders,
+                    isRefreshingRemoteConfig = isRefreshingRemoteConfig,
+                    lastRemoteConfigError = lastRemoteConfigError,
+                    onBack = { showStreamingConfigScreen = false },
+                    onSaveRemoteConfigUrl = { url, resetOverrides ->
+                        viewModel.saveRemoteConfigUrl(url, resetOverrides = resetOverrides)
+                    },
+                    onTestRemoteConfigUrl = { viewModel.testRemoteConfigUrl(it) },
+                    onRefreshRemoteConfig = { url, resetOverrides ->
+                        viewModel.refreshRemoteConfig(url, resetOverrides = resetOverrides)
+                    },
+                    onClearRemoteConfigFeedback = { viewModel.clearRemoteConfigConnectionState() },
+                    onRollbackRemoteConfig = { viewModel.rollbackRemoteConfig() },
+                    onTestProvider = { viewModel.online.testProviderConnectivity(it) },
+                    onTestLyricsProvider = { viewModel.online.testLyricsProviderConnectivity(it) },
+                    onTestAllProviders = { viewModel.online.testAllProvidersConnectivity() },
+                    onToggleMusicProviderEnabled = { viewModel.toggleMusicProviderEnabled(it) },
+                    onMoveMusicProviderUp = { viewModel.moveMusicProviderPriorityUp(it) },
+                    onMoveMusicProviderDown = { viewModel.moveMusicProviderPriorityDown(it) },
+                    onToggleLyricsProviderEnabled = { viewModel.toggleLyricsProviderEnabled(it) },
+                    onMoveLyricsProviderUp = { viewModel.moveLyricsProviderPriorityUp(it) },
+                    onMoveLyricsProviderDown = { viewModel.moveLyricsProviderPriorityDown(it) },
+                    onResetOverrides = { viewModel.resetProviderOverrides() },
+                    onBuildDiagnosticsReport = { viewModel.online.buildDiagnosticsReportText() },
+                    onNotifyMessage = { viewModel.notifyMessage(it) }
                 )
             }
 

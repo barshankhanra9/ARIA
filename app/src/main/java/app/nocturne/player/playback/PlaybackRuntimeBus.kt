@@ -48,6 +48,8 @@ data class OnlineEngineSnapshot(
 
 interface OnlinePlaybackBridge {
     fun playOnlineTracks(tracks: List<OnlineTrack>, startIndex: Int = 0, shuffle: Boolean = false)
+    fun playSingleTrackForRadio(track: OnlineTrack)
+    fun appendRadioTracksIfSeedActive(seedTrackId: String, tracks: List<OnlineTrack>)
     fun togglePlayPause()
     fun pause()
     fun seekTo(positionMs: Long)

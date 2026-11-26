@@ -410,9 +410,7 @@ class AffinityRepository(
         }
 
         fun trackSignature(title: String, artist: String): String {
-            val t = title.lowercase().replace(Regex("[^a-z0-9]"), "")
-            val a = normalizeArtistKey(artist).replace(" ", "")
-            return "$t|$a"
+            return app.nocturne.player.data.audio.MetadataCleaner.strictTrackDedupKey(title, artist)
         }
     }
 }

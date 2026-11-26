@@ -1,7 +1,9 @@
 package app.nocturne.player.data.online
 
+import app.nocturne.player.data.model.DynamicLyricsProviderConfig
 import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.EndpointHealthInfo
+import app.nocturne.player.data.model.LyricsProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
@@ -262,12 +264,28 @@ class ProviderHealthTracker(
     }
 
     @Synchronized
-    fun diagnosticsForProvider(config: DynamicProviderConfig): ProviderDiagnosticsSnapshot {
+    fun diagnosticsForProvider(
+        config: DynamicProviderConfig,
+        hasLocalOverride: Boolean = false
+    ): ProviderDiagnosticsSnapshot {
         val id = config.id.lowercase()
         val now = clockMs()
         val provSt = providerState(id)
+        val lyricsCapable = config.adapterType.equals("jiosaavn", ignoreCase = true) ||
+            config.capabilities.any { it.equals("lyrics", ignoreCase = true) || it.equals("all", ignoreCase = true) } ||
+            config.endpointsFor(OperationType.LYRICS).isNotEmpty()
+
         val opHealth = OperationType.entries.associateWith { op ->
-            val eps = config.endpointsFor(op)
+            val eps = when (op) {
+                OperationType.LYRICS -> if (lyricsCapable) {
+                    config.endpointsFor(OperationType.LYRICS).ifEmpty {
+                        config.endpoints.filter { it.enabled }.sortedBy { it.priority }
+                    }
+                } else {
+                    emptyList()
+                }
+                else -> config.endpointsFor(op)
+            }
             eps.map { ep ->
                 val epSt = endpointState(id, ep.url, op)
                 val remaining = (epSt.cooldownUntilMs - now).coerceAtLeast(0L)
@@ -278,7 +296,7 @@ class ProviderHealthTracker(
                     isHealthy = remaining == 0L,
                     cooldownRemainingMs = remaining,
                     consecutiveFailures = epSt.consecutiveFailures,
-                    ewmaLatencyMs = epSt.ewmaLatencyMs,
+                    ewmaLatencyMs = if (epSt.lastSuccessAtMs > 0L) epSt.ewmaLatencyMs else 0L,
                     lastSuccessAtMs = epSt.lastSuccessAtMs,
                     lastError = epSt.lastError
                 )
@@ -291,6 +309,10 @@ class ProviderHealthTracker(
             ?: config.endpointsFor(OperationType.METADATA).firstOrNull()?.url
         val activePlay = lastSuccessfulEndpointByOp[ProviderOpKey(id, OperationType.PLAYBACK)]
             ?: config.endpointsFor(OperationType.PLAYBACK).firstOrNull()?.url
+        val activeLyrics = if (lyricsCapable) {
+            lastSuccessfulEndpointByOp[ProviderOpKey(id, OperationType.LYRICS)]
+                ?: opHealth[OperationType.LYRICS]?.firstOrNull()?.url
+        } else null
 
         return ProviderDiagnosticsSnapshot(
             providerId = config.id,
@@ -299,14 +321,68 @@ class ProviderHealthTracker(
             enabled = config.enabled,
             isAvailable = config.enabled && now >= provSt.cooldownUntilMs,
             priority = config.priority,
+            hasLocalOverride = hasLocalOverride,
+            supportsLyrics = lyricsCapable,
             configuredEndpoints = config.endpoints.map { it.url }.distinct(),
             activeSearchEndpoint = activeSearch,
             activeMetadataEndpoint = activeMeta,
             activePlaybackEndpoint = activePlay,
+            activeLyricsEndpoint = activeLyrics,
             operationHealth = opHealth,
             lastSuccessfulRequestMs = provSt.lastSuccessAtMs,
             lastError = provSt.lastError,
-            ewmaLatencyMs = provSt.ewmaLatencyMs
+            ewmaLatencyMs = if (provSt.lastSuccessAtMs > 0L) provSt.ewmaLatencyMs else 0L
+        )
+    }
+
+    @Synchronized
+    fun diagnosticsForLyricsProvider(
+        config: DynamicLyricsProviderConfig,
+        effectiveEndpoints: List<String>,
+        hasLocalOverride: Boolean = false
+    ): LyricsProviderDiagnosticsSnapshot {
+        val id = config.id.lowercase()
+        val now = clockMs()
+        val provSt = providerState(id)
+        val urls = effectiveEndpoints.map { it.trim().trimEnd('/') }.filter { it.isNotBlank() }.distinct()
+        val epInfos = urls.mapIndexed { idx, url ->
+            val explicitPri = config.endpoints.firstOrNull { it.url.trimEnd('/').equals(url, ignoreCase = true) }?.priority
+                ?: (idx + 1)
+            val epSt = endpointState(id, url, OperationType.LYRICS)
+            val remaining = (epSt.cooldownUntilMs - now).coerceAtLeast(0L)
+            EndpointHealthInfo(
+                url = url,
+                priority = explicitPri,
+                operation = OperationType.LYRICS,
+                isHealthy = remaining == 0L && epSt.consecutiveFailures == 0,
+                cooldownRemainingMs = remaining,
+                consecutiveFailures = epSt.consecutiveFailures,
+                ewmaLatencyMs = if (epSt.lastSuccessAtMs > 0L) epSt.ewmaLatencyMs else 0L,
+                lastSuccessAtMs = epSt.lastSuccessAtMs,
+                lastError = epSt.lastError
+            )
+        }
+        val activeEp = lastSuccessfulEndpointByOp[ProviderOpKey(id, OperationType.LYRICS)]
+            ?: urls.firstOrNull()
+        val anyUnhealthy = epInfos.any { !it.isHealthy }
+        val isHealthy = config.enabled && now >= provSt.cooldownUntilMs && (!anyUnhealthy || epInfos.any { it.isHealthy })
+        val resolvedLatency = epInfos.firstOrNull { it.ewmaLatencyMs > 0L }?.ewmaLatencyMs
+            ?: if (provSt.lastSuccessAtMs > 0L) provSt.ewmaLatencyMs else 0L
+
+        return LyricsProviderDiagnosticsSnapshot(
+            providerId = config.id,
+            displayName = config.displayName,
+            adapterType = config.adapterType,
+            enabled = config.enabled,
+            isHealthy = isHealthy && !anyUnhealthy,
+            priority = config.priority,
+            hasLocalOverride = hasLocalOverride,
+            configuredEndpoints = urls,
+            activeEndpoint = activeEp,
+            endpoints = epInfos,
+            lastSuccessfulRequestMs = provSt.lastSuccessAtMs,
+            lastError = epInfos.firstNotNullOfOrNull { it.lastError } ?: provSt.lastError,
+            ewmaLatencyMs = resolvedLatency
         )
     }
 }

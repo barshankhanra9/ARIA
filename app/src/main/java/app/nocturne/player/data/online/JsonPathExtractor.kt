@@ -39,33 +39,17 @@ object JsonPathExtractor {
 
     fun extractLong(root: JsonElement?, pathSpec: String?): Long? {
         val el = extractElement(root, pathSpec) ?: return null
-        return when (el) {
-            is JsonPrimitive -> el.longOrNull ?: el.contentOrNull?.trim()?.toDoubleOrNull()?.toLong()
-            is JsonArray -> (el.firstOrNull() as? JsonPrimitive)?.let { p ->
-                p.longOrNull ?: p.contentOrNull?.trim()?.toDoubleOrNull()?.toLong()
-            }
-            else -> null
-        }
+        return el.extractLongSafe()
     }
 
     fun extractInt(root: JsonElement?, pathSpec: String?): Int? {
         val el = extractElement(root, pathSpec) ?: return null
-        return when (el) {
-            is JsonPrimitive -> el.intOrNull ?: el.contentOrNull?.trim()?.toDoubleOrNull()?.toInt()
-            else -> null
-        }
+        return el.extractIntSafe()
     }
 
     fun extractBoolean(root: JsonElement?, pathSpec: String?): Boolean? {
         val el = extractElement(root, pathSpec) ?: return null
-        return (el as? JsonPrimitive)?.booleanOrNull
-            ?: (el as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase()?.let {
-                when (it) {
-                    "true", "1", "yes" -> true
-                    "false", "0", "no" -> false
-                    else -> null
-                }
-            }
+        return el.extractBooleanSafe()
     }
 
     fun extractArray(root: JsonElement?, pathSpec: String?): List<JsonElement> {
@@ -93,20 +77,8 @@ object JsonPathExtractor {
     }
 
     private fun elementToString(el: JsonElement): String? {
-        return when (el) {
-            is JsonPrimitive -> el.contentOrNull?.takeIf { it.isNotBlank() && it != "null" }
-            is JsonArray -> {
-                val parts = el.mapNotNull { elementToString(it) }.distinct()
-                parts.takeIf { it.isNotEmpty() }?.joinToString(", ")
-            }
-            is JsonObject -> {
-                (el["name"] as? JsonPrimitive)?.contentOrNull
-                    ?: (el["title"] as? JsonPrimitive)?.contentOrNull
-                    ?: (el["url"] as? JsonPrimitive)?.contentOrNull
-                    ?: (el["text"] as? JsonPrimitive)?.contentOrNull
-                    ?: (el["value"] as? JsonPrimitive)?.contentOrNull
-            }
-        }
+        return el.extractText()
+            ?: el.extractUrlString()
     }
 
     private fun traverseSinglePath(root: JsonElement, rawPath: String): JsonElement? {

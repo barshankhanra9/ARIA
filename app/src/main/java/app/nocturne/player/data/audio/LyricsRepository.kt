@@ -81,12 +81,31 @@ class LyricsRepository(
             )
         }
         val active = remoteConfigRepository.activeConfig.value
-        val candidates = listOf(
-            liriqoAdapter to (active.liriqoConfig()?.priority ?: 1),
-            musixmatchAdapter to (active.musixmatchConfig()?.priority ?: 2),
-            jiosaavnAdapter to (active.jiosaavnLyricsConfig()?.priority ?: 3),
-            lrclibAdapter to (active.lrclibConfig()?.priority ?: 4)
-        )
+        val candidates = buildList {
+            val liriqoExplicit = active.lyricsProviderById("liriqo")
+            if (liriqoExplicit == null || liriqoExplicit.enabled) {
+                add(liriqoAdapter to (liriqoExplicit?.priority ?: 1))
+            }
+
+            val mxmExplicit = active.lyricsProviderById("musixmatch")
+            if (mxmExplicit == null || mxmExplicit.enabled) {
+                add(musixmatchAdapter to (mxmExplicit?.priority ?: 2))
+            }
+
+            val hasRemoteCatalog = active.providers.isNotEmpty() || active.lyricsProviders.isNotEmpty()
+            val saavnCfg = active.jiosaavnLyricsConfig()
+            if (saavnCfg != null || !hasRemoteCatalog) {
+                add(jiosaavnAdapter to (saavnCfg?.priority ?: 3))
+            }
+
+            val hasExplicitLrclib = active.lyricsProviders.any {
+                it.id.equals("lrclib", ignoreCase = true) || it.adapterType.equals("lrclib", ignoreCase = true)
+            }
+            val lrclibCfg = active.lrclibConfig()
+            if (!hasExplicitLrclib || lrclibCfg != null) {
+                add(lrclibAdapter to (lrclibCfg?.priority ?: 4))
+            }
+        }
         return candidates.sortedBy { it.second }.map { it.first }
     }
 

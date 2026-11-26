@@ -1179,6 +1179,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 forceRemoteRefresh = forceRemoteRefresh
             )
             _currentLyrics.value = result
+            online.refreshProviderHealth()
         }
     }
 
@@ -1237,11 +1238,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun saveRemoteConfigUrl(candidateUrl: String) {
+    fun saveRemoteConfigUrl(candidateUrl: String, resetOverrides: Boolean = false) {
         val trimmed = candidateUrl.trim()
         viewModelScope.launch {
             _remoteConfigConnectionState.value = RemoteConfigConnectionState.Saving(trimmed)
-            when (val res = remoteConfigRepo.saveAndActivateUrl(trimmed)) {
+            when (val res = remoteConfigRepo.saveAndActivateUrl(trimmed, resetOverrides = resetOverrides)) {
                 is ConfigOperationResult.Success -> {
                     online.refreshProviderHealth()
                     val cfg = res.config
@@ -1275,22 +1276,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _remoteConfigConnectionState.value = RemoteConfigConnectionState.Idle
     }
 
-    fun refreshRemoteConfig(customUrl: String? = null) {
+    fun refreshRemoteConfig(customUrl: String? = null, resetOverrides: Boolean = false) {
         val trimmed = customUrl?.trim()?.takeIf { it.isNotBlank() }
         if (trimmed != null) {
-            saveRemoteConfigUrl(trimmed)
+            saveRemoteConfigUrl(trimmed, resetOverrides = resetOverrides)
             return
         }
         viewModelScope.launch {
             _remoteConfigConnectionState.value = RemoteConfigConnectionState.Idle
-            val updated = remoteConfigRepo.refreshNow(customUrl = null, force = true)
+            val updated = remoteConfigRepo.refreshNow(
+                customUrl = null,
+                force = true,
+                resetOverrides = resetOverrides
+            )
             online.refreshProviderHealth()
             val status = remoteConfigRepo.status.value
             val err = remoteConfigRepo.lastFetchError.value
             when {
                 !err.isNullOrBlank() -> emitMessage("${status.lastErrorType.label.ifBlank { "Sync Error" }}: $err")
-                status.wasNotModified304 -> emitMessage("Provider config up to date (${updated.enabledProviders().size}/${updated.providers.size} enabled)")
-                else -> emitMessage("Synced ${updated.enabledProviders().size}/${updated.providers.size} active providers (v${updated.configVersion})")
+                status.wasNotModified304 -> emitMessage(
+                    if (resetOverrides) {
+                        "Reset local overrides · ${updated.enabledProviders().size}/${updated.providers.size} active"
+                    } else {
+                        "Provider config up to date (${updated.enabledProviders().size}/${updated.providers.size} enabled)"
+                    }
+                )
+                else -> emitMessage(
+                    "Synced ${updated.enabledProviders().size}/${updated.providers.size} active providers (v${updated.configVersion})"
+                )
             }
         }
     }
@@ -1306,6 +1319,60 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 emitMessage("No previous working configuration to roll back to")
             }
         }
+    }
+
+    fun toggleMusicProviderEnabled(providerId: String) {
+        viewModelScope.launch {
+            remoteConfigRepo.toggleMusicProviderEnabled(providerId)
+            online.refreshProviderHealth()
+        }
+    }
+
+    fun moveMusicProviderPriorityUp(providerId: String) {
+        viewModelScope.launch {
+            remoteConfigRepo.moveMusicProviderPriority(providerId, delta = -1)
+            online.refreshProviderHealth()
+        }
+    }
+
+    fun moveMusicProviderPriorityDown(providerId: String) {
+        viewModelScope.launch {
+            remoteConfigRepo.moveMusicProviderPriority(providerId, delta = +1)
+            online.refreshProviderHealth()
+        }
+    }
+
+    fun toggleLyricsProviderEnabled(providerId: String) {
+        viewModelScope.launch {
+            remoteConfigRepo.toggleLyricsProviderEnabled(providerId)
+            online.refreshProviderHealth()
+        }
+    }
+
+    fun moveLyricsProviderPriorityUp(providerId: String) {
+        viewModelScope.launch {
+            remoteConfigRepo.moveLyricsProviderPriority(providerId, delta = -1)
+            online.refreshProviderHealth()
+        }
+    }
+
+    fun moveLyricsProviderPriorityDown(providerId: String) {
+        viewModelScope.launch {
+            remoteConfigRepo.moveLyricsProviderPriority(providerId, delta = +1)
+            online.refreshProviderHealth()
+        }
+    }
+
+    fun resetProviderOverrides() {
+        viewModelScope.launch {
+            remoteConfigRepo.resetProviderOverrides()
+            online.refreshProviderHealth()
+            emitMessage("Reset local provider overrides")
+        }
+    }
+
+    fun notifyMessage(message: String) {
+        emitMessage(message)
     }
 
     // Tag Editor

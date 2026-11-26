@@ -189,7 +189,9 @@ data class UserSettings(
     val infiniteRadioEnabled: Boolean = true,
 
     // Remote Provider Config
-    val remoteProviderConfigUrl: String = DEFAULT_REMOTE_CONFIG_URL
+    val remoteProviderConfigUrl: String = DEFAULT_REMOTE_CONFIG_URL,
+    val musicProviderOverrides: Map<String, ProviderLocalOverride> = emptyMap(),
+    val lyricsProviderOverrides: Map<String, ProviderLocalOverride> = emptyMap()
 ) {
     companion object {
         const val LEGACY_REMOTE_CONFIG_URL =
@@ -198,6 +200,12 @@ data class UserSettings(
             "https://raw.githubusercontent.com/barshankhanra9/aria-providers/refs/heads/main/providers.json"
     }
 }
+
+@Serializable
+data class ProviderLocalOverride(
+    val enabled: Boolean? = null,
+    val priority: Int? = null
+)
 
 @Serializable
 data class RemoteProvidersConfig(
@@ -268,9 +276,6 @@ data class RemoteProvidersConfig(
         }
         if (explicitLyrics != null) {
             if (!explicitLyrics.enabled || !explicitLyrics.supportsCapability("lyrics")) return null
-            if (musicJioSaavn != null && !musicJioSaavn.enabled) {
-                return null
-            }
             return if (explicitLyrics.resolvedEndpoints().isEmpty() && musicJioSaavn != null) {
                 explicitLyrics.copy(
                     endpoints = musicJioSaavn.endpoints,
@@ -282,7 +287,11 @@ data class RemoteProvidersConfig(
                 explicitLyrics
             }
         }
-        if (musicJioSaavn != null && musicJioSaavn.enabled && musicJioSaavn.supportsCapability("lyrics")) {
+        val saavnSupportsLyrics = musicJioSaavn != null && musicJioSaavn.enabled && (
+            musicJioSaavn.supportsCapability("lyrics") ||
+                musicJioSaavn.endpointsFor(OperationType.LYRICS).isNotEmpty()
+            )
+        if (saavnSupportsLyrics && musicJioSaavn != null) {
             return DynamicLyricsProviderConfig(
                 id = "jiosaavn_lyrics",
                 displayName = "${musicJioSaavn.displayName} Lyrics",
@@ -304,6 +313,45 @@ data class RemoteProvidersConfig(
         return null
     }
 
+    fun resolvedLyricsProvidersForDiagnostics(): List<DynamicLyricsProviderConfig> {
+        val list = lyricsProviders.toMutableList()
+        val hasExplicitSaavn = list.any {
+            it.id.equals("jiosaavn_lyrics", ignoreCase = true) ||
+                it.id.equals("jiosaavnlyrics", ignoreCase = true) ||
+                it.adapterType.equals("jiosaavn_lyrics", ignoreCase = true) ||
+                it.id.equals("jiosaavn", ignoreCase = true)
+        }
+        val musicSaavn = providers.firstOrNull {
+            it.id.equals("jiosaavn", ignoreCase = true) ||
+                it.adapterType.equals("jiosaavn", ignoreCase = true)
+        }
+        val saavnSupportsLyrics = musicSaavn != null && (
+            musicSaavn.capabilities.isEmpty() ||
+                musicSaavn.capabilities.any { it.equals("lyrics", ignoreCase = true) || it.equals("all", ignoreCase = true) } ||
+                musicSaavn.endpointsFor(OperationType.LYRICS).isNotEmpty()
+            )
+        if (!hasExplicitSaavn && saavnSupportsLyrics && musicSaavn != null) {
+            list += DynamicLyricsProviderConfig(
+                id = "jiosaavn_lyrics",
+                displayName = "${musicSaavn.displayName} Lyrics",
+                category = "lyrics",
+                adapterType = "jiosaavn_lyrics",
+                enabled = musicSaavn.enabled,
+                priority = musicSaavn.priority,
+                capabilities = musicSaavn.capabilities,
+                endpoints = musicSaavn.endpoints,
+                instances = musicSaavn.baseUrls(),
+                timeoutMs = musicSaavn.timeoutMs,
+                maxRetries = musicSaavn.maxRetries,
+                cooldownMs = musicSaavn.cooldownMs,
+                endpointFailover = musicSaavn.endpointFailover,
+                headers = musicSaavn.headers,
+                params = musicSaavn.params
+            )
+        }
+        return list.sortedBy { it.priority }
+    }
+
     fun providerById(id: String): DynamicProviderConfig? =
         providers.firstOrNull { it.id.equals(id, ignoreCase = true) }
 
@@ -322,11 +370,12 @@ data class RemoteProvidersConfig(
 
     fun distinctCategories(): List<String> {
         val providerCats = providers.flatMap { it.effectiveCategories() }
-        val all = if (lyricsProviders.any { it.enabled && (it.resolvedEndpoints().isNotEmpty() || it.id.equals("musixmatch", ignoreCase = true)) }) {
-            providerCats + "Lyrics"
-        } else {
-            providerCats
+        val hasLyrics = resolvedLyricsProvidersForDiagnostics().any {
+            it.enabled && (it.resolvedEndpoints().isNotEmpty() ||
+                it.id.equals("musixmatch", ignoreCase = true) ||
+                it.id.equals("jiosaavn_lyrics", ignoreCase = true))
         }
+        val all = if (hasLyrics) providerCats + "Lyrics" else providerCats
         return all.distinct()
     }
 

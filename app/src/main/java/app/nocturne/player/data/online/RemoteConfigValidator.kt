@@ -51,7 +51,7 @@ object RemoteConfigValidator {
         "stripKeywordsRegex", "strip_keywords_regex",
         "titleDelimiters", "title_delimiters"
     )
-    private val ENDPOINT_OPERATIONS = setOf("search", "metadata", "playback", "all")
+    private val ENDPOINT_OPERATIONS = setOf("search", "metadata", "playback", "lyrics", "all")
 
     private val json = Json {
         ignoreUnknownKeys = true

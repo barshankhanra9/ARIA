@@ -3,6 +3,7 @@ package app.nocturne.player.data.audio.lyrics
 import android.net.Uri
 import app.nocturne.player.data.model.DynamicLyricsProviderConfig
 import app.nocturne.player.data.model.LyricsSource
+import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.online.JsonPathExtractor
 import app.nocturne.player.data.online.OnlineHttpClient
 import app.nocturne.player.data.online.ProviderHealthTracker
@@ -71,6 +72,7 @@ class JioSaavnLyricsAdapter(
                 "$cleanBase/lyrics?id=$encodedId"
             )
             for (url in candidateUrls) {
+                val startNs = System.nanoTime()
                 val res = LyricsHttpUtil.executeJsonGetWithHealth(
                     healthTracker = healthTracker,
                     providerId = providerId,
@@ -81,12 +83,23 @@ class JioSaavnLyricsAdapter(
                     maxRetries = maxRetries,
                     cooldownMs = cooldownMs,
                     maxBytes = 512L * 1024L,
-                    allowLoopback = baseUrlsOverride != null
+                    allowLoopback = baseUrlsOverride != null,
+                    operation = OperationType.LYRICS
                 )
+                val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
                 if (res is LyricsHttpUtil.EndpointFetchResult.EndpointFailure) {
+                    healthTracker.recordEndpointFailure(
+                        providerId = "jiosaavn",
+                        operation = OperationType.LYRICS,
+                        endpointUrl = cleanBase,
+                        error = res.reason,
+                        endpointFailureThreshold = 1,
+                        customCooldownMs = cooldownMs
+                    )
                     break
                 }
                 if (res is LyricsHttpUtil.EndpointFetchResult.Success) {
+                    healthTracker.recordEndpointSuccess("jiosaavn", OperationType.LYRICS, cleanBase, latencyMs)
                     val lyricsText = extractLyricsText(res.body)
                     if (!lyricsText.isNullOrBlank()) {
                         return@withContext ResolvedLyricsPayload(
@@ -94,6 +107,8 @@ class JioSaavnLyricsAdapter(
                             plainLyrics = lyricsText
                         )
                     }
+                } else if (res is LyricsHttpUtil.EndpointFetchResult.NotFound) {
+                    healthTracker.recordEndpointSuccess("jiosaavn", OperationType.LYRICS, cleanBase, latencyMs)
                 }
             }
         }

@@ -19,11 +19,8 @@ import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.OkHttpClient
 
 class PipedProvider(
@@ -81,15 +78,15 @@ class PipedProvider(
         }
 
         val resp = executeRawWithFallback(OperationType.SEARCH, path)
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-        val items = obj["items"]?.jsonArray.orEmpty()
+        val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
+        val items = obj.objArray("items").orEmpty()
 
         val tracks = mutableListOf<OnlineTrack>()
         val artists = mutableListOf<OnlineArtistSummary>()
         val albums = mutableListOf<OnlineAlbumSummary>()
 
         items.forEach { el ->
-            val itemObj = el.jsonObject
+            val itemObj = el.asObjectOrNull() ?: return@forEach
             when (itemObj.str("type")) {
                 "stream", null -> parseStreamItem(itemObj)?.let { tracks.add(it) }
                 "channel" -> parseChannelItem(itemObj)?.let { artists.add(it) }
@@ -115,13 +112,13 @@ class PipedProvider(
         val safeQuery = InputAndUrlSecurity.sanitizeSearchQuery(query)
         if (safeQuery.isBlank()) return@withContext emptyList()
         val resp = executeRawWithFallback(OperationType.SEARCH, "/suggestions?query=${Uri.encode(safeQuery)}")
-        json.parseToJsonElement(resp.body).jsonArray.mapNotNull { it.jsonPrimitive.contentOrNull }
+        json.parseArrayOrNull(resp.body)?.mapNotNull { it.extractText() }.orEmpty()
     }
 
     override suspend fun trending(): List<OnlineTrack> = withContext(Dispatchers.IO) {
         val resp = executeRawWithFallback(OperationType.SEARCH, "/trending?region=US")
-        val arr = json.parseToJsonElement(resp.body).jsonArray
-        arr.mapNotNull { parseStreamItem(it.jsonObject) }
+        val arr = json.parseArrayOrNull(resp.body) ?: JsonArray(emptyList())
+        arr.mapNotNull { it.asObjectOrNull()?.let(::parseStreamItem) }
     }
 
     override suspend fun resolveStream(
@@ -158,16 +155,17 @@ class PipedProvider(
                     cooldownMs = cooldownMs,
                     endpointFailover = false
                 )
-                val obj = json.parseToJsonElement(resp.body).jsonObject
+                val obj = json.parseObjectOrNull(resp.body)
+                    ?: throw IllegalStateException("Malformed stream JSON from $displayName")
                 if (!obj.str("error").isNullOrBlank()) {
                     throw IllegalStateException(obj.str("error") ?: "Piped stream error")
                 }
 
-                val rawStreams = obj["audioStreams"]?.jsonArray.orEmpty()
+                val rawStreams = obj.objArray("audioStreams").orEmpty()
                 val streams = rawStreams.mapNotNull { el ->
-                    val st = el.jsonObject
+                    val st = el.asObjectOrNull() ?: return@mapNotNull null
                     if (st.bool("videoOnly") == true) return@mapNotNull null
-                    val rawUrl = st.str("url")
+                    val rawUrl = st.strUrl("url")
                     val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
                     val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
                         ?: return@mapNotNull null
@@ -202,11 +200,11 @@ class PipedProvider(
                 lastWorkingInstance = resp.endpointUrl
                 val title = obj.str("title") ?: track.title
                 val uploader = obj.str("uploader") ?: track.artist
-                val uploaderUrl = obj.str("uploaderUrl")?.let { normalizeYoutubeUrl(it) } ?: track.artistUrl
+                val uploaderUrl = obj.strUrl("uploaderUrl")?.let { normalizeYoutubeUrl(it) } ?: track.artistUrl
                 val durationSec = obj.long("duration") ?: 0L
-                val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl"), allowedOrigin) ?: track.thumbnailUrl
-                val related = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
-                    parseStreamItem(it.jsonObject)
+                val thumb = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.strUrl("thumbnailUrl"), allowedOrigin) ?: track.thumbnailUrl
+                val related = obj.objArray("relatedStreams").orEmpty().mapNotNull {
+                    it.asObjectOrNull()?.let(::parseStreamItem)
                 }
 
                 return@withContext OnlineStreamResolution(
@@ -243,18 +241,18 @@ class PipedProvider(
         val channelId = InputAndUrlSecurity.sanitizePathSegment(extractChannelId(artistIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Piped channel ID")
         val resp = executeRawWithFallback(OperationType.METADATA, "/channel/${Uri.encode(channelId)}")
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-        val tracks = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
-            parseStreamItem(it.jsonObject)
+        val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
+        val tracks = obj.objArray("relatedStreams").orEmpty().mapNotNull {
+            it.asObjectOrNull()?.let(::parseStreamItem)
         }
         val subCount = obj.long("subscriberCount") ?: 0L
 
         OnlineArtistPage(
             id = channelId,
-            name = obj.str("name") ?: "Artist",
+            name = obj.str("name") ?: obj.str("author") ?: "Artist",
             url = "https://www.youtube.com/channel/${Uri.encode(channelId)}",
-            avatarUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("avatarUrl")),
-            bannerUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("bannerUrl")),
+            avatarUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.strUrl("avatarUrl")),
+            bannerUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.strUrl("bannerUrl")),
             subscriberCountText = if (subCount > 0L) "${subCount / 1000}K" else "",
             description = obj.str("description").orEmpty(),
             tracks = tracks,
@@ -268,17 +266,21 @@ class PipedProvider(
         val playlistId = InputAndUrlSecurity.sanitizePathSegment(extractPlaylistId(albumIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Piped playlist ID")
         val resp = executeRawWithFallback(OperationType.METADATA, "/playlists/${Uri.encode(playlistId)}")
-        val obj = json.parseToJsonElement(resp.body).jsonObject
-        val tracks = obj["relatedStreams"]?.jsonArray.orEmpty().mapNotNull {
-            parseStreamItem(it.jsonObject)
+        val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
+        val tracksArr = obj.objArray("relatedStreams")
+            ?: obj.objArray("videos")
+            ?: obj.objArray("items")
+            ?: JsonArray(emptyList())
+        val tracks = tracksArr.mapNotNull {
+            it.asObjectOrNull()?.let(::parseStreamItem)
         }
 
         OnlineAlbumPage(
             id = playlistId,
-            title = obj.str("name") ?: "Playlist",
-            artist = obj.str("uploader") ?: displayName,
+            title = obj.str("name") ?: obj.str("title") ?: "Playlist",
+            artist = obj.str("uploader") ?: obj.str("author") ?: displayName,
             url = "https://www.youtube.com/playlist?list=${Uri.encode(playlistId)}",
-            thumbnailUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnailUrl"))
+            thumbnailUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.strUrl("thumbnailUrl"))
                 ?: tracks.firstOrNull()?.thumbnailUrl,
             description = obj.str("description").orEmpty(),
             tracks = tracks,
@@ -298,9 +300,9 @@ class PipedProvider(
             val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
                 ?: return@withContext emptyList()
             val resp = executeRawWithFallback(OperationType.METADATA, "/streams/${Uri.encode(videoId)}")
-            val obj = json.parseToJsonElement(resp.body).jsonObject
-            obj["relatedStreams"]?.jsonArray.orEmpty()
-                .mapNotNull { parseStreamItem(it.jsonObject) }
+            val obj = json.parseObjectOrNull(resp.body) ?: return@withContext emptyList()
+            obj.objArray("relatedStreams").orEmpty()
+                .mapNotNull { it.asObjectOrNull()?.let(::parseStreamItem) }
                 .take(limit.coerceIn(1, 30))
         }
 

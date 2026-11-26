@@ -108,6 +108,29 @@ object MetadataCleaner {
         return parts.first()
     }
 
+    fun strictTrackDedupKey(title: String, artist: String): String {
+        val cleaned = clean(rawTitle = title, rawArtist = artist)
+        val extraNoiseRegex = Regex(
+            """(\[[^\]]*]|\([^)]*(official|audio|video|lyrics|lyric|visualizer|hq|hd|4k|8k|remaster|live|slowed|reverb|bass|version|edit|acoustic|unplugged|extended|mix|mv)[^)]*\))""",
+            RegexOption.IGNORE_CASE
+        )
+        val baseTitle = cleaned.title
+            .ifBlank { title }
+            .replace(extraNoiseRegex, " ")
+            .replace(featSuffixRegex, " ")
+            .let(::normalizeAlphaNum)
+            .ifBlank { normalizeAlphaNum(title) }
+
+        val primaryArtist = (cleaned.artist.ifBlank { artist })
+            .split(Regex("""\s*(?:,|&|\bfeat\.?|\bft\.?|\bfeaturing\b|\bx\b|\bwith\b)\s*""", RegexOption.IGNORE_CASE))
+            .firstOrNull { it.isNotBlank() }
+            ?: artist
+        val baseArtist = normalizeAlphaNum(primaryArtist)
+            .ifBlank { normalizeAlphaNum(artist) }
+
+        return "$baseTitle|$baseArtist"
+    }
+
     private fun normalizeAlphaNum(text: String): String =
         text.lowercase().replace(Regex("[^a-z0-9]"), "")
 

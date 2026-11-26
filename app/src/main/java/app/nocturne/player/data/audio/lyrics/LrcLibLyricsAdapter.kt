@@ -8,6 +8,7 @@ import app.nocturne.player.data.online.OnlineHttpClient
 import app.nocturne.player.data.online.ProviderHealthTracker
 import app.nocturne.player.data.online.bool
 import app.nocturne.player.data.online.long
+import app.nocturne.player.data.online.parseArrayOrNull
 import app.nocturne.player.data.online.str
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -15,7 +16,6 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonArray
 import okhttp3.OkHttpClient
 import kotlin.math.abs
 
@@ -83,7 +83,7 @@ class LrcLibLyricsAdapter(
             )
             val body = (res as? LyricsHttpUtil.EndpointFetchResult.Success)?.body ?: continue
             val best = runCatching {
-                val arr = json.parseToJsonElement(body).jsonArray
+                val arr = json.parseArrayOrNull(body) ?: return@runCatching null
                 pickBestMatch(arr, query.cleanedTitle, query.cleanedArtist, durationSec)
             }.getOrNull()
 

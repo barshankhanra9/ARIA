@@ -6,7 +6,8 @@ import kotlinx.serialization.Serializable
 enum class OperationType(val key: String, val label: String) {
     SEARCH("search", "Search"),
     METADATA("metadata", "Metadata"),
-    PLAYBACK("playback", "Playback")
+    PLAYBACK("playback", "Playback"),
+    LYRICS("lyrics", "Lyrics")
 }
 
 @Serializable
@@ -356,6 +357,9 @@ data class RemoteConfigStatus(
     val providerCount: Int = 0,
     val enabledProviderCount: Int = 0,
     val lyricsEndpointCount: Int = 0,
+    val totalLyricsProviderCount: Int = 0,
+    val enabledLyricsProviderCount: Int = 0,
+    val hasLocalOverrides: Boolean = false,
     val categories: List<String> = emptyList(),
     val lastError: String? = null,
     val lastErrorType: RemoteConfigErrorType = RemoteConfigErrorType.NONE
@@ -380,11 +384,30 @@ data class ProviderDiagnosticsSnapshot(
     val enabled: Boolean,
     val isAvailable: Boolean,
     val priority: Int,
+    val hasLocalOverride: Boolean = false,
+    val supportsLyrics: Boolean = false,
     val configuredEndpoints: List<String>,
     val activeSearchEndpoint: String? = null,
     val activeMetadataEndpoint: String? = null,
     val activePlaybackEndpoint: String? = null,
+    val activeLyricsEndpoint: String? = null,
     val operationHealth: Map<OperationType, List<EndpointHealthInfo>> = emptyMap(),
+    val lastSuccessfulRequestMs: Long = 0L,
+    val lastError: String? = null,
+    val ewmaLatencyMs: Long = 0L
+)
+
+data class LyricsProviderDiagnosticsSnapshot(
+    val providerId: String,
+    val displayName: String,
+    val adapterType: String,
+    val enabled: Boolean,
+    val isHealthy: Boolean,
+    val priority: Int,
+    val hasLocalOverride: Boolean = false,
+    val configuredEndpoints: List<String> = emptyList(),
+    val activeEndpoint: String? = null,
+    val endpoints: List<EndpointHealthInfo> = emptyList(),
     val lastSuccessfulRequestMs: Long = 0L,
     val lastError: String? = null,
     val ewmaLatencyMs: Long = 0L

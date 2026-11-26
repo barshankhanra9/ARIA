@@ -23,10 +23,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import okhttp3.OkHttpClient
 import java.io.IOException
 
@@ -85,7 +81,7 @@ class JioSaavnProvider(
                     fallbackPath = "/search/albums?query=$encodedQ&page=$page&limit=20"
                 )
                 val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-                val albums = results.mapNotNull { parseAlbumItem(it.jsonObject) }
+                val albums = results.mapNotNull { it.asObjectOrNull()?.let(::parseAlbumItem) }
                 OnlineSearchPage(
                     query = query,
                     albums = albums,
@@ -104,7 +100,7 @@ class JioSaavnProvider(
                     fallbackPath = "/search/artists?query=$encodedQ&page=$page&limit=20"
                 )
                 val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-                val artists = results.mapNotNull { parseArtistItem(it.jsonObject) }
+                val artists = results.mapNotNull { it.asObjectOrNull()?.let(::parseArtistItem) }
                 OnlineSearchPage(
                     query = query,
                     artists = artists,
@@ -123,7 +119,7 @@ class JioSaavnProvider(
                     fallbackPath = "/search/songs?query=$encodedQ&page=$page&limit=20"
                 )
                 val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-                val tracks = results.mapNotNull { parseSongItem(it.jsonObject) }
+                val tracks = results.mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
                 OnlineSearchPage(
                     query = query,
                     tracks = tracks,
@@ -149,7 +145,7 @@ class JioSaavnProvider(
         )
         extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
             .mapNotNull { el ->
-                val obj = el.jsonObject
+                val obj = el.asObjectOrNull() ?: return@mapNotNull el.extractText()?.let(::decodeHtmlEntities)
                 (obj.str("name") ?: obj.str("title"))?.let(::decodeHtmlEntities)
             }
             .distinct()
@@ -165,7 +161,7 @@ class JioSaavnProvider(
             fallbackPath = "/search/songs?query=${Uri.encode("latest trending songs")}&page=1&limit=20"
         )
         extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-            .mapNotNull { parseSongItem(it.jsonObject) }
+            .mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
     }
 
     suspend fun fetchNewReleases(): List<OnlineTrack> = withContext(Dispatchers.IO) {
@@ -177,7 +173,7 @@ class JioSaavnProvider(
             fallbackPath = "/search/songs?query=${Uri.encode("new releases")}&page=1&limit=16"
         )
         extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-            .mapNotNull { parseSongItem(it.jsonObject) }
+            .mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
     }
 
     suspend fun fetchCuratedPlaylists(): List<OnlineAlbumSummary> = withContext(Dispatchers.IO) {
@@ -196,7 +192,7 @@ class JioSaavnProvider(
             )
         }
         extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-            .mapNotNull { parseAlbumItem(it.jsonObject) }
+            .mapNotNull { it.asObjectOrNull()?.let(::parseAlbumItem) }
     }
 
     suspend fun fetchSongSuggestions(songId: String, limit: Int = 10): List<OnlineTrack> =
@@ -210,7 +206,7 @@ class JioSaavnProvider(
                 "/songs/${Uri.encode(safeSourceId)}/suggestions?limit=$boundedLimit"
             )
             extractResultsArray(sugResp.body, cfg?.mapping?.resultsPath)
-                .mapNotNull { parseSongItem(it.jsonObject) }
+                .mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
         }
 
     override suspend fun fetchRelatedTracks(track: OnlineTrack, limit: Int): List<OnlineTrack> {
@@ -297,15 +293,15 @@ class JioSaavnProvider(
             fallbackPath = "/artists/${Uri.encode(id)}"
         )
         val dataObj = extractDataObject(resp.body)
-        val topSongs = (dataObj?.get("topSongs") as? JsonArray).orEmpty()
-            .mapNotNull { parseSongItem(it.jsonObject) }
-        val topAlbums = (dataObj?.get("topAlbums") as? JsonArray).orEmpty()
-            .mapNotNull { parseAlbumItem(it.jsonObject) }
+        val topSongs = dataObj?.objArray("topSongs").orEmpty()
+            .mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
+        val topAlbums = dataObj?.objArray("topAlbums").orEmpty()
+            .mapNotNull { it.asObjectOrNull()?.let(::parseAlbumItem) }
 
         OnlineArtistPage(
             id = id,
-            name = decodeHtmlEntities(dataObj?.str("name") ?: "Artist"),
-            url = dataObj?.str("url") ?: artistIdOrUrl,
+            name = decodeHtmlEntities(dataObj?.str("name") ?: dataObj?.str("title") ?: "Artist"),
+            url = dataObj?.strUrl("url") ?: artistIdOrUrl,
             avatarUrl = pickBestImageUrl(dataObj?.get("image")),
             subscriberCountText = dataObj?.str("followerCount") ?: "",
             description = "",
@@ -336,18 +332,28 @@ class JioSaavnProvider(
             }
         }
         val dataObj = extractDataObject(resp.body)
-        val songs = (dataObj?.get("songs") as? JsonArray).orEmpty()
-            .mapNotNull { parseSongItem(it.jsonObject) }
+        val songsArr = (dataObj?.objArray("songs")
+            ?: dataObj?.objArray("list")
+            ?: dataObj?.objArray("tracks"))
+            ?: extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
+        val songs = songsArr.mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
 
         OnlineAlbumPage(
             id = id,
-            title = decodeHtmlEntities(dataObj?.str("name") ?: dataObj?.str("title") ?: "Album"),
-            artist = decodeHtmlEntities(
-                extractPrimaryArtists(dataObj).ifBlank { displayName }
+            title = decodeHtmlEntities(
+                dataObj?.str("name")
+                    ?: dataObj?.str("title")
+                    ?: dataObj?.str("listname")
+                    ?: "Album"
             ),
-            url = dataObj?.str("url") ?: albumIdOrUrl,
+            artist = decodeHtmlEntities(
+                extractPrimaryArtists(dataObj)
+                    .ifBlank { dataObj?.str("subtitle").orEmpty() }
+                    .ifBlank { displayName }
+            ),
+            url = dataObj?.strUrl("url") ?: albumIdOrUrl,
             thumbnailUrl = pickBestImageUrl(dataObj?.get("image")) ?: songs.firstOrNull()?.thumbnailUrl,
-            description = decodeHtmlEntities(dataObj?.str("description").orEmpty()),
+            description = decodeHtmlEntities(dataObj?.str("description") ?: dataObj?.str("subtitle").orEmpty()),
             tracks = songs,
             providerType = OnlineProviderType.JIOSAAVN,
             providerId = providerId
@@ -415,32 +421,43 @@ class JioSaavnProvider(
     }
 
     private fun extractResultsArray(body: String, configuredPath: String? = null): JsonArray {
-        val root = json.parseToJsonElement(body)
+        val root = json.parseElementOrNull(body) ?: return JsonArray(emptyList())
         if (!configuredPath.isNullOrBlank()) {
             val extracted = JsonPathExtractor.extractArray(root, configuredPath)
             if (extracted.isNotEmpty()) return JsonArray(extracted)
         }
         if (root is JsonArray) return root
-        val obj = root.jsonObject
+        val obj = root.asObjectOrNull() ?: return JsonArray(emptyList())
         val data = obj["data"]
         return when (data) {
             is JsonArray -> data
-            is JsonObject -> (data["results"] as? JsonArray) ?: JsonArray(emptyList())
-            else -> (obj["results"] as? JsonArray) ?: JsonArray(emptyList())
+            is JsonObject -> data.objArray("results")
+                ?: data.objArray("songs")
+                ?: data.objArray("list")
+                ?: JsonArray(emptyList())
+            else -> obj.objArray("results")
+                ?: obj.objArray("songs")
+                ?: obj.objArray("list")
+                ?: JsonArray(emptyList())
         }
     }
 
     private fun extractDataObject(body: String): JsonObject? {
-        val root = json.parseToJsonElement(body).jsonObject
-        return root["data"] as? JsonObject ?: root
+        val root = json.parseElementOrNull(body) ?: return null
+        val obj = root.asObjectOrNull() ?: return (root as? JsonArray)?.firstOrNull().asObjectOrNull()
+        return when (val data = obj["data"]) {
+            is JsonObject -> data
+            is JsonArray -> data.firstOrNull().asObjectOrNull()
+            else -> obj
+        }
     }
 
     private fun extractSongObject(body: String): JsonObject? {
-        val root = json.parseToJsonElement(body).jsonObject
+        val root = json.parseObjectOrNull(body) ?: return null
         val data = root["data"]
         return when (data) {
-            is JsonArray -> data.firstOrNull() as? JsonObject
-            is JsonObject -> (data["results"] as? JsonArray)?.firstOrNull() as? JsonObject ?: data
+            is JsonArray -> data.firstOrNull().asObjectOrNull()
+            is JsonObject -> data.objArray("results")?.firstOrNull().asObjectOrNull() ?: data
             else -> root
         }
     }
@@ -517,10 +534,10 @@ class JioSaavnProvider(
     }
 
     private fun parseDownloadUrls(el: JsonElement?): List<OnlineAudioStream> {
-        val arr = el as? JsonArray ?: return emptyList()
+        val arr = el.asArrayOrNull() ?: return emptyList()
         return arr.mapNotNull { item ->
-            val obj = item as? JsonObject ?: return@mapNotNull null
-            val rawUrl = obj.str("url") ?: obj.str("link")
+            val obj = item.asObjectOrNull() ?: return@mapNotNull null
+            val rawUrl = obj.strUrl("url") ?: obj.strUrl("link")
             val allowedOrigin = rawUrl?.takeIf { baseUrlsOverride != null }
             val url = InputAndUrlSecurity.validateRemoteHttpsUrl(rawUrl, allowedOrigin)
                 ?: return@mapNotNull null
@@ -546,27 +563,33 @@ class JioSaavnProvider(
 
     private fun extractPrimaryArtists(obj: JsonObject?): String {
         if (obj == null) return ""
-        val artistsObj = obj["artists"] as? JsonObject
-        val primaryArr = artistsObj?.get("primary") as? JsonArray
+        val artistsObj = obj.objObject("artists")
+        val primaryArr = artistsObj?.objArray("primary") ?: obj.objArray("primaryArtists")
         if (primaryArr != null && primaryArr.isNotEmpty()) {
-            val names = primaryArr.mapNotNull { (it as? JsonObject)?.str("name")?.takeIf { n -> n.isNotBlank() } }
+            val names = primaryArr.mapNotNull { item ->
+                (item.asObjectOrNull()?.str("name") ?: item.extractText())?.takeIf { it.isNotBlank() }
+            }
             if (names.isNotEmpty()) return names.joinToString(", ")
         }
-        return obj.str("primaryArtists").orEmpty()
+        return obj.str("primaryArtists")
+            ?: obj.str("artists")
+            ?: obj.str("subtitle")
+            ?: ""
     }
 
     private fun pickBestImageUrl(el: JsonElement?): String? {
         val raw = when (el) {
             is JsonArray -> {
-                val objects = el.mapNotNull { it as? JsonObject }
+                val objects = el.mapNotNull { it.asObjectOrNull() }
                 val preferred = objects.firstOrNull {
                     val q = it.str("quality").orEmpty()
                     q.contains("500") || q.contains("high", ignoreCase = true)
                 } ?: objects.lastOrNull()
-                preferred?.let { it.str("url") ?: it.str("link") }
+                preferred?.let { it.strUrl("url") ?: it.strUrl("link") }
+                    ?: el.lastOrNull()?.extractUrlString()
             }
-            is JsonPrimitive -> el.contentOrNull
-            else -> null
+            is JsonObject -> el.strUrl("url") ?: el.strUrl("link") ?: el.extractUrlString()
+            else -> el.extractUrlString()
         } ?: return null
 
         val upgraded = raw
@@ -578,10 +601,8 @@ class JioSaavnProvider(
         return InputAndUrlSecurity.validateRemoteHttpsUrl(upgraded, allowedOrigin)
     }
 
-    private fun parseFlexibleLong(el: JsonElement?): Long {
-        val prim = el as? JsonPrimitive ?: return 0L
-        return prim.contentOrNull?.trim()?.toLongOrNull() ?: 0L
-    }
+    private fun parseFlexibleLong(el: JsonElement?): Long =
+        el.extractLongSafe() ?: 0L
 
     private fun decodeHtmlEntities(input: String): String =
         JsonPathExtractor.decodeHtmlEntities(input).trim()

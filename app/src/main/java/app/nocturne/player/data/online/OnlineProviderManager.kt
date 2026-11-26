@@ -1,9 +1,14 @@
 package app.nocturne.player.data.online
 
 import android.content.Context
+import android.net.Uri
 import app.nocturne.player.data.audio.MetadataCleaner
+import app.nocturne.player.data.audio.lyrics.LyricsHttpUtil
+import app.nocturne.player.data.audio.lyrics.MusixmatchLyricsAdapter
+import app.nocturne.player.data.model.DynamicLyricsProviderConfig
 import app.nocturne.player.data.model.DynamicProviderConfig
 import app.nocturne.player.data.model.LyricsCleaningConfig
+import app.nocturne.player.data.model.LyricsProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -25,6 +30,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
 import java.io.IOException
 import java.util.ArrayDeque
@@ -208,7 +214,10 @@ class OnlineProviderManager(
         if (repo != null) {
             val cfg = repo.activeConfig.value
             return cfg.providers.sortedBy { it.priority }.map { providerCfg ->
-                healthTracker.diagnosticsForProvider(providerCfg)
+                healthTracker.diagnosticsForProvider(
+                    config = providerCfg,
+                    hasLocalOverride = repo.hasMusicProviderOverride(providerCfg.id)
+                )
             }
         }
         return currentAdaptersSnapshot().values.mapIndexed { idx, adapter ->
@@ -219,6 +228,43 @@ class OnlineProviderManager(
                 priority = idx + 1
             )
             healthTracker.diagnosticsForProvider(fallbackCfg)
+        }
+    }
+
+    fun getLyricsProviderDiagnostics(): List<LyricsProviderDiagnosticsSnapshot> {
+        val repo = remoteConfigRepository ?: return emptyList()
+        val cfg = repo.activeConfig.value
+        return cfg.resolvedLyricsProvidersForDiagnostics().map { lp ->
+            val effectiveEndpoints = resolveEffectiveLyricsEndpoints(cfg, lp)
+            healthTracker.diagnosticsForLyricsProvider(
+                config = lp,
+                effectiveEndpoints = effectiveEndpoints,
+                hasLocalOverride = repo.hasLyricsProviderOverride(lp.id)
+            )
+        }
+    }
+
+    private fun resolveEffectiveLyricsEndpoints(
+        cfg: RemoteProvidersConfig,
+        lp: DynamicLyricsProviderConfig
+    ): List<String> {
+        val direct = lp.resolvedEndpoints()
+        if (direct.isNotEmpty()) return direct
+        val adapter = lp.adapterType.lowercase().ifBlank { lp.id.lowercase() }
+        return when {
+            adapter == "musixmatch" || lp.id.equals("musixmatch", ignoreCase = true) ->
+                listOf(MusixmatchLyricsAdapter.DEFAULT_MUSIXMATCH_BASE)
+            adapter == "jiosaavn_lyrics" || lp.id.equals("jiosaavn_lyrics", ignoreCase = true) -> {
+                cfg.endpointsForProvider("jiosaavn").ifEmpty {
+                    cfg.providerById("jiosaavn")
+                        ?.endpoints
+                        ?.filter { it.enabled }
+                        ?.sortedBy { it.priority }
+                        ?.map { it.url }
+                        .orEmpty()
+                }
+            }
+            else -> emptyList()
         }
     }
 
@@ -565,8 +611,13 @@ class OnlineProviderManager(
             streamCache.getIfValid(track.id)?.relatedTracks?.let { results.addAll(it) }
         }
 
+        val seedKey = MetadataCleaner.strictTrackDedupKey(track.title, track.artist)
         filterSingleSongs(deduplicateTracks(results), forceFilter = true)
-            .filterNot { it.id == track.id }
+            .filterNot { candidate ->
+                candidate.id == track.id ||
+                    (track.sourceId.isNotBlank() && candidate.sourceId == track.sourceId && candidate.providerType == track.providerType) ||
+                    MetadataCleaner.strictTrackDedupKey(candidate.title, candidate.artist) == seedKey
+            }
             .take(limit)
     }
 
@@ -655,8 +706,13 @@ class OnlineProviderManager(
             }.onSuccess { collected.addAll(it) }
         }
 
+        val seedKey = MetadataCleaner.strictTrackDedupKey(seedTrack.title, seedTrack.artist)
         filterSingleSongs(deduplicateTracks(collected), forceFilter = true)
-            .filterNot { it.id == seedTrack.id }
+            .filterNot { candidate ->
+                candidate.id == seedTrack.id ||
+                    (seedTrack.sourceId.isNotBlank() && candidate.sourceId == seedTrack.sourceId && candidate.providerType == seedTrack.providerType) ||
+                    MetadataCleaner.strictTrackDedupKey(candidate.title, candidate.artist) == seedKey
+            }
             .take(limit)
     }
 
@@ -826,8 +882,8 @@ class OnlineProviderManager(
                     providerId = id,
                     displayName = displayName,
                     success = false,
-                    errorSummary = "Disabled in GitHub configuration",
-                    details = "Provider is disabled remotely"
+                    errorSummary = "Disabled",
+                    details = "Provider is disabled locally or in remote configuration"
                 )
             }
             if (adapter == null) {
@@ -877,6 +933,214 @@ class OnlineProviderManager(
             val ids = remoteConfigRepository?.activeConfig?.value?.providers?.map { it.id }
                 ?: adapters.keys.toList()
             ids.map { pid -> testProviderConnectivity(pid) }
+        }
+
+    suspend fun testLyricsProviderConnectivity(providerId: String): ProviderConnectivityTestResult =
+        withContext(Dispatchers.IO) {
+            val id = providerId.lowercase()
+            val cfg = remoteConfigRepository?.activeConfig?.value
+            val lp = cfg?.resolvedLyricsProvidersForDiagnostics()?.firstOrNull {
+                it.id.equals(id, ignoreCase = true)
+            } ?: return@withContext ProviderConnectivityTestResult(
+                providerId = id,
+                displayName = id.uppercase(),
+                success = false,
+                errorSummary = "Not configured",
+                details = "Lyrics provider not found in active configuration"
+            )
+
+            if (!lp.enabled) {
+                return@withContext ProviderConnectivityTestResult(
+                    providerId = lp.id,
+                    displayName = lp.displayName,
+                    success = false,
+                    errorSummary = "Disabled",
+                    details = "Lyrics provider is disabled"
+                )
+            }
+
+            val rawEndpoints = resolveEffectiveLyricsEndpoints(cfg, lp)
+            val safeEndpoints = rawEndpoints.mapNotNull {
+                InputAndUrlSecurity.validateRemoteBaseUrl(it, allowLoopback = allowLoopbackForTests)
+            }
+            if (safeEndpoints.isEmpty()) {
+                return@withContext ProviderConnectivityTestResult(
+                    providerId = lp.id,
+                    displayName = lp.displayName,
+                    success = false,
+                    errorSummary = "No endpoints",
+                    details = "No valid HTTPS lyrics endpoints configured"
+                )
+            }
+
+            healthTracker.resetEndpointCooldowns(lp.id)
+            val timedClient = LyricsHttpUtil.clientWithTimeout(httpClient, lp.timeoutMs)
+            val baseHeaders = InputAndUrlSecurity.sanitizeRemoteHeaderMap(lp.headers)
+            val cookie = lp.cookie?.takeIf { it.isNotBlank() }
+            val adapterKey = lp.adapterType.lowercase().ifBlank { lp.id.lowercase() }
+
+            var lastFailure: ProviderConnectivityTestResult? = null
+            var attempts = 0
+
+            for (baseEp in safeEndpoints) {
+                attempts++
+                val cleanBase = baseEp.trimEnd('/')
+                val result = when {
+                    adapterKey == "musixmatch" || lp.id.equals("musixmatch", ignoreCase = true) -> {
+                        val appId = lp.appId?.takeIf { it.isNotBlank() }
+                            ?: lp.params["app_id"]?.takeIf { it.isNotBlank() }
+                            ?: MusixmatchLyricsAdapter.DEFAULT_APP_ID
+                        val ua = lp.userAgent?.takeIf { it.isNotBlank() }
+                            ?: MusixmatchLyricsAdapter.DEFAULT_USER_AGENT
+                        val probeUrl = "$cleanBase/ws/1.1/token.get?app_id=${Uri.encode(appId)}&format=json"
+                        val mxmHeaders = baseHeaders + mapOf(
+                            "User-Agent" to ua,
+                            "Authority" to "apic-desktop.musixmatch.com",
+                            "Origin" to "https://apic-desktop.musixmatch.com"
+                        )
+                        val startNs = System.nanoTime()
+                        val fetchRes = LyricsHttpUtil.executeJsonGetWithHealth(
+                            healthTracker = healthTracker,
+                            providerId = lp.id,
+                            baseEndpoint = cleanBase,
+                            fullUrl = probeUrl,
+                            timedClient = timedClient,
+                            headers = mxmHeaders,
+                            cookie = cookie,
+                            maxRetries = 0,
+                            cooldownMs = lp.cooldownMs,
+                            maxBytes = 256L * 1024L,
+                            allowLoopback = allowLoopbackForTests,
+                            operation = OperationType.LYRICS,
+                            recordClientErrorsAsFailure = true
+                        )
+                        val latencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
+                        when (fetchRes) {
+                            is LyricsHttpUtil.EndpointFetchResult.Success -> {
+                                val mxmStatus = runCatching {
+                                    Json.parseToJsonElement(fetchRes.body)
+                                        .asObjectOrNull()
+                                        ?.get("message")?.asObjectOrNull()
+                                        ?.get("header")?.asObjectOrNull()
+                                        ?.get("status_code")?.extractIntSafe()
+                                }.getOrNull()
+                                if (mxmStatus != null && mxmStatus !in 200..299) {
+                                    val err = "HTTP $mxmStatus"
+                                    healthTracker.recordEndpointFailure(
+                                        providerId = lp.id,
+                                        operation = OperationType.LYRICS,
+                                        endpointUrl = cleanBase,
+                                        error = err,
+                                        endpointFailureThreshold = 1,
+                                        customCooldownMs = lp.cooldownMs
+                                    )
+                                    ProviderConnectivityTestResult(
+                                        providerId = lp.id,
+                                        displayName = lp.displayName,
+                                        success = false,
+                                        testedEndpoint = cleanBase,
+                                        latencyMs = latencyMs,
+                                        errorSummary = err,
+                                        details = "Musixmatch returned $err"
+                                    )
+                                } else {
+                                    ProviderConnectivityTestResult(
+                                        providerId = lp.id,
+                                        displayName = lp.displayName,
+                                        success = true,
+                                        testedEndpoint = cleanBase,
+                                        latencyMs = latencyMs,
+                                        details = "Token endpoint OK (${latencyMs}ms)"
+                                    )
+                                }
+                            }
+                            is LyricsHttpUtil.EndpointFetchResult.NotFound -> {
+                                ProviderConnectivityTestResult(
+                                    providerId = lp.id,
+                                    displayName = lp.displayName,
+                                    success = true,
+                                    testedEndpoint = cleanBase,
+                                    latencyMs = latencyMs,
+                                    details = "Reachable (HTTP ${fetchRes.statusCode})"
+                                )
+                            }
+                            is LyricsHttpUtil.EndpointFetchResult.EndpointFailure -> {
+                                ProviderConnectivityTestResult(
+                                    providerId = lp.id,
+                                    displayName = lp.displayName,
+                                    success = false,
+                                    testedEndpoint = cleanBase,
+                                    latencyMs = latencyMs,
+                                    errorSummary = fetchRes.reason,
+                                    details = fetchRes.reason
+                                )
+                            }
+                        }
+                    }
+                    adapterKey == "liriqo" || lp.id.equals("liriqo", ignoreCase = true) -> {
+                        LyricsHttpUtil.probeEndpoint(
+                            healthTracker = healthTracker,
+                            providerId = lp.id,
+                            displayName = lp.displayName,
+                            baseEndpoint = cleanBase,
+                            probeUrl = "$cleanBase/lyrics?title=Hello&artist=Adele",
+                            timedClient = timedClient,
+                            headers = baseHeaders,
+                            cookie = cookie,
+                            cooldownMs = lp.cooldownMs,
+                            allowLoopback = allowLoopbackForTests
+                        )
+                    }
+                    adapterKey == "jiosaavn_lyrics" || lp.id.equals("jiosaavn_lyrics", ignoreCase = true) -> {
+                        LyricsHttpUtil.probeEndpoint(
+                            healthTracker = healthTracker,
+                            providerId = lp.id,
+                            displayName = lp.displayName,
+                            baseEndpoint = cleanBase,
+                            probeUrl = "$cleanBase/lyrics?id=1",
+                            timedClient = timedClient,
+                            headers = baseHeaders,
+                            cookie = cookie,
+                            cooldownMs = lp.cooldownMs,
+                            allowLoopback = allowLoopbackForTests,
+                            mirrorToProviderId = "jiosaavn"
+                        )
+                    }
+                    else -> {
+                        LyricsHttpUtil.probeEndpoint(
+                            healthTracker = healthTracker,
+                            providerId = lp.id,
+                            displayName = lp.displayName,
+                            baseEndpoint = cleanBase,
+                            probeUrl = "$cleanBase/api/search?q=hello",
+                            timedClient = timedClient,
+                            headers = baseHeaders,
+                            cookie = cookie,
+                            cooldownMs = lp.cooldownMs,
+                            allowLoopback = allowLoopbackForTests
+                        )
+                    }
+                }
+                if (result.success) {
+                    return@withContext result.copy(failoverAttempts = (attempts - 1).coerceAtLeast(0))
+                }
+                lastFailure = result
+            }
+
+            (lastFailure ?: ProviderConnectivityTestResult(
+                providerId = lp.id,
+                displayName = lp.displayName,
+                success = false,
+                errorSummary = "Failed",
+                details = "All endpoints failed"
+            )).copy(failoverAttempts = (attempts - 1).coerceAtLeast(0))
+        }
+
+    suspend fun testAllLyricsProvidersConnectivity(): List<ProviderConnectivityTestResult> =
+        withContext(Dispatchers.IO) {
+            val list = remoteConfigRepository?.activeConfig?.value?.resolvedLyricsProvidersForDiagnostics()
+                .orEmpty()
+            list.map { lp -> testLyricsProviderConnectivity(lp.id) }
         }
 
     fun getCachedStream(trackId: String): OnlineStreamResolution? = streamCache.getIfValid(trackId)
@@ -1094,13 +1358,15 @@ class OnlineProviderManager(
 
         fun deduplicateTracks(tracks: List<OnlineTrack>): List<OnlineTrack> {
             val seenIds = HashSet<String>(tracks.size)
+            val seenSourceKeys = HashSet<String>(tracks.size)
             val seenSignatures = HashSet<String>(tracks.size)
             val result = ArrayList<OnlineTrack>(tracks.size)
             for (t in tracks) {
-                val normTitle = t.title.lowercase().replace(Regex("[^a-z0-9]"), "")
-                val normArtist = t.artist.lowercase().replace(Regex("[^a-z0-9]"), "")
-                val signature = "$normTitle|$normArtist|${t.durationMs / 5000L}"
-                if (seenIds.add(t.id) && seenSignatures.add(signature)) {
+                val idAdded = seenIds.add(t.id)
+                val sourceKeyAdded = t.sourceId.isBlank() || seenSourceKeys.add("${t.providerType.name}:${t.sourceId}")
+                val signature = MetadataCleaner.strictTrackDedupKey(t.title, t.artist)
+                val sigAdded = seenSignatures.add(signature)
+                if (idAdded && sourceKeyAdded && sigAdded) {
                     result.add(t)
                 }
             }
