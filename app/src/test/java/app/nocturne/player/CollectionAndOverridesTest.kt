@@ -7,19 +7,37 @@ import app.nocturne.player.data.audio.LyricsRepository
 import app.nocturne.player.data.audio.MetadataCleaner
 import app.nocturne.player.data.db.AriaDatabase
 import app.nocturne.player.data.model.LyricsSource
+import app.nocturne.player.data.model.NetworkSpeedTier
+import app.nocturne.player.data.model.OnlineAlbumPage
+import app.nocturne.player.data.model.OnlineAlbumSummary
+import app.nocturne.player.data.model.OnlineArtistPage
 import app.nocturne.player.data.model.OnlineProviderType
+import app.nocturne.player.data.model.OnlineSearchFilter
+import app.nocturne.player.data.model.OnlineSearchPage
+import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.model.Track
 import app.nocturne.player.data.online.AudiusProvider
+import app.nocturne.player.data.online.DynamicHttpExecutor
 import app.nocturne.player.data.online.InvidiousProvider
 import app.nocturne.player.data.online.JioSaavnProvider
+import app.nocturne.player.data.online.OnlineMusicProvider
 import app.nocturne.player.data.online.OnlineProviderManager
 import app.nocturne.player.data.online.PipedProvider
 import app.nocturne.player.data.online.ProviderHealthTracker
 import app.nocturne.player.data.online.RemoteConfigRepository
 import app.nocturne.player.data.prefs.SettingsRepository
+import app.nocturne.player.ui.OnlineCoordinator
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -34,6 +52,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -561,6 +580,386 @@ class CollectionAndOverridesTest {
             assertTrue(lrclibDiag.ewmaLatencyMs > 0L)
         } finally {
             db.close()
+        }
+    }
+
+    @Test
+    fun playlistNavigationTarget_prefersExactIdAndDistinguishesProviders() {
+        val saavnPlaylist = OnlineAlbumSummary(
+            id = "pl_exact_8812",
+            title = "Top Bollywood 2026",
+            artist = "JioSaavn",
+            url = "https://www.jiosaavn.com/featured/top-bollywood/xyz",
+            providerType = OnlineProviderType.JIOSAAVN,
+            providerId = "jiosaavn",
+            isPlaylist = true
+        )
+        assertEquals("pl_exact_8812", saavnPlaylist.navigationTarget())
+
+        val pipedPlaylist = OnlineAlbumSummary(
+            id = "PLpiped_990",
+            title = "Midnight Mix",
+            artist = "Piped",
+            url = "https://piped.video/playlist?list=PLpiped_990",
+            providerType = OnlineProviderType.PIPED,
+            providerId = "piped",
+            isPlaylist = true
+        )
+        assertEquals("PLpiped_990", pipedPlaylist.navigationTarget())
+
+        val soundcloudPlaylist = OnlineAlbumSummary(
+            id = "sc_123",
+            title = "SC Set",
+            artist = "DJ",
+            url = "https://soundcloud.com/dj/sets/late-night",
+            providerType = OnlineProviderType.SOUNDCLOUD,
+            providerId = "soundcloud",
+            isPlaylist = true
+        )
+        assertEquals("https://soundcloud.com/dj/sets/late-night", soundcloudPlaylist.navigationTarget())
+    }
+
+    @Test
+    fun playlistDetails_queriesExactPlaylistIdAndTemplatedRoutesAcrossJioSaavnPipedAndInvidious() = runTest {
+        val server = MockWebServer()
+        server.start()
+        val recordedPaths = mutableListOf<String>()
+        try {
+            val baseUrl = server.url("").toString().trimEnd('/')
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    val path = request.path.orEmpty()
+                    recordedPaths += path
+                    return when {
+                        path.startsWith("/playlists?id=pl_alpha") ||
+                            path.startsWith("/api/playlists?id=pl_alpha") -> MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "status": "SUCCESS",
+                              "data": {
+                                "id": "pl_alpha",
+                                "name": "Alpha Drive Mix",
+                                "username": "Curator A",
+                                "image": [ { "quality": "500x500", "url": "https://img.example/alpha.jpg" } ],
+                                "songs": [
+                                  {
+                                    "id": "s_alpha_1",
+                                    "name": "Alpha Track One",
+                                    "duration": "205",
+                                    "artists": { "primary": [ { "name": "Artist Alpha" } ] }
+                                  }
+                                ]
+                              }
+                            }
+                            """.trimIndent()
+                        )
+                        path.startsWith("/playlists?id=pl_beta") ||
+                            path.startsWith("/api/playlists?id=pl_beta") -> MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "status": "SUCCESS",
+                              "data": {
+                                "id": "pl_beta",
+                                "name": "Beta Chill Vibes",
+                                "username": "Curator B",
+                                "image": [ { "quality": "500x500", "url": "https://img.example/beta.jpg" } ],
+                                "songs": [
+                                  {
+                                    "id": "s_beta_1",
+                                    "name": "Beta Track One",
+                                    "duration": "190",
+                                    "artists": { "primary": [ { "name": "Artist Beta" } ] }
+                                  }
+                                ]
+                              }
+                            }
+                            """.trimIndent()
+                        )
+                        path.startsWith("/playlists?browseId=PL_custom_1") -> MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "status": "SUCCESS",
+                              "data": {
+                                "id": "PL_custom_1",
+                                "name": "Templated Browse Playlist",
+                                "songs": [
+                                  { "id": "s_tmpl_1", "name": "Templated Song", "duration": "175" }
+                                ]
+                              }
+                            }
+                            """.trimIndent()
+                        )
+                        path == "/playlists/PL_piped_42" -> MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "name": "Piped Exact 42",
+                              "uploader": "Channel 42",
+                              "thumbnailUrl": "https://img.example/p42.jpg",
+                              "relatedStreams": [
+                                { "url": "/watch?v=vid42", "title": "Piped Song 42", "uploaderName": "Artist 42", "duration": 210 }
+                              ]
+                            }
+                            """.trimIndent()
+                        )
+                        path == "/api/v1/playlists/PL_inv_77" -> MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "playlistId": "PL_inv_77",
+                              "title": "Invidious Exact 77",
+                              "author": "Inv Host 77",
+                              "videos": [
+                                { "videoId": "inv77", "title": "Inv Song 77", "author": "Artist 77", "lengthSeconds": 185 }
+                              ]
+                            }
+                            """.trimIndent()
+                        )
+                        path.startsWith("/playlists") -> MockResponse().setResponseCode(200).setBody(
+                            """
+                            {
+                              "status": "SUCCESS",
+                              "data": {
+                                "id": "default_featured",
+                                "name": "WRONG DEFAULT FEATURED PLAYLIST",
+                                "songs": [ { "id": "wrong_1", "name": "Wrong Default Song", "duration": "180" } ]
+                              }
+                            }
+                            """.trimIndent()
+                        )
+                        else -> MockResponse().setResponseCode(404)
+                    }
+                }
+            }
+
+            val client = OkHttpClient()
+            val jiosaavn = JioSaavnProvider(client = client, baseUrlsOverride = listOf(baseUrl))
+
+            val alpha = jiosaavn.fetchAlbumOrPlaylist("pl_alpha", isPlaylist = true)
+            val beta = jiosaavn.fetchAlbumOrPlaylist("pl_beta", isPlaylist = true)
+            assertEquals("pl_alpha", alpha.id)
+            assertEquals("Alpha Drive Mix", alpha.title)
+            assertEquals("Alpha Track One", alpha.tracks.single().title)
+            assertTrue(alpha.isPlaylist)
+
+            assertEquals("pl_beta", beta.id)
+            assertEquals("Beta Chill Vibes", beta.title)
+            assertEquals("Beta Track One", beta.tracks.single().title)
+            assertTrue(beta.isPlaylist)
+            assertTrue(recordedPaths.any { it.contains("id=pl_alpha") })
+            assertTrue(recordedPaths.any { it.contains("id=pl_beta") })
+            assertFalse(recordedPaths.any { it == "/playlists" })
+
+            // Verify templated playlistDetails route with {browseId} is honored when configured
+            val context = ApplicationProvider.getApplicationContext<Application>()
+            val settingsRepo = SettingsRepository(context)
+            val configInterceptor = Interceptor { chain ->
+                val req = chain.request()
+                if (req.url.toString().contains("cfg.example/playlists.json")) {
+                    val body = """
+                        {
+                          "schemaVersion": 2,
+                          "configVersion": "2026.11.26-pl",
+                          "providers": [
+                            {
+                              "id": "jiosaavn",
+                              "displayName": "JioSaavn",
+                              "adapterType": "jiosaavn",
+                              "enabled": true,
+                              "priority": 10,
+                              "endpoints": [
+                                { "url": "$baseUrl", "priority": 1, "enabled": true, "operations": ["search", "metadata", "playback"] }
+                              ],
+                              "routes": {
+                                "playlistDetails": { "method": "GET", "path": "/playlists", "queryParams": { "browseId": "{browseId}" } }
+                              }
+                            }
+                          ]
+                        }
+                    """.trimIndent()
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(body.toResponseBody("application/json".toMediaType()))
+                        .build()
+                } else {
+                    chain.proceed(req)
+                }
+            }
+            val cfgClient = OkHttpClient.Builder().addInterceptor(configInterceptor).build()
+            val tracker = ProviderHealthTracker()
+            val remoteRepo = RemoteConfigRepository(
+                settingsRepository = settingsRepo,
+                baseClient = cfgClient,
+                allowTestLoopback = true
+            )
+            remoteRepo.refreshNow(customUrl = "https://cfg.example/playlists.json", force = true)
+            val templatedSaavn = JioSaavnProvider(
+                client = cfgClient,
+                healthTracker = tracker,
+                dynamicConfigProvider = { remoteRepo.activeConfig.value.providerById("jiosaavn") },
+                executorOverride = DynamicHttpExecutor(
+                    baseClient = cfgClient,
+                    healthTracker = tracker,
+                    allowLoopbackForTests = true
+                )
+            )
+            val templatedPage = templatedSaavn.fetchAlbumOrPlaylist("https://music.example/playlist?browseId=PL_custom_1", isPlaylist = true)
+            assertEquals("Templated Browse Playlist", templatedPage.title)
+            assertEquals("Templated Song", templatedPage.tracks.single().title)
+            assertTrue(recordedPaths.any { it == "/playlists?browseId=PL_custom_1" })
+
+            // Verify Piped & Invidious extract exact playlist ID from full playlist URLs
+            val piped = PipedProvider(client = client, baseUrlsOverride = listOf(baseUrl))
+            val pipedUrlPage = piped.fetchAlbumOrPlaylist("https://piped.video/playlist?list=PL_piped_42", isPlaylist = true)
+            assertEquals("Piped Exact 42", pipedUrlPage.title)
+            assertEquals("Piped Song 42", pipedUrlPage.tracks.single().title)
+
+            val invidious = InvidiousProvider(client = client, baseUrlsOverride = listOf(baseUrl))
+            val invUrlPage = invidious.fetchAlbumOrPlaylist("https://yewtu.be/playlist?list=PL_inv_77", isPlaylist = true)
+            assertEquals("Invidious Exact 77", invUrlPage.title)
+            assertEquals("Inv Song 77", invUrlPage.tracks.single().title)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun onlineCoordinator_resetsStateOnCollectionChangeAndDropsStaleOutOfOrderResponses() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val settingsRepo = SettingsRepository(context)
+        val tracker = ProviderHealthTracker()
+        val remoteRepo = RemoteConfigRepository(settingsRepository = settingsRepo, baseClient = OkHttpClient())
+
+        val firstGate = CompletableDeferred<Unit>()
+        val slowStarted = CompletableDeferred<Unit>()
+        val slowGate = CompletableDeferred<Unit>()
+        val fastGate = CompletableDeferred<Unit>()
+
+        val delayedProvider = object : OnlineMusicProvider {
+            override val providerType = OnlineProviderType.JIOSAAVN
+            override val supportsPagination: Boolean = false
+            override suspend fun search(
+                query: String,
+                filter: OnlineSearchFilter,
+                pageToken: String?
+            ) = OnlineSearchPage(query = query, providerUsed = providerType)
+
+            override suspend fun suggestions(query: String): List<String> = emptyList()
+            override suspend fun trending(): List<OnlineTrack> = emptyList()
+            override suspend fun resolveStream(
+                track: OnlineTrack,
+                speedTier: NetworkSpeedTier
+            ): OnlineStreamResolution = throw UnsupportedOperationException()
+            override suspend fun fetchRelatedTracks(track: OnlineTrack, limit: Int): List<OnlineTrack> = emptyList()
+            override suspend fun fetchArtist(artistIdOrUrl: String): OnlineArtistPage =
+                throw UnsupportedOperationException()
+
+            override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+                fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = true)
+
+            override suspend fun fetchAlbumOrPlaylist(
+                albumIdOrUrl: String,
+                isPlaylist: Boolean
+            ): OnlineAlbumPage {
+                when (albumIdOrUrl) {
+                    "pl_first" -> firstGate.await()
+                    "pl_slow" -> {
+                        slowStarted.complete(Unit)
+                        slowGate.await()
+                    }
+                    "pl_fast" -> fastGate.await()
+                }
+                val title = when (albumIdOrUrl) {
+                    "pl_first" -> "First Playlist"
+                    "pl_slow" -> "Stale Slow Playlist"
+                    "pl_fast" -> "Latest Fast Playlist"
+                    else -> "Unknown"
+                }
+                return OnlineAlbumPage(
+                    id = albumIdOrUrl,
+                    title = title,
+                    artist = "Curator",
+                    url = "https://example.org/playlist/$albumIdOrUrl",
+                    thumbnailUrl = "https://img.example/$albumIdOrUrl.jpg",
+                    tracks = listOf(
+                        OnlineTrack(
+                            id = "jiosaavn:trk_$albumIdOrUrl",
+                            sourceId = "trk_$albumIdOrUrl",
+                            providerType = OnlineProviderType.JIOSAAVN,
+                            sourceUrl = "https://example.org/song/$albumIdOrUrl",
+                            title = "Song for $albumIdOrUrl",
+                            artist = "Artist"
+                        )
+                    ),
+                    providerType = OnlineProviderType.JIOSAAVN,
+                    providerId = "jiosaavn",
+                    isPlaylist = isPlaylist
+                )
+            }
+        }
+
+        val manager = OnlineProviderManager(
+            providers = mapOf(OnlineProviderType.JIOSAAVN to delayedProvider),
+            healthTracker = tracker,
+            remoteConfigRepository = remoteRepo
+        )
+        val coordScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val coordinator = OnlineCoordinator(
+                app = context,
+                scope = coordScope,
+                emitMessage = {},
+                providerManagerOverride = manager
+            )
+
+            // Load first playlist to completion
+            coordinator.openAlbum("pl_first", OnlineProviderType.JIOSAAVN, "jiosaavn", isPlaylist = true)
+            firstGate.complete(Unit)
+            withTimeout(2_000L) {
+                while (coordinator.albumDetailState.value.isLoading) {
+                    delay(5L)
+                }
+            }
+            assertEquals("First Playlist", coordinator.albumDetailState.value.page?.title)
+            assertEquals("pl_first", coordinator.albumDetailState.value.requestedId)
+
+            // Selecting a new playlist immediately clears previous title, artwork, and tracks
+            coordinator.prepareAlbumSelection("pl_slow", OnlineProviderType.JIOSAAVN, "jiosaavn", isPlaylist = true)
+            val resetState = coordinator.albumDetailState.value
+            assertTrue(resetState.isLoading)
+            assertNull(resetState.page)
+            assertEquals("pl_slow", resetState.requestedId)
+            assertTrue(resetState.isPlaylist)
+
+            // Trigger slow request, wait until it enters fetch, then supersede with fast request
+            coordinator.openAlbum("pl_slow", OnlineProviderType.JIOSAAVN, "jiosaavn", isPlaylist = true)
+            withTimeout(2_000L) { slowStarted.await() }
+            coordinator.openAlbum("pl_fast", OnlineProviderType.JIOSAAVN, "jiosaavn", isPlaylist = true)
+
+            // Verify state immediately cleared for pl_fast before completion
+            assertTrue(coordinator.albumDetailState.value.isLoading)
+            assertNull(coordinator.albumDetailState.value.page)
+            assertEquals("pl_fast", coordinator.albumDetailState.value.requestedId)
+
+            // Complete pl_fast first, then let stale pl_slow resolve later
+            fastGate.complete(Unit)
+            withTimeout(2_000L) {
+                while (coordinator.albumDetailState.value.isLoading) {
+                    delay(5L)
+                }
+            }
+            slowGate.complete(Unit)
+            delay(30L)
+
+            val finalState = coordinator.albumDetailState.value
+            assertFalse(finalState.isLoading)
+            assertEquals("pl_fast", finalState.requestedId)
+            assertEquals("pl_fast", finalState.page?.id)
+            assertEquals("Latest Fast Playlist", finalState.page?.title)
+            assertEquals("Song for pl_fast", finalState.page?.tracks?.single()?.title)
+        } finally {
+            coordScope.cancel()
         }
     }
 }

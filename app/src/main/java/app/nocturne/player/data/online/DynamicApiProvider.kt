@@ -375,46 +375,125 @@ class DynamicApiProvider(
         )
     }
 
-    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
+    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+        fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = false)
+
+    override suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val currentCfg = cfg
-        val template = currentCfg.routes.albumDetails ?: currentCfg.routes.playlistDetails
-            ?: throw IOException("${currentCfg.displayName} does not support album or playlist details")
-        val rawId = albumIdOrUrl.trimEnd('/').substringAfterLast("/").substringBefore("?")
+        val trimmedInput = albumIdOrUrl.trim()
+        val preferPlaylist = isPlaylist ||
+            trimmedInput.contains("playlist", ignoreCase = true) ||
+            trimmedInput.contains("list=", ignoreCase = true) ||
+            trimmedInput.contains("/browse/", ignoreCase = true)
+
+        val primaryTemplate = if (preferPlaylist) {
+            currentCfg.routes.playlistDetails ?: currentCfg.routes.albumDetails
+        } else {
+            currentCfg.routes.albumDetails ?: currentCfg.routes.playlistDetails
+        } ?: throw IOException("${currentCfg.displayName} does not support album or playlist details")
+
+        val fallbackTemplate = if (preferPlaylist) {
+            currentCfg.routes.albumDetails?.takeIf { it != primaryTemplate }
+        } else {
+            currentCfg.routes.playlistDetails?.takeIf { it != primaryTemplate }
+        }
+
+        val rawId = extractCollectionId(trimmedInput)
         val safeId = InputAndUrlSecurity.sanitizePathSegment(rawId)
             ?: throw IllegalArgumentException("Invalid album ID for ${currentCfg.displayName}")
 
-        val response = executor.executeTemplated(
-            config = currentCfg,
-            operation = OperationType.METADATA,
-            template = template,
-            variables = mapOf("id" to safeId, "albumId" to safeId, "playlistId" to safeId)
-        )
-        val root = executor.parseJson(response.body)
-        val itemEl = currentCfg.mapping.itemPath?.let { JsonPathExtractor.extractElement(root, it) } ?: root
-        val alMap = currentCfg.mapping.album
-        val decodeHtml = currentCfg.mapping.decodeHtmlEntities
+        val vars = buildMap {
+            put("id", safeId)
+            put("albumId", safeId)
+            put("playlistId", safeId)
+            put("listId", safeId)
+            put("browseId", safeId)
+            put("sourceId", safeId)
+            if (trimmedInput.startsWith("https://", ignoreCase = true) ||
+                trimmedInput.startsWith("http://", ignoreCase = true)
+            ) {
+                put("url", trimmedInput)
+                put("link", trimmedInput)
+            }
+        }
 
-        val tracks = alMap.tracksPath?.let { path ->
-            JsonPathExtractor.extractArray(itemEl, path)
-                .mapNotNull { parseTrackItem(it, currentCfg, response.endpointUrl) }
-        }.orEmpty()
+        val templates = listOfNotNull(primaryTemplate, fallbackTemplate)
+        var firstPage: OnlineAlbumPage? = null
+        var firstError: Throwable? = null
 
-        OnlineAlbumPage(
-            id = safeId,
-            title = (JsonPathExtractor.extractString(itemEl, alMap.titlePath) ?: "Album")
-                .let { maybeDecodeHtml(it, decodeHtml) },
-            artist = (JsonPathExtractor.extractString(itemEl, alMap.artistPath) ?: currentCfg.displayName)
-                .let { maybeDecodeHtml(it, decodeHtml) },
-            url = extractValidUrl(itemEl, alMap.urlPath, response.endpointUrl) ?: albumIdOrUrl,
-            thumbnailUrl = extractValidUrl(itemEl, alMap.thumbnailPath, response.endpointUrl)
-                ?: tracks.firstOrNull()?.thumbnailUrl,
-            description = JsonPathExtractor.extractString(itemEl, alMap.descriptionPath)
-                ?.let { maybeDecodeHtml(it, decodeHtml) }.orEmpty(),
-            tracks = tracks,
-            providerType = OnlineProviderType.fromProviderId(currentCfg.id),
-            providerId = currentCfg.id,
-            providerLabel = currentCfg.displayName
-        )
+        for (template in templates) {
+            val respResult = runCatching {
+                executor.executeTemplated(
+                    config = currentCfg,
+                    operation = OperationType.METADATA,
+                    template = template,
+                    variables = vars
+                )
+            }
+            val response = respResult.getOrNull()
+            if (response == null) {
+                if (firstError == null) firstError = respResult.exceptionOrNull()
+                continue
+            }
+            val root = executor.parseJson(response.body)
+            val itemEl = currentCfg.mapping.itemPath?.let { JsonPathExtractor.extractElement(root, it) } ?: root
+            val alMap = currentCfg.mapping.album
+            val decodeHtml = currentCfg.mapping.decodeHtmlEntities
+
+            val tracks = alMap.tracksPath?.let { path ->
+                JsonPathExtractor.extractArray(itemEl, path)
+                    .mapNotNull { parseTrackItem(it, currentCfg, response.endpointUrl) }
+            }.orEmpty()
+
+            val page = OnlineAlbumPage(
+                id = JsonPathExtractor.extractString(itemEl, alMap.idPath)?.trim()?.takeIf { it.isNotBlank() } ?: safeId,
+                title = (JsonPathExtractor.extractString(itemEl, alMap.titlePath)
+                    ?: if (preferPlaylist) "Playlist" else "Album")
+                    .let { maybeDecodeHtml(it, decodeHtml) },
+                artist = (JsonPathExtractor.extractString(itemEl, alMap.artistPath) ?: currentCfg.displayName)
+                    .let { maybeDecodeHtml(it, decodeHtml) },
+                url = extractValidUrl(itemEl, alMap.urlPath, response.endpointUrl) ?: trimmedInput,
+                thumbnailUrl = extractValidUrl(itemEl, alMap.thumbnailPath, response.endpointUrl)
+                    ?: tracks.firstOrNull()?.thumbnailUrl,
+                description = JsonPathExtractor.extractString(itemEl, alMap.descriptionPath)
+                    ?.let { maybeDecodeHtml(it, decodeHtml) }.orEmpty(),
+                tracks = tracks,
+                providerType = OnlineProviderType.fromProviderId(currentCfg.id),
+                providerId = currentCfg.id,
+                providerLabel = currentCfg.displayName,
+                isPlaylist = preferPlaylist
+            )
+            if (page.tracks.isNotEmpty()) {
+                return@withContext page
+            }
+            if (firstPage == null) {
+                firstPage = page
+            }
+        }
+
+        firstPage ?: throw (firstError ?: IOException("Could not load ${currentCfg.displayName} collection $safeId"))
+    }
+
+    private fun extractCollectionId(input: String): String {
+        val trimmed = input.trim()
+        if (!trimmed.contains('/') && !trimmed.contains('?') && !trimmed.contains('=')) {
+            return trimmed
+        }
+        runCatching {
+            val normalized = if (trimmed.startsWith("http", ignoreCase = true)) {
+                trimmed
+            } else {
+                "https://placeholder.local/${trimmed.trimStart('/')}"
+            }
+            val uri = Uri.parse(normalized)
+            listOf("id", "playlistId", "albumId", "list", "listId", "browseId").forEach { key ->
+                uri.getQueryParameter(key)?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+        }
+        return trimmed.trimEnd('/').substringAfterLast("/").substringBefore("?").substringBefore("#")
     }
 
     private fun parseTrackItem(
@@ -506,20 +585,27 @@ class DynamicApiProvider(
         val alMap = cfg.mapping.album
         val decodeHtml = cfg.mapping.decodeHtmlEntities
         val id = (JsonPathExtractor.extractString(el, alMap.idPath)
-            ?: JsonPathExtractor.extractString(el, "id|albumId"))?.trim()?.takeIf { it.isNotBlank() } ?: return null
+            ?: JsonPathExtractor.extractString(el, "id|albumId|playlistId|browseId"))?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val url = JsonPathExtractor.extractString(el, alMap.urlPath) ?: id
+        val typeHint = JsonPathExtractor.extractString(el, "type|kind|itemType").orEmpty()
+        val isPlaylist = typeHint.contains("playlist", ignoreCase = true) ||
+            url.contains("playlist", ignoreCase = true) ||
+            url.contains("list=", ignoreCase = true)
         val title = (JsonPathExtractor.extractString(el, alMap.titlePath)
-            ?: JsonPathExtractor.extractString(el, "title|name"))?.let { maybeDecodeHtml(it, decodeHtml) } ?: "Album"
+            ?: JsonPathExtractor.extractString(el, "title|name"))?.let { maybeDecodeHtml(it, decodeHtml) }
+            ?: if (isPlaylist) "Playlist" else "Album"
         return OnlineAlbumSummary(
             id = id,
             title = title,
             artist = (JsonPathExtractor.extractString(el, alMap.artistPath)
                 ?: JsonPathExtractor.extractString(el, "artist|author"))?.let { maybeDecodeHtml(it, decodeHtml) }
                 ?: cfg.displayName,
-            url = JsonPathExtractor.extractString(el, alMap.urlPath) ?: id,
+            url = url,
             thumbnailUrl = extractValidUrl(el, alMap.thumbnailPath, null),
             trackCount = JsonPathExtractor.extractInt(el, alMap.trackCountPath) ?: 0,
             providerType = OnlineProviderType.fromProviderId(cfg.id),
-            providerId = cfg.id
+            providerId = cfg.id,
+            isPlaylist = isPlaylist
         )
     }
 

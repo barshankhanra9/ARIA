@@ -262,10 +262,37 @@ class PipedProvider(
         )
     }
 
-    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
+    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+        fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = true)
+
+    override suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val playlistId = InputAndUrlSecurity.sanitizePathSegment(extractPlaylistId(albumIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Piped playlist ID")
-        val resp = executeRawWithFallback(OperationType.METADATA, "/playlists/${Uri.encode(playlistId)}")
+        val cfg = currentConfig()
+        val template = cfg?.routes?.playlistDetails ?: cfg?.routes?.albumDetails
+        val resp = if (template != null && cfg != null) {
+            val r = executor.executeTemplated(
+                config = cfg,
+                operation = OperationType.METADATA,
+                template = template,
+                variables = mapOf(
+                    "id" to playlistId,
+                    "playlistId" to playlistId,
+                    "albumId" to playlistId,
+                    "listId" to playlistId,
+                    "browseId" to playlistId,
+                    "url" to albumIdOrUrl
+                ),
+                endpointOverride = baseUrlsOverride
+            )
+            lastWorkingInstance = r.endpointUrl
+            r
+        } else {
+            executeRawWithFallback(OperationType.METADATA, "/playlists/${Uri.encode(playlistId)}")
+        }
         val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
         val tracksArr = obj.objArray("relatedStreams")
             ?: obj.objArray("videos")
@@ -285,7 +312,8 @@ class PipedProvider(
             description = obj.str("description").orEmpty(),
             tracks = tracks,
             providerType = OnlineProviderType.PIPED,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 
@@ -402,7 +430,8 @@ class PipedProvider(
             thumbnailUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(obj.str("thumbnail")),
             trackCount = obj.int("videos") ?: 0,
             providerType = OnlineProviderType.PIPED,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 
@@ -434,8 +463,26 @@ class PipedProvider(
     }
 
     private fun extractPlaylistId(idOrUrl: String): String {
-        return runCatching {
-            Uri.parse(normalizeYoutubeUrl(idOrUrl)).getQueryParameter("list")?.takeIf { it.isNotBlank() }
-        }.getOrNull() ?: idOrUrl
+        val trimmed = idOrUrl.trim()
+        if (!trimmed.contains('/') && !trimmed.contains('?') && !trimmed.contains('=')) {
+            return trimmed
+        }
+        runCatching {
+            val normalized = normalizeYoutubeUrl(trimmed) ?: trimmed
+            val uri = Uri.parse(normalized)
+            listOf("list", "id", "playlistId", "listId", "browseId").forEach { key ->
+                uri.getQueryParameter(key)?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+            val segments = uri.pathSegments.orEmpty().filter { it.isNotBlank() }
+            val plIdx = segments.indexOfFirst {
+                it.equals("playlists", ignoreCase = true) ||
+                    it.equals("playlist", ignoreCase = true) ||
+                    it.equals("browse", ignoreCase = true)
+            }
+            if (plIdx >= 0 && plIdx + 1 < segments.size) {
+                return segments[plIdx + 1]
+            }
+        }
+        return trimmed.trimEnd('/').substringAfterLast("/").substringBefore("?").substringBefore("#")
     }
 }

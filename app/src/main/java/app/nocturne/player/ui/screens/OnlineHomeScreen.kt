@@ -544,7 +544,7 @@ fun OnlineHomeScreen(
                     ) {
                         items(
                             trendingState.curatedPlaylists.take(15),
-                            key = { "${it.providerType.name}:${it.id}" }
+                            key = { "${it.providerType.name}:${it.providerId}:${it.id}:${it.url}" }
                         ) { playlist ->
                             OnlineCuratedPlaylistCard(
                                 playlist = playlist,

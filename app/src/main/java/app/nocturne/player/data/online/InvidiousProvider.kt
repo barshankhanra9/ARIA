@@ -274,10 +274,37 @@ class InvidiousProvider(
         )
     }
 
-    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
+    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+        fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = true)
+
+    override suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val playlistId = InputAndUrlSecurity.sanitizePathSegment(extractPlaylistId(albumIdOrUrl))
             ?: throw IllegalArgumentException("Invalid Invidious playlist ID")
-        val resp = executeRawWithFallback(OperationType.METADATA, "/api/v1/playlists/${Uri.encode(playlistId)}")
+        val cfg = currentConfig()
+        val template = cfg?.routes?.playlistDetails ?: cfg?.routes?.albumDetails
+        val resp = if (template != null && cfg != null) {
+            val r = executor.executeTemplated(
+                config = cfg,
+                operation = OperationType.METADATA,
+                template = template,
+                variables = mapOf(
+                    "id" to playlistId,
+                    "playlistId" to playlistId,
+                    "albumId" to playlistId,
+                    "listId" to playlistId,
+                    "browseId" to playlistId,
+                    "url" to albumIdOrUrl
+                ),
+                endpointOverride = baseUrlsOverride
+            )
+            lastWorkingInstance = r.endpointUrl
+            r
+        } else {
+            executeRawWithFallback(OperationType.METADATA, "/api/v1/playlists/${Uri.encode(playlistId)}")
+        }
         val instanceUrl = resp.endpointUrl
         val obj = json.parseObjectOrNull(resp.body) ?: JsonObject(emptyMap())
         val videosArr = obj.objArray("videos")
@@ -298,7 +325,8 @@ class InvidiousProvider(
             description = obj.str("description").orEmpty(),
             tracks = videos,
             providerType = OnlineProviderType.INVIDIOUS,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 
@@ -425,7 +453,8 @@ class InvidiousProvider(
             thumbnailUrl = thumb,
             trackCount = obj.int("videoCount") ?: 0,
             providerType = OnlineProviderType.INVIDIOUS,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 
@@ -464,8 +493,30 @@ class InvidiousProvider(
     }
 
     private fun extractPlaylistId(idOrUrl: String): String {
-        return runCatching {
-            Uri.parse(idOrUrl).getQueryParameter("list")?.takeIf { it.isNotBlank() }
-        }.getOrNull() ?: idOrUrl
+        val trimmed = idOrUrl.trim()
+        if (!trimmed.contains('/') && !trimmed.contains('?') && !trimmed.contains('=')) {
+            return trimmed
+        }
+        runCatching {
+            val normalized = if (trimmed.startsWith("http", ignoreCase = true)) {
+                trimmed
+            } else {
+                "https://www.youtube.com/${trimmed.trimStart('/')}"
+            }
+            val uri = Uri.parse(normalized)
+            listOf("list", "id", "playlistId", "listId", "browseId").forEach { key ->
+                uri.getQueryParameter(key)?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+            val segments = uri.pathSegments.orEmpty().filter { it.isNotBlank() }
+            val plIdx = segments.indexOfFirst {
+                it.equals("playlists", ignoreCase = true) ||
+                    it.equals("playlist", ignoreCase = true) ||
+                    it.equals("browse", ignoreCase = true)
+            }
+            if (plIdx >= 0 && plIdx + 1 < segments.size) {
+                return segments[plIdx + 1]
+            }
+        }
+        return trimmed.trimEnd('/').substringAfterLast("/").substringBefore("?").substringBefore("#")
     }
 }

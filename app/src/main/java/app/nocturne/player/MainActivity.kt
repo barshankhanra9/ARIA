@@ -135,7 +135,8 @@ private enum class AppTab(
 private data class OnlineNavTarget(
     val idOrUrl: String,
     val providerType: OnlineProviderType,
-    val providerId: String? = null
+    val providerId: String? = null,
+    val isPlaylist: Boolean = false
 )
 
 class MainActivity : ComponentActivity() {
@@ -415,7 +416,7 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                             playlistTarget == null &&
                             onlinePlaylistTarget == null &&
                             onlineArtistDetail.page == null && !onlineArtistDetail.isLoading &&
-                            onlineAlbumDetail.page == null && !onlineAlbumDetail.isLoading
+                            lastAlbumNav == null && onlineAlbumDetail.page == null && !onlineAlbumDetail.isLoading
                     ) {
                         currentTab = AppTab.HOME
                     }
@@ -469,9 +470,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                         currentTab = AppTab.PLAYLISTS
                                     },
                                     onOpenCuratedPlaylist = { al ->
-                                        val target = al.url.ifBlank { al.id }
-                                        lastAlbumNav = OnlineNavTarget(target, al.providerType, al.providerId)
-                                        viewModel.online.openAlbum(target, al.providerType, al.providerId)
+                                        val target = al.navigationTarget()
+                                        lastAlbumNav = OnlineNavTarget(target, al.providerType, al.providerId, al.isPlaylist)
+                                        viewModel.online.prepareAlbumSelection(target, al.providerType, al.providerId, al.isPlaylist)
                                     }
                                 )
                             } else {
@@ -625,9 +626,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                         lastArtistNav = OnlineNavTarget(urlOrId, p, pid)
                                         viewModel.online.openArtist(urlOrId, p, pid)
                                     },
-                                    onOpenAlbum = { urlOrId, p, pid ->
-                                        lastAlbumNav = OnlineNavTarget(urlOrId, p, pid)
-                                        viewModel.online.openAlbum(urlOrId, p, pid)
+                                    onOpenAlbum = { urlOrId, p, pid, isPl ->
+                                        lastAlbumNav = OnlineNavTarget(urlOrId, p, pid, isPl)
+                                        viewModel.online.prepareAlbumSelection(urlOrId, p, pid, isPl)
                                     }
                                 )
                             } else {
@@ -738,23 +739,36 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     onPlayTracks = { list, idx, shuf -> viewModel.online.playTracks(list, idx, shuf) },
                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
                     onOpenContextMenu = { onlineContextMenuTrack = it },
-                    onOpenAlbum = { idOrUrl, prov, pid ->
-                        lastAlbumNav = OnlineNavTarget(idOrUrl, prov, pid)
-                        viewModel.online.openAlbum(idOrUrl, prov, pid)
+                    onOpenAlbum = { idOrUrl, prov, pid, isPl ->
+                        lastAlbumNav = OnlineNavTarget(idOrUrl, prov, pid, isPl)
+                        viewModel.online.prepareAlbumSelection(idOrUrl, prov, pid, isPl)
                     }
                 )
             }
 
             AnimatedVisibility(
-                visible = onlineAlbumDetail.isLoading || onlineAlbumDetail.page != null || onlineAlbumDetail.errorMessage != null,
+                visible = lastAlbumNav != null || onlineAlbumDetail.isLoading || onlineAlbumDetail.page != null || onlineAlbumDetail.errorMessage != null,
                 enter = fadeIn(),
                 exit = fadeOut()
             ) {
+                val activeAlbumNav = lastAlbumNav
                 OnlineAlbumDetailScreen(
                     state = onlineAlbumDetail,
                     currentPlayingTrackId = onlineSnapshot.currentTrack?.id,
-                    onBack = { viewModel.online.clearAlbumDetail() },
-                    onRetry = lastAlbumNav?.let { nav -> { viewModel.online.openAlbum(nav.idOrUrl, nav.providerType, nav.providerId) } },
+                    playlistId = activeAlbumNav?.idOrUrl ?: onlineAlbumDetail.requestedId.orEmpty(),
+                    providerType = activeAlbumNav?.providerType ?: onlineAlbumDetail.requestedProviderType,
+                    providerId = activeAlbumNav?.providerId ?: onlineAlbumDetail.requestedProviderId,
+                    isPlaylist = activeAlbumNav?.isPlaylist ?: onlineAlbumDetail.isPlaylist,
+                    onLoadCollection = { id, p, pid, isPl ->
+                        viewModel.online.openAlbum(id, p, pid, isPl)
+                    },
+                    onBack = {
+                        lastAlbumNav = null
+                        viewModel.online.clearAlbumDetail()
+                    },
+                    onRetry = activeAlbumNav?.let { nav ->
+                        { viewModel.online.openAlbum(nav.idOrUrl, nav.providerType, nav.providerId, nav.isPlaylist) }
+                    },
                     onPlayTracks = { list, idx, shuf -> viewModel.online.playTracks(list, idx, shuf) },
                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
                     onOpenContextMenu = { onlineContextMenuTrack = it }
@@ -825,8 +839,8 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                             val cur = onlineSnapshot.currentTrack
                             val url = cur?.albumUrl?.takeIf { it.isNotBlank() }
                             if (url != null) {
-                                lastAlbumNav = OnlineNavTarget(url, cur.providerType, cur.effectiveProviderId())
-                                viewModel.online.openAlbum(url, cur.providerType, cur.effectiveProviderId())
+                                lastAlbumNav = OnlineNavTarget(url, cur.providerType, cur.effectiveProviderId(), isPlaylist = false)
+                                viewModel.online.prepareAlbumSelection(url, cur.providerType, cur.effectiveProviderId(), isPlaylist = false)
                             } else {
                                 viewModel.switchPlaybackMode(PlaybackMode.ONLINE)
                                 currentTab = AppTab.SEARCH
@@ -1066,8 +1080,8 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     },
                     onOpenAlbum = tr.albumUrl?.takeIf { it.isNotBlank() }?.let { target ->
                         {
-                            lastAlbumNav = OnlineNavTarget(target, tr.providerType, tr.effectiveProviderId())
-                            viewModel.online.openAlbum(target, tr.providerType, tr.effectiveProviderId())
+                            lastAlbumNav = OnlineNavTarget(target, tr.providerType, tr.effectiveProviderId(), isPlaylist = false)
+                            viewModel.online.prepareAlbumSelection(target, tr.providerType, tr.effectiveProviderId(), isPlaylist = false)
                         }
                     },
                     onViewDetails = { onlineDetailsTrack = tr }

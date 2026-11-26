@@ -279,8 +279,27 @@ data class OnlineAlbumSummary(
     val thumbnailUrl: String? = null,
     val trackCount: Int = 0,
     val providerType: OnlineProviderType,
-    val providerId: String = providerType.name.lowercase()
-)
+    val providerId: String = providerType.name.lowercase(),
+    val isPlaylist: Boolean = false
+) {
+    fun navigationTarget(): String {
+        val cleanId = id.trim()
+        val cleanUrl = url.trim()
+        if (providerId.lowercase() in setOf("jiosaavn", "audius")) {
+            return cleanId.ifBlank { cleanUrl }
+        }
+        return when (providerType) {
+            OnlineProviderType.JIOSAAVN,
+            OnlineProviderType.AUDIUS,
+            OnlineProviderType.PIPED,
+            OnlineProviderType.INVIDIOUS,
+            OnlineProviderType.DYNAMIC -> cleanId.ifBlank { cleanUrl }
+            OnlineProviderType.YOUTUBE -> cleanId.ifBlank { cleanUrl }
+            OnlineProviderType.SOUNDCLOUD,
+            OnlineProviderType.BANDCAMP -> cleanUrl.ifBlank { cleanId }
+        }
+    }
+}
 
 data class OnlineArtistPage(
     val id: String,
@@ -307,7 +326,8 @@ data class OnlineAlbumPage(
     val tracks: List<OnlineTrack> = emptyList(),
     val providerType: OnlineProviderType,
     val providerId: String = providerType.name.lowercase(),
-    val providerLabel: String = providerType.displayName
+    val providerLabel: String = providerType.displayName,
+    val isPlaylist: Boolean = false
 )
 
 data class OnlineSearchPage(

@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Album
@@ -32,8 +33,11 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.nocturne.player.data.model.OnlineProviderType
@@ -62,7 +66,7 @@ fun OnlineArtistDetailScreen(
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
     onOpenContextMenu: (OnlineTrack) -> Unit,
-    onOpenAlbum: (String, OnlineProviderType, String?) -> Unit
+    onOpenAlbum: (String, OnlineProviderType, String?, Boolean) -> Unit
 ) {
     BackHandler(onBack = onBack)
     val palette = AriaPaperTheme.palette
@@ -168,12 +172,17 @@ fun OnlineArtistDetailScreen(
                                     Text("RELEASES & PLAYLISTS", style = MaterialTheme.typography.labelSmall, color = palette.accent)
                                     Spacer(Modifier.height(8.dp))
                                     LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                        items(page.playlists, key = { it.id }) { al ->
+                                        items(
+                                            page.playlists,
+                                            key = { "${it.providerType.name}:${it.providerId}:${it.id}:${it.url}" }
+                                        ) { al ->
                                             PaperCard(
-                                                modifier = Modifier.width(136.dp),
+                                                modifier = Modifier
+                                                    .width(136.dp)
+                                                    .testTag("online_artist_album_${al.id}"),
                                                 containerColor = palette.paperElevated,
                                                 elevation = 2.dp,
-                                                onClick = { onOpenAlbum(al.url.ifBlank { al.id }, al.providerType, al.providerId) },
+                                                onClick = { onOpenAlbum(al.navigationTarget(), al.providerType, al.providerId, al.isPlaylist) },
                                                 contentPadding = PaddingValues(8.dp)
                                             ) {
                                                 PrintedArtwork(al.thumbnailUrl, al.thumbnailUrl, modifier = Modifier.fillMaxWidth().aspectRatio(1f), mattePadding = 2.dp, targetSizePx = 220)
@@ -215,6 +224,11 @@ fun OnlineArtistDetailScreen(
 fun OnlineAlbumDetailScreen(
     state: OnlineAlbumDetailState,
     currentPlayingTrackId: String?,
+    playlistId: String = state.requestedId.orEmpty(),
+    providerType: OnlineProviderType? = state.requestedProviderType,
+    providerId: String? = state.requestedProviderId,
+    isPlaylist: Boolean = state.isPlaylist,
+    onLoadCollection: ((String, OnlineProviderType, String?, Boolean) -> Unit)? = null,
     onBack: () -> Unit,
     onRetry: (() -> Unit)?,
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
@@ -223,6 +237,19 @@ fun OnlineAlbumDetailScreen(
 ) {
     BackHandler(onBack = onBack)
     val palette = AriaPaperTheme.palette
+
+    LaunchedEffect(playlistId, providerType, providerId, isPlaylist) {
+        if (playlistId.isNotBlank() && providerType != null && onLoadCollection != null) {
+            onLoadCollection(playlistId, providerType, providerId, isPlaylist)
+        }
+    }
+
+    val activePage = state.page?.takeIf {
+        !state.isLoading && (playlistId.isBlank() || state.requestedId == null || state.requestedId == playlistId)
+    }
+    val effectiveIsPlaylist = activePage?.isPlaylist ?: (state.isPlaylist || isPlaylist)
+    val isShowingLoading = state.isLoading ||
+        (playlistId.isNotBlank() && state.requestedId != playlistId && state.errorMessage == null)
 
     Box(
         modifier = Modifier
@@ -237,19 +264,23 @@ fun OnlineAlbumDetailScreen(
                     Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back", tint = palette.inkPrimary)
                 }
                 Column(Modifier.weight(1f)) {
+                    val providerTitle = activePage?.providerLabel?.takeIf { it.isNotBlank() }?.uppercase()
+                        ?: activePage?.providerType?.displayName?.uppercase()
+                        ?: providerType?.displayName?.uppercase()
+                        ?: "ONLINE"
+                    val collectionKind = if (effectiveIsPlaylist) "PLAYLIST" else "ALBUM"
                     Text(
-                        text = state.page?.providerLabel?.takeIf { it.isNotBlank() }?.uppercase()
-                            ?: state.page?.providerType?.displayName?.uppercase()
-                            ?: "ONLINE ALBUM",
+                        text = "$providerTitle · $collectionKind",
                         style = MaterialTheme.typography.labelSmall,
                         color = palette.accent
                     )
                     Text(
-                        text = state.page?.title ?: "Collection",
+                        text = activePage?.title ?: if (effectiveIsPlaylist) "Playlist" else "Collection",
                         style = MaterialTheme.typography.headlineMedium,
                         color = palette.inkPrimary,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.testTag("online_collection_title")
                     )
                 }
             }
@@ -258,8 +289,8 @@ fun OnlineAlbumDetailScreen(
             Spacer(Modifier.height(12.dp))
 
             when {
-                state.isLoading -> PaperSkeletonList(count = 6)
-                state.page == null -> PaperEmptyState(
+                isShowingLoading -> PaperSkeletonList(count = 6)
+                activePage == null -> PaperEmptyState(
                     icon = Icons.Rounded.CloudOff,
                     title = "Collection Unavailable",
                     subtitle = state.errorMessage ?: "Could not load album or playlist details.",
@@ -267,68 +298,75 @@ fun OnlineAlbumDetailScreen(
                     onAction = onRetry
                 )
                 else -> {
-                    val page = state.page
-                    LazyColumn(
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(bottom = 28.dp)
-                    ) {
-                        item(key = "album_hero") {
-                            PaperCard(
-                                containerColor = palette.paperCream,
-                                elevation = 4.dp,
-                                contentPadding = PaddingValues(14.dp)
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    PrintedArtwork(
-                                        trackUri = page.thumbnailUrl,
-                                        customCoverUri = page.thumbnailUrl,
-                                        modifier = Modifier.size(84.dp),
-                                        mattePadding = 4.dp,
-                                        targetSizePx = 280
-                                    )
-                                    Spacer(Modifier.width(14.dp))
-                                    Column(Modifier.weight(1f)) {
-                                        Text(page.title, style = MaterialTheme.typography.headlineSmall, color = palette.inkPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                        Spacer(Modifier.height(4.dp))
-                                        Text(page.artist, style = MaterialTheme.typography.bodyMedium, color = palette.accent)
-                                        Spacer(Modifier.height(6.dp))
-                                        InkStampTag(text = "${page.tracks.size} TRACKS", accented = true)
-                                    }
-                                }
-                                if (page.tracks.isNotEmpty()) {
-                                    Spacer(Modifier.height(12.dp))
-                                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                        TactilePaperButton(
-                                            text = "Play All",
-                                            onClick = { onPlayTracks(page.tracks, 0, false) },
-                                            modifier = Modifier.weight(1f),
-                                            icon = Icons.Rounded.PlayArrow
-                                        )
-                                        TactilePaperButton(
-                                            text = "Shuffle",
-                                            onClick = { onPlayTracks(page.tracks, page.tracks.indices.random(), true) },
-                                            modifier = Modifier.weight(1f),
-                                            icon = Icons.Rounded.Shuffle,
-                                            filled = false
-                                        )
-                                    }
-                                }
-                            }
+                    val page = activePage
+                    key(playlistId, page.id) {
+                        val listState = rememberLazyListState()
+                        LaunchedEffect(playlistId) {
+                            listState.scrollToItem(0)
                         }
-
-                        if (page.tracks.isEmpty()) {
-                            item(key = "album_empty") {
-                                PaperEmptyState(Icons.Rounded.Album, "No Tracks Found", "This online collection does not contain playable audio tracks.")
+                        LazyColumn(
+                            state = listState,
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            contentPadding = PaddingValues(bottom = 28.dp)
+                        ) {
+                            item(key = "album_hero_${page.id}") {
+                                PaperCard(
+                                    containerColor = palette.paperCream,
+                                    elevation = 4.dp,
+                                    contentPadding = PaddingValues(14.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        PrintedArtwork(
+                                            trackUri = page.thumbnailUrl,
+                                            customCoverUri = page.thumbnailUrl,
+                                            modifier = Modifier.size(84.dp),
+                                            mattePadding = 4.dp,
+                                            targetSizePx = 280
+                                        )
+                                        Spacer(Modifier.width(14.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(page.title, style = MaterialTheme.typography.headlineSmall, color = palette.inkPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(page.artist, style = MaterialTheme.typography.bodyMedium, color = palette.accent)
+                                            Spacer(Modifier.height(6.dp))
+                                            InkStampTag(text = "${page.tracks.size} TRACKS", accented = true)
+                                        }
+                                    }
+                                    if (page.tracks.isNotEmpty()) {
+                                        Spacer(Modifier.height(12.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            TactilePaperButton(
+                                                text = "Play All",
+                                                onClick = { onPlayTracks(page.tracks, 0, false) },
+                                                modifier = Modifier.weight(1f),
+                                                icon = Icons.Rounded.PlayArrow
+                                            )
+                                            TactilePaperButton(
+                                                text = "Shuffle",
+                                                onClick = { onPlayTracks(page.tracks, page.tracks.indices.random(), true) },
+                                                modifier = Modifier.weight(1f),
+                                                icon = Icons.Rounded.Shuffle,
+                                                filled = false
+                                            )
+                                        }
+                                    }
+                                }
                             }
-                        } else {
-                            itemsIndexed(page.tracks, key = { idx, t -> "${t.id}_$idx" }) { idx, track ->
-                                OnlineTrackListRow(
-                                    track = track,
-                                    isCurrent = track.id == currentPlayingTrackId,
-                                    onClick = { onPlayTracks(page.tracks, idx, false) },
-                                    onToggleFavorite = { onToggleFavorite(track) },
-                                    onMoreClick = { onOpenContextMenu(track) }
-                                )
+
+                            if (page.tracks.isEmpty()) {
+                                item(key = "album_empty") {
+                                    PaperEmptyState(Icons.Rounded.Album, "No Tracks Found", "This online collection does not contain playable audio tracks.")
+                                }
+                            } else {
+                                itemsIndexed(page.tracks, key = { idx, t -> "${page.id}_${t.id}_$idx" }) { idx, track ->
+                                    OnlineTrackListRow(
+                                        track = track,
+                                        isCurrent = track.id == currentPlayingTrackId,
+                                        onClick = { onPlayTracks(page.tracks, idx, false) },
+                                        onToggleFavorite = { onToggleFavorite(track) },
+                                        onMoreClick = { onOpenContextMenu(track) }
+                                    )
+                                }
                             }
                         }
                     }

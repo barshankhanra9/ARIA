@@ -836,7 +836,8 @@ class OnlineProviderManager(
     suspend fun fetchAlbumOrPlaylist(
         albumIdOrUrl: String,
         hintProvider: OnlineProviderType,
-        hintProviderId: String? = null
+        hintProviderId: String? = null,
+        isPlaylist: Boolean = false
     ): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(albumIdOrUrl, 300)
         require(cleanTarget.isNotBlank()) { "Album or playlist identifier cannot be blank" }
@@ -849,7 +850,7 @@ class OnlineProviderManager(
             val adapter = adapters[pid] ?: continue
             val start = System.currentTimeMillis()
             try {
-                val page = adapter.fetchAlbumOrPlaylist(cleanTarget)
+                val page = adapter.fetchAlbumOrPlaylist(cleanTarget, isPlaylist = isPlaylist)
                 healthTracker.recordProviderSuccess(
                     providerId = pid,
                     latencyMs = System.currentTimeMillis() - start,
@@ -859,7 +860,8 @@ class OnlineProviderManager(
                 return@withContext page.copy(
                     tracks = deduplicateTracks(page.tracks),
                     providerId = pid,
-                    providerLabel = page.providerLabel.ifBlank { adapter.displayName }
+                    providerLabel = page.providerLabel.ifBlank { adapter.displayName },
+                    isPlaylist = page.isPlaylist || isPlaylist
                 )
             } catch (t: Throwable) {
                 lastError = t
@@ -1273,7 +1275,8 @@ class OnlineProviderManager(
             val youtube = adapters.filter { it.key == "youtube" || it.value.providerType == OnlineProviderType.YOUTUBE }.keys
             val piped = adapters.filter { it.key == "piped" || it.value.providerType == OnlineProviderType.PIPED }.keys
             val invidious = adapters.filter { it.key == "invidious" || it.value.providerType == OnlineProviderType.INVIDIOUS }.keys
-            (youtube + piped + invidious).toList().distinct()
+            val hintedFirst = listOfNotNull(targetId.takeIf { it in adapters })
+            (hintedFirst + piped + invidious + youtube).toList().distinct()
         } else if (adapters.containsKey(targetId)) {
             listOf(targetId)
         } else {

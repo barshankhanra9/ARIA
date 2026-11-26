@@ -83,7 +83,7 @@ fun OnlineSearchScreen(
     onToggleFavorite: (OnlineTrack) -> Unit,
     onOpenContextMenu: (OnlineTrack) -> Unit,
     onOpenArtist: (String, OnlineProviderType, String?) -> Unit,
-    onOpenAlbum: (String, OnlineProviderType, String?) -> Unit
+    onOpenAlbum: (String, OnlineProviderType, String?, Boolean) -> Unit
 ) {
     val palette = AriaPaperTheme.palette
     val keyboard = LocalSoftwareKeyboardController.current
@@ -335,10 +335,13 @@ fun OnlineSearchScreen(
                                 Text("ALBUMS & COLLECTIONS", style = MaterialTheme.typography.labelSmall, color = palette.accent)
                                 Spacer(Modifier.height(8.dp))
                                 LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                    items(state.albums, key = { it.id }) { album ->
+                                    items(
+                                        state.albums,
+                                        key = { "${it.providerType.name}:${it.providerId}:${it.id}:${it.url}" }
+                                    ) { album ->
                                         OnlineAlbumCard(
                                             album = album,
-                                            onClick = { onOpenAlbum(album.url.ifBlank { album.id }, album.providerType, album.providerId) }
+                                            onClick = { onOpenAlbum(album.navigationTarget(), album.providerType, album.providerId, album.isPlaylist) }
                                         )
                                     }
                                 }
@@ -446,7 +449,9 @@ private fun OnlineAlbumCard(
 ) {
     val palette = AriaPaperTheme.palette
     PaperCard(
-        modifier = Modifier.width(142.dp),
+        modifier = Modifier
+            .width(142.dp)
+            .testTag("online_search_album_${album.id}"),
         containerColor = palette.paperElevated,
         elevation = 2.dp,
         onClick = onClick,

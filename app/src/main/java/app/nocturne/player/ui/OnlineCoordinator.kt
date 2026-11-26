@@ -80,6 +80,10 @@ data class OnlineArtistDetailState(
 )
 
 data class OnlineAlbumDetailState(
+    val requestedId: String? = null,
+    val requestedProviderType: OnlineProviderType? = null,
+    val requestedProviderId: String? = null,
+    val isPlaylist: Boolean = false,
     val isLoading: Boolean = false,
     val page: OnlineAlbumPage? = null,
     val errorMessage: String? = null
@@ -100,10 +104,11 @@ data class OnlineRecommendationsUiState(
 class OnlineCoordinator(
     private val app: Application,
     private val scope: CoroutineScope,
-    private val emitMessage: (String) -> Unit
+    private val emitMessage: (String) -> Unit,
+    private val providerManagerOverride: OnlineProviderManager? = null
 ) {
     private val remoteConfigRepo = OnlineDependencies.getRemoteConfigRepository(app)
-    private val providerManager = OnlineDependencies.getProviderManager(app)
+    private val providerManager = providerManagerOverride ?: OnlineDependencies.getProviderManager(app)
     private val repository = OnlineDependencies.getRepository(app)
     private val affinityRepo = OnlineDependencies.getAffinityRepository(app)
     private val recommendationEngine = OnlineDependencies.getRecommendationEngine(app)
@@ -210,6 +215,7 @@ class OnlineCoordinator(
     private var recommendationsJob: Job? = null
     private var artistJob: Job? = null
     private var albumJob: Job? = null
+    private var albumRequestSeq: Long = 0L
     private var radioFetchJob: Job? = null
 
     init {
@@ -736,28 +742,109 @@ class OnlineCoordinator(
         _artistDetailState.value = OnlineArtistDetailState()
     }
 
-    fun openAlbum(idOrUrl: String, providerType: OnlineProviderType, providerId: String? = null) {
+    fun prepareAlbumSelection(
+        idOrUrl: String,
+        providerType: OnlineProviderType,
+        providerId: String? = null,
+        isPlaylist: Boolean = false
+    ) {
         val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(idOrUrl, 300)
-        if (cleanTarget.isBlank()) return
         albumJob?.cancel()
-        _albumDetailState.value = OnlineAlbumDetailState(isLoading = true)
+        albumRequestSeq += 1L
+        if (cleanTarget.isBlank()) {
+            _albumDetailState.value = OnlineAlbumDetailState(
+                requestedId = null,
+                requestedProviderType = providerType,
+                requestedProviderId = providerId,
+                isPlaylist = isPlaylist,
+                isLoading = false,
+                page = null,
+                errorMessage = "Invalid album or playlist identifier"
+            )
+            return
+        }
+        _albumDetailState.value = OnlineAlbumDetailState(
+            requestedId = cleanTarget,
+            requestedProviderType = providerType,
+            requestedProviderId = providerId,
+            isPlaylist = isPlaylist,
+            isLoading = true,
+            page = null,
+            errorMessage = null
+        )
+    }
+
+    fun openAlbum(
+        idOrUrl: String,
+        providerType: OnlineProviderType,
+        providerId: String? = null,
+        isPlaylist: Boolean = false
+    ) {
+        val cleanTarget = InputAndUrlSecurity.sanitizeSingleLineText(idOrUrl, 300)
+        albumJob?.cancel()
+        val reqSeq = ++albumRequestSeq
+        if (cleanTarget.isBlank()) {
+            _albumDetailState.value = OnlineAlbumDetailState(
+                requestedId = null,
+                requestedProviderType = providerType,
+                requestedProviderId = providerId,
+                isPlaylist = isPlaylist,
+                isLoading = false,
+                page = null,
+                errorMessage = "Invalid album or playlist identifier"
+            )
+            return
+        }
+        // Immediately clear previously loaded playlist title, artwork, and tracks
+        _albumDetailState.value = OnlineAlbumDetailState(
+            requestedId = cleanTarget,
+            requestedProviderType = providerType,
+            requestedProviderId = providerId,
+            isPlaylist = isPlaylist,
+            isLoading = true,
+            page = null,
+            errorMessage = null
+        )
         albumJob = scope.launch {
             runCatching {
-                providerManager.fetchAlbumOrPlaylist(cleanTarget, providerType, hintProviderId = providerId)
-            }.onSuccess { page ->
-                _albumDetailState.value = OnlineAlbumDetailState(isLoading = false, page = page)
-                refreshProviderHealth()
-            }.onFailure { err ->
-                _albumDetailState.value = OnlineAlbumDetailState(
-                    isLoading = false,
-                    errorMessage = err.localizedMessage ?: "Could not load album or playlist"
+                providerManager.fetchAlbumOrPlaylist(
+                    albumIdOrUrl = cleanTarget,
+                    hintProvider = providerType,
+                    hintProviderId = providerId,
+                    isPlaylist = isPlaylist
                 )
+            }.onSuccess { page ->
+                if (reqSeq == albumRequestSeq) {
+                    _albumDetailState.value = OnlineAlbumDetailState(
+                        requestedId = cleanTarget,
+                        requestedProviderType = providerType,
+                        requestedProviderId = providerId,
+                        isPlaylist = page.isPlaylist || isPlaylist,
+                        isLoading = false,
+                        page = page,
+                        errorMessage = null
+                    )
+                    refreshProviderHealth()
+                }
+            }.onFailure { err ->
+                if (reqSeq == albumRequestSeq) {
+                    _albumDetailState.value = OnlineAlbumDetailState(
+                        requestedId = cleanTarget,
+                        requestedProviderType = providerType,
+                        requestedProviderId = providerId,
+                        isPlaylist = isPlaylist,
+                        isLoading = false,
+                        page = null,
+                        errorMessage = err.localizedMessage ?: "Could not load album or playlist"
+                    )
+                }
             }
         }
     }
 
     fun clearAlbumDetail() {
         albumJob?.cancel()
+        albumRequestSeq += 1L
         _albumDetailState.value = OnlineAlbumDetailState()
     }
 

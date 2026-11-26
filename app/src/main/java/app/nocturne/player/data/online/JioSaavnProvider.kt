@@ -18,10 +18,13 @@ import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import okhttp3.OkHttpClient
 import java.io.IOException
@@ -73,7 +76,20 @@ class JioSaavnProvider(
         val cfg = currentConfig()
 
         when (filter) {
-            OnlineSearchFilter.ALBUMS -> {
+            OnlineSearchFilter.ALBUMS -> coroutineScope {
+                val playlistsDeferred = if (page == 1 && baseUrlsOverride == null && cfg?.routes?.searchAlbums == null) {
+                    async<List<OnlineAlbumSummary>> {
+                        runCatching {
+                            val plResp = executeRawWithFallback(
+                                OperationType.SEARCH,
+                                "/search/playlists?query=$encodedQ&page=$page&limit=12"
+                            )
+                            extractResultsArray(plResp.body, cfg?.mapping?.resultsPath)
+                                .mapNotNull { it.asObjectOrNull()?.let { obj -> parseAlbumItem(obj, isPlaylistHint = true) } }
+                        }.getOrDefault(emptyList())
+                    }
+                } else null
+
                 val resp = executeConfiguredOrPath(
                     operation = OperationType.SEARCH,
                     template = cfg?.routes?.searchAlbums,
@@ -81,12 +97,14 @@ class JioSaavnProvider(
                     fallbackPath = "/search/albums?query=$encodedQ&page=$page&limit=20"
                 )
                 val results = extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-                val albums = results.mapNotNull { it.asObjectOrNull()?.let(::parseAlbumItem) }
+                val baseAlbums = results.mapNotNull { it.asObjectOrNull()?.let { obj -> parseAlbumItem(obj) } }
+                val merged = (playlistsDeferred?.await().orEmpty() + baseAlbums)
+                    .distinctBy { "${it.providerType.name}:${it.id}" }
                 OnlineSearchPage(
                     query = query,
-                    albums = albums,
-                    nextPageToken = if (albums.size >= 15) (page + 1).toString() else null,
-                    hasMore = albums.size >= 15,
+                    albums = merged,
+                    nextPageToken = if (baseAlbums.size >= 15) (page + 1).toString() else null,
+                    hasMore = baseAlbums.size >= 15,
                     providerUsed = OnlineProviderType.JIOSAAVN,
                     providerUsedId = providerId,
                     providerUsedLabel = displayName
@@ -178,21 +196,24 @@ class JioSaavnProvider(
 
     suspend fun fetchCuratedPlaylists(): List<OnlineAlbumSummary> = withContext(Dispatchers.IO) {
         val cfg = currentConfig()
-        val resp = runCatching {
-            executeRawWithFallback(
+        val playlistAttempt = runCatching {
+            val resp = executeRawWithFallback(
                 OperationType.SEARCH,
                 "/search/playlists?query=${Uri.encode("trending top charts")}&page=1&limit=12"
             )
-        }.getOrElse {
-            executeConfiguredOrPath(
-                operation = OperationType.SEARCH,
-                template = cfg?.routes?.searchAlbums,
-                variables = mapOf("query" to "top charts", "page" to "1", "limit" to "12"),
-                fallbackPath = "/search/albums?query=${Uri.encode("top charts")}&page=1&limit=12"
-            )
-        }
-        extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
-            .mapNotNull { it.asObjectOrNull()?.let(::parseAlbumItem) }
+            extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
+                .mapNotNull { it.asObjectOrNull()?.let { obj -> parseAlbumItem(obj, isPlaylistHint = true) } }
+        }.getOrDefault(emptyList())
+        if (playlistAttempt.isNotEmpty()) return@withContext playlistAttempt
+
+        val albumResp = executeConfiguredOrPath(
+            operation = OperationType.SEARCH,
+            template = cfg?.routes?.searchAlbums,
+            variables = mapOf("query" to "top charts", "page" to "1", "limit" to "12"),
+            fallbackPath = "/search/albums?query=${Uri.encode("top charts")}&page=1&limit=12"
+        )
+        extractResultsArray(albumResp.body, cfg?.mapping?.resultsPath)
+            .mapNotNull { it.asObjectOrNull()?.let { obj -> parseAlbumItem(obj) } }
     }
 
     suspend fun fetchSongSuggestions(songId: String, limit: Int = 10): List<OnlineTrack> =
@@ -312,51 +333,181 @@ class JioSaavnProvider(
         )
     }
 
-    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
-        val rawId = albumIdOrUrl.trimEnd('/').substringAfterLast("/").substringBefore("?")
+    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+        fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = false)
+
+    override suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
+        val trimmedInput = albumIdOrUrl.trim()
+        val rawId = extractCollectionId(trimmedInput)
         val id = InputAndUrlSecurity.sanitizePathSegment(rawId)
-            ?: throw IllegalArgumentException("Invalid JioSaavn album ID")
+            ?: throw IllegalArgumentException("Invalid JioSaavn collection ID")
         val cfg = currentConfig()
-        val resp = if (cfg?.routes?.albumDetails != null) {
-            executeConfiguredOrPath(
-                operation = OperationType.METADATA,
-                template = cfg.routes.albumDetails,
-                variables = mapOf("id" to id, "albumId" to id),
-                fallbackPath = "/albums?id=${Uri.encode(id)}"
-            )
-        } else {
-            runCatching {
-                executeRawWithFallback(OperationType.METADATA, "/albums?id=${Uri.encode(id)}")
-            }.getOrElse {
-                executeRawWithFallback(OperationType.METADATA, "/playlists?id=${Uri.encode(id)}")
+        val encodedId = Uri.encode(id)
+        val isFullUrl = trimmedInput.startsWith("https://", ignoreCase = true) ||
+            trimmedInput.startsWith("http://", ignoreCase = true)
+        val preferPlaylist = isPlaylist ||
+            trimmedInput.contains("/featured/", ignoreCase = true) ||
+            trimmedInput.contains("/playlist", ignoreCase = true) ||
+            trimmedInput.contains("playlistId=", ignoreCase = true) ||
+            trimmedInput.contains("list=", ignoreCase = true)
+
+        val variables = buildMap {
+            put("id", id)
+            put("albumId", id)
+            put("playlistId", id)
+            put("listId", id)
+            put("browseId", id)
+            put("sourceId", id)
+            if (isFullUrl) {
+                put("url", trimmedInput)
+                put("link", trimmedInput)
             }
         }
-        val dataObj = extractDataObject(resp.body)
+
+        val attempts = buildList<suspend () -> ExecutedHttpResponse> {
+            val playlistRoute = cfg?.routes?.playlistDetails
+            val albumRoute = cfg?.routes?.albumDetails
+            val addPlaylistAttempt = {
+                add {
+                    if (playlistRoute != null && cfg != null) {
+                        executeConfiguredOrPath(
+                            operation = OperationType.METADATA,
+                            template = playlistRoute,
+                            variables = variables,
+                            fallbackPath = "/playlists?id=$encodedId"
+                        )
+                    } else {
+                        executeRawWithFallback(OperationType.METADATA, "/playlists?id=$encodedId")
+                    }
+                }
+            }
+            val addAlbumAttempt = {
+                add {
+                    if (albumRoute != null && cfg != null) {
+                        executeConfiguredOrPath(
+                            operation = OperationType.METADATA,
+                            template = albumRoute,
+                            variables = variables,
+                            fallbackPath = "/albums?id=$encodedId"
+                        )
+                    } else {
+                        executeRawWithFallback(OperationType.METADATA, "/albums?id=$encodedId")
+                    }
+                }
+            }
+
+            if (preferPlaylist) {
+                addPlaylistAttempt()
+                if (isFullUrl) {
+                    add { executeRawWithFallback(OperationType.METADATA, "/playlists?link=${Uri.encode(trimmedInput)}") }
+                }
+                addAlbumAttempt()
+            } else {
+                addAlbumAttempt()
+                if (isFullUrl) {
+                    add { executeRawWithFallback(OperationType.METADATA, "/albums?link=${Uri.encode(trimmedInput)}") }
+                }
+                addPlaylistAttempt()
+            }
+
+            if (baseUrlsOverride == null) {
+                val hasNoApiSuffix = getEndpointConfigs(OperationType.METADATA)
+                    .none { it.url.trimEnd('/').endsWith("/api", ignoreCase = true) }
+                if (hasNoApiSuffix) {
+                    if (preferPlaylist && playlistRoute == null) {
+                        add { executeRawWithFallback(OperationType.METADATA, "/api/playlists?id=$encodedId") }
+                    } else if (!preferPlaylist && albumRoute == null) {
+                        add { executeRawWithFallback(OperationType.METADATA, "/api/albums?id=$encodedId") }
+                    }
+                }
+            }
+        }
+
+        var firstParsedPage: OnlineAlbumPage? = null
+        var firstError: Throwable? = null
+        for (attempt in attempts) {
+            val respResult = runCatching { attempt() }
+            val resp = respResult.getOrNull()
+            if (resp == null) {
+                if (firstError == null) firstError = respResult.exceptionOrNull()
+                continue
+            }
+            val page = parseCollectionResponse(
+                body = resp.body,
+                requestedId = id,
+                fallbackUrl = trimmedInput,
+                configuredResultsPath = cfg?.mapping?.resultsPath,
+                isPlaylist = preferPlaylist
+            )
+            if (page.tracks.isNotEmpty()) {
+                return@withContext page
+            }
+            if (firstParsedPage == null && (extractDataObject(resp.body) != null || page.title != "Album" && page.title != "Playlist")) {
+                firstParsedPage = page
+            }
+        }
+
+        firstParsedPage ?: throw (firstError ?: IllegalStateException("Could not load JioSaavn collection $id"))
+    }
+
+    private fun extractCollectionId(albumIdOrUrl: String): String {
+        val trimmed = albumIdOrUrl.trim()
+        if (!trimmed.contains('/') && !trimmed.contains('?') && !trimmed.contains('=')) {
+            return trimmed
+        }
+        runCatching {
+            val normalized = if (trimmed.startsWith("http", ignoreCase = true)) {
+                trimmed
+            } else {
+                "https://placeholder.local/${trimmed.trimStart('/')}"
+            }
+            val uri = Uri.parse(normalized)
+            listOf("id", "playlistId", "albumId", "list", "listId", "browseId").forEach { key ->
+                uri.getQueryParameter(key)?.trim()?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+        }
+        return trimmed.trimEnd('/').substringAfterLast("/").substringBefore("?").substringBefore("#")
+    }
+
+    private fun parseCollectionResponse(
+        body: String,
+        requestedId: String,
+        fallbackUrl: String,
+        configuredResultsPath: String?,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage {
+        val dataObj = extractDataObject(body)
         val songsArr = (dataObj?.objArray("songs")
             ?: dataObj?.objArray("list")
             ?: dataObj?.objArray("tracks"))
-            ?: extractResultsArray(resp.body, cfg?.mapping?.resultsPath)
+            ?: extractResultsArray(body, configuredResultsPath)
         val songs = songsArr.mapNotNull { it.asObjectOrNull()?.let(::parseSongItem) }
+        val resolvedTypePlaylist = isPlaylist ||
+            dataObj?.str("type").equals("playlist", ignoreCase = true)
 
-        OnlineAlbumPage(
-            id = id,
+        return OnlineAlbumPage(
+            id = dataObj?.str("id")?.takeIf { it.isNotBlank() } ?: requestedId,
             title = decodeHtmlEntities(
                 dataObj?.str("name")
                     ?: dataObj?.str("title")
                     ?: dataObj?.str("listname")
-                    ?: "Album"
+                    ?: if (resolvedTypePlaylist) "Playlist" else "Album"
             ),
             artist = decodeHtmlEntities(
                 extractPrimaryArtists(dataObj)
                     .ifBlank { dataObj?.str("subtitle").orEmpty() }
                     .ifBlank { displayName }
             ),
-            url = dataObj?.strUrl("url") ?: albumIdOrUrl,
+            url = dataObj?.strUrl("url") ?: dataObj?.strUrl("perma_url") ?: fallbackUrl,
             thumbnailUrl = pickBestImageUrl(dataObj?.get("image")) ?: songs.firstOrNull()?.thumbnailUrl,
             description = decodeHtmlEntities(dataObj?.str("description") ?: dataObj?.str("subtitle").orEmpty()),
             tracks = songs,
             providerType = OnlineProviderType.JIOSAAVN,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = resolvedTypePlaylist
         )
     }
 
@@ -388,12 +539,13 @@ class JioSaavnProvider(
         fallbackPath: String
     ): ExecutedHttpResponse {
         val cfg = currentConfig()
-        val resp = if (template != null && cfg != null && baseUrlsOverride == null) {
+        val resp = if (template != null && cfg != null) {
             executor.executeTemplated(
                 config = cfg,
                 operation = operation,
                 template = template,
-                variables = variables
+                variables = variables,
+                endpointOverride = baseUrlsOverride
             )
         } else {
             executeRawWithFallback(operation, fallbackPath)
@@ -448,6 +600,7 @@ class JioSaavnProvider(
         return when (val data = obj["data"]) {
             is JsonObject -> data
             is JsonArray -> data.firstOrNull().asObjectOrNull()
+            is JsonNull -> null
             else -> obj
         }
     }
@@ -506,17 +659,28 @@ class JioSaavnProvider(
         )
     }
 
-    private fun parseAlbumItem(obj: JsonObject): OnlineAlbumSummary? {
+    private fun parseAlbumItem(obj: JsonObject, isPlaylistHint: Boolean = false): OnlineAlbumSummary? {
         val id = obj.str("id")?.takeIf { it.isNotBlank() } ?: return null
+        val url = obj.str("url") ?: obj.str("perma_url") ?: id
+        val typeStr = obj.str("type").orEmpty()
+        val isPlaylist = isPlaylistHint ||
+            typeStr.equals("playlist", ignoreCase = true) ||
+            url.contains("/featured/", ignoreCase = true) ||
+            url.contains("/playlist", ignoreCase = true)
         return OnlineAlbumSummary(
             id = id,
-            title = decodeHtmlEntities(obj.str("name") ?: obj.str("title") ?: "Album"),
-            artist = decodeHtmlEntities(extractPrimaryArtists(obj).ifBlank { displayName }),
-            url = obj.str("url") ?: id,
+            title = decodeHtmlEntities(
+                obj.str("name") ?: obj.str("title") ?: obj.str("listname") ?: if (isPlaylist) "Playlist" else "Album"
+            ),
+            artist = decodeHtmlEntities(
+                extractPrimaryArtists(obj).ifBlank { obj.str("subtitle").orEmpty() }.ifBlank { displayName }
+            ),
+            url = url,
             thumbnailUrl = pickBestImageUrl(obj["image"]),
-            trackCount = obj.int("songCount") ?: 0,
+            trackCount = obj.int("songCount") ?: obj.int("list_count") ?: 0,
             providerType = OnlineProviderType.JIOSAAVN,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = isPlaylist
         )
     }
 

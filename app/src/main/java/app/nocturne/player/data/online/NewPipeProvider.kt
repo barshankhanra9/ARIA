@@ -224,7 +224,13 @@ class NewPipeProvider(
         )
     }
 
-    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
+    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+        fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = true)
+
+    override suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
         val service = getService()
         val url = normalizePlaylistUrl(albumIdOrUrl)
             ?: throw IllegalArgumentException("Untrusted or invalid album or playlist URL")
@@ -240,7 +246,8 @@ class NewPipeProvider(
             description = "",
             tracks = tracks,
             providerType = providerType,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = isPlaylist || url.contains("playlist", ignoreCase = true) || url.contains("list=", ignoreCase = true)
         )
     }
 
@@ -317,13 +324,14 @@ class NewPipeProvider(
         val url = item.url?.takeIf { it.isNotBlank() } ?: return null
         return OnlineAlbumSummary(
             id = extractPlaylistId(url),
-            title = item.name.orEmpty().ifBlank { "Album" },
+            title = item.name.orEmpty().ifBlank { "Playlist" },
             artist = item.uploaderName.orEmpty().ifBlank { displayName },
             url = url,
             thumbnailUrl = pickBestImage(item.thumbnails),
             trackCount = item.streamCount.toInt().coerceAtLeast(0),
             providerType = providerType,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 

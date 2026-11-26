@@ -44,5 +44,10 @@ interface OnlineMusicProvider {
 
     suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage
 
+    suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = fetchAlbumOrPlaylist(albumIdOrUrl)
+
     suspend fun fetchRelatedTracks(track: OnlineTrack, limit: Int = 10): List<OnlineTrack> = emptyList()
 }

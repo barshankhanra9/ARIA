@@ -212,11 +212,38 @@ class AudiusProvider(
         )
     }
 
-    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage = withContext(Dispatchers.IO) {
-        val rawId = albumIdOrUrl.substringAfterLast("/").substringBefore("?")
+    override suspend fun fetchAlbumOrPlaylist(albumIdOrUrl: String): OnlineAlbumPage =
+        fetchAlbumOrPlaylist(albumIdOrUrl, isPlaylist = true)
+
+    override suspend fun fetchAlbumOrPlaylist(
+        albumIdOrUrl: String,
+        isPlaylist: Boolean
+    ): OnlineAlbumPage = withContext(Dispatchers.IO) {
+        val rawId = albumIdOrUrl.trim().trimEnd('/').substringAfterLast("/").substringBefore("?")
         val plId = InputAndUrlSecurity.sanitizePathSegment(rawId)
             ?: throw IllegalArgumentException("Invalid Audius playlist ID")
-        val resp = executeRawWithFallback(OperationType.METADATA, "/v1/playlists/${Uri.encode(plId)}/tracks?app_name=$APP_NAME")
+        val cfg = currentConfig()
+        val template = cfg?.routes?.playlistDetails ?: cfg?.routes?.albumDetails
+        val resp = if (template != null && cfg != null) {
+            val r = executor.executeTemplated(
+                config = cfg,
+                operation = OperationType.METADATA,
+                template = template,
+                variables = mapOf(
+                    "id" to plId,
+                    "playlistId" to plId,
+                    "albumId" to plId,
+                    "listId" to plId,
+                    "browseId" to plId,
+                    "url" to albumIdOrUrl
+                ),
+                endpointOverride = baseUrlsOverride
+            )
+            lastWorkingInstance = r.endpointUrl
+            r
+        } else {
+            executeRawWithFallback(OperationType.METADATA, "/v1/playlists/${Uri.encode(plId)}/tracks?app_name=$APP_NAME")
+        }
         val rootObj = json.parseObjectOrNull(resp.body)
         val dataEl = rootObj?.get("data")
         val dataObj = dataEl.asObjectOrNull() ?: (dataEl.asArrayOrNull()?.firstOrNull().asObjectOrNull())
@@ -235,7 +262,8 @@ class AudiusProvider(
             description = dataObj?.str("description").orEmpty(),
             tracks = tracks,
             providerType = OnlineProviderType.AUDIUS,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 
@@ -340,7 +368,8 @@ class AudiusProvider(
             thumbnailUrl = pickArtwork(obj["artwork"] as? JsonObject),
             trackCount = obj.int("track_count") ?: 0,
             providerType = OnlineProviderType.AUDIUS,
-            providerId = providerId
+            providerId = providerId,
+            isPlaylist = true
         )
     }
 
