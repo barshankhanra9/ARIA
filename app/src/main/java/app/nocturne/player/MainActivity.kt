@@ -59,6 +59,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -140,17 +141,37 @@ private data class OnlineNavTarget(
 )
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        const val EXTRA_OPEN_NOW_PLAYING = "app.nocturne.player.OPEN_NOW_PLAYING"
+    }
+
+    private val openNowPlayingTrigger = mutableIntStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        if (intent?.getBooleanExtra(EXTRA_OPEN_NOW_PLAYING, false) == true) {
+            openNowPlayingTrigger.intValue += 1
+        }
         setContent {
-            AriaAppRoot()
+            AriaAppRoot(openNowPlayingSignal = openNowPlayingTrigger.intValue)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_OPEN_NOW_PLAYING, false)) {
+            openNowPlayingTrigger.intValue += 1
         }
     }
 }
 
 @Composable
-fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
+fun AriaAppRoot(
+    viewModel: MainViewModel = viewModel(),
+    openNowPlayingSignal: Int = 0
+) {
     val context = LocalContext.current
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val playbackMode by viewModel.playbackMode.collectAsStateWithLifecycle()
@@ -190,6 +211,11 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     val providerTestResults by viewModel.online.providerTestResults.collectAsStateWithLifecycle()
     val lyricsProviderTestResults by viewModel.online.lyricsProviderTestResults.collectAsStateWithLifecycle()
     val isTestingProviders by viewModel.online.isTestingProviders.collectAsStateWithLifecycle()
+    val downloadedTracks by viewModel.online.downloadedTracks.collectAsStateWithLifecycle()
+    val downloadStates by viewModel.online.downloadStates.collectAsStateWithLifecycle()
+    val downloadedPlaylists by viewModel.online.downloadedPlaylists.collectAsStateWithLifecycle()
+    val totalDownloadBytes by viewModel.online.totalDownloadBytes.collectAsStateWithLifecycle()
+    val downloadedOfflineTracks by viewModel.downloadedOfflineTracks.collectAsStateWithLifecycle()
 
     var currentTab by rememberSaveable { mutableStateOf(AppTab.HOME) }
     var librarySection by rememberSaveable { mutableStateOf(LibrarySection.ALL_SONGS) }
@@ -202,6 +228,11 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
     var lastAlbumNav by remember { mutableStateOf<OnlineNavTarget?>(null) }
 
     var showNowPlaying by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(openNowPlayingSignal) {
+        if (openNowPlayingSignal > 0) {
+            showNowPlaying = true
+        }
+    }
     var showQueueSheet by remember { mutableStateOf(false) }
     var showOnlineQueueSheet by remember { mutableStateOf(false) }
     var showRelatedSheet by remember { mutableStateOf(false) }
@@ -550,7 +581,16 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onOpenPlaylist = { pl ->
                                         onlinePlaylistTarget = OnlinePlaylistViewTarget.Custom(pl.id)
                                         currentTab = AppTab.PLAYLISTS
-                                    }
+                                    },
+                                    downloadedTracks = downloadedTracks,
+                                    downloadStates = downloadStates,
+                                    downloadedPlaylists = downloadedPlaylists,
+                                    totalDownloadBytes = totalDownloadBytes,
+                                    onDownloadTrack = { viewModel.online.downloadTrack(it) },
+                                    onDeleteDownload = { viewModel.online.deleteDownloadedTrack(it) },
+                                    onDeleteDownloadedPlaylist = { viewModel.online.deleteDownloadedPlaylist(it) },
+                                    onPlayDownloadedTracks = { list, idx, shuf -> viewModel.online.playDownloadedTracks(list, idx, shuf) },
+                                    onPlayDownloadedPlaylist = { pl, idx, shuf -> viewModel.online.playDownloadedPlaylist(pl, idx, shuf) }
                                 )
                             } else {
                                 LibraryScreen(
@@ -601,7 +641,13 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onRescanLibrary = { viewModel.rescanLibrary() },
                                     onPickMusicFolder = { folderPicker.launch(null) },
                                     onPickAudioFile = { audioFilePicker.launch(arrayOf("audio/*")) },
-                                    onToggleExcludeFolder = { viewModel.toggleExcludeFolder(it) }
+                                    onToggleExcludeFolder = { viewModel.toggleExcludeFolder(it) },
+                                    downloadedOfflineTracks = downloadedOfflineTracks,
+                                    onDeleteDownloadedTrack = { tr ->
+                                        if (tr.onlineTrackId.isNotBlank()) {
+                                            viewModel.online.deleteDownloadedTrack(tr.onlineTrackId)
+                                        }
+                                    }
                                 )
                             }
 
@@ -629,7 +675,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onOpenAlbum = { urlOrId, p, pid, isPl ->
                                         lastAlbumNav = OnlineNavTarget(urlOrId, p, pid, isPl)
                                         viewModel.online.prepareAlbumSelection(urlOrId, p, pid, isPl)
-                                    }
+                                    },
+                                    downloadStates = downloadStates,
+                                    onDownloadTrack = { viewModel.online.downloadTrack(it) }
                                 )
                             } else {
                                 SearchScreen(
@@ -679,7 +727,21 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                     onRenamePlaylist = { id, n, d -> viewModel.online.renamePlaylist(id, n, d) },
                                     onDeletePlaylist = { viewModel.online.deletePlaylist(it) },
                                     onRemoveTrackFromPlaylist = { id, idx -> viewModel.online.removeTrackFromPlaylist(id, idx) },
-                                    onReorderPlaylistTracks = { id, f, t -> viewModel.online.reorderPlaylistTracks(id, f, t) }
+                                    onReorderPlaylistTracks = { id, f, t -> viewModel.online.reorderPlaylistTracks(id, f, t) },
+                                    downloadStates = downloadStates,
+                                    onDownloadTrack = { viewModel.online.downloadTrack(it) },
+                                    onDownloadPlaylist = { pid, title, cover, list ->
+                                        val first = list.firstOrNull()
+                                        viewModel.online.downloadPlaylist(
+                                            playlistId = pid,
+                                            title = title,
+                                            subtitle = "${list.size} streams",
+                                            coverUrl = cover,
+                                            providerType = first?.providerType ?: OnlineProviderType.JIOSAAVN,
+                                            providerId = first?.effectiveProviderId() ?: "jiosaavn",
+                                            tracks = list
+                                        )
+                                    }
                                 )
                             } else {
                                 PlaylistsScreen(
@@ -718,7 +780,8 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                                 onOpenStreamingConfig = {
                                     viewModel.online.refreshProviderHealth()
                                     showStreamingConfigScreen = true
-                                }
+                                },
+                                onNotifyMessage = { viewModel.notifyMessage(it) }
                             )
                         }
                     }
@@ -742,7 +805,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     onOpenAlbum = { idOrUrl, prov, pid, isPl ->
                         lastAlbumNav = OnlineNavTarget(idOrUrl, prov, pid, isPl)
                         viewModel.online.prepareAlbumSelection(idOrUrl, prov, pid, isPl)
-                    }
+                    },
+                    downloadStates = downloadStates,
+                    onDownloadTrack = { viewModel.online.downloadTrack(it) }
                 )
             }
 
@@ -771,7 +836,20 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     },
                     onPlayTracks = { list, idx, shuf -> viewModel.online.playTracks(list, idx, shuf) },
                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
-                    onOpenContextMenu = { onlineContextMenuTrack = it }
+                    onOpenContextMenu = { onlineContextMenuTrack = it },
+                    downloadStates = downloadStates,
+                    onDownloadTrack = { viewModel.online.downloadTrack(it) },
+                    onDownloadCollection = { page ->
+                        viewModel.online.downloadPlaylist(
+                            playlistId = "col_${page.id.ifBlank { page.title }}",
+                            title = page.title,
+                            subtitle = page.artist,
+                            coverUrl = page.thumbnailUrl,
+                            providerType = page.providerType,
+                            providerId = page.providerId.ifBlank { page.providerType.defaultProviderId() },
+                            tracks = page.tracks
+                        )
+                    }
                 )
             }
 
@@ -881,7 +959,17 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     onOpenRelated = if (isOnlineNow) {
                         { showRelatedSheet = true }
                     } else null,
-                    onRetryLyrics = { viewModel.retryLoadLyrics() }
+                    onRetryLyrics = { viewModel.retryLoadLyrics() },
+                    downloadState = activeUi.currentTrack?.let { cur ->
+                        if (cur.isOnline) downloadStates[cur.onlineTrackId] else null
+                    },
+                    onDownloadTrack = if (isOnlineNow) {
+                        { tr ->
+                            val resolved = viewModel.online.resolveOnlineTrackById(tr.onlineTrackId) ?: onlineSnapshot.currentTrack
+                            if (resolved != null) viewModel.online.downloadTrack(resolved)
+                        }
+                    } else null,
+                    onStartEndOfTrackSleepTimer = { viewModel.startEndOfTrackSleepTimer() }
                 )
             }
 
@@ -1028,7 +1116,9 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                     onDismiss = { showRelatedSheet = false },
                     onPlayTracks = { list, idx -> viewModel.online.playTracks(list, idx, false) },
                     onToggleFavorite = { viewModel.online.toggleFavorite(it) },
-                    onOpenContextMenu = { onlineContextMenuTrack = it }
+                    onOpenContextMenu = { onlineContextMenuTrack = it },
+                    downloadStates = downloadStates,
+                    onDownloadTrack = { viewModel.online.downloadTrack(it) }
                 )
             }
 
@@ -1084,7 +1174,10 @@ fun AriaAppRoot(viewModel: MainViewModel = viewModel()) {
                             viewModel.online.prepareAlbumSelection(target, tr.providerType, tr.effectiveProviderId(), isPlaylist = false)
                         }
                     },
-                    onViewDetails = { onlineDetailsTrack = tr }
+                    onViewDetails = { onlineDetailsTrack = tr },
+                    downloadState = downloadStates[tr.id],
+                    onDownloadClick = { viewModel.online.downloadTrack(tr) },
+                    onRemoveDownload = { viewModel.online.deleteDownloadedTrack(tr.id) }
                 )
             }
 

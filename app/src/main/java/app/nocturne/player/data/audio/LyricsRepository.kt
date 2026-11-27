@@ -127,6 +127,36 @@ class LyricsRepository(
             cleaned.artist.ifBlank { track.artist }
         )
 
+        // 0. Check locally downloaded lyrics / pre-populated embeddedLyrics first (works 100% offline)
+        if (!track.embeddedLyrics.isNullOrBlank()) {
+            val raw = track.embeddedLyrics
+            return@withContext LyricsData(
+                syncedLines = TagAndLyricsEngine.parseLrc(raw),
+                rawText = raw,
+                source = LyricsSource.SIDECAR_LRC,
+                fromCache = true
+            )
+        }
+        val downloadLookupIds = listOf(cacheKey, track.onlineTrackId, track.uriString)
+            .filter { it.isNotBlank() }
+            .distinct()
+        for (dlId in downloadLookupIds) {
+            val dlEntity = runCatching { db.offlineDownloadDao().getCompletedTrackOnce(dlId) }.getOrNull()
+            val localPath = dlEntity?.localLyricsPath?.takeIf { it.isNotBlank() }
+            if (localPath != null) {
+                val file = java.io.File(localPath)
+                val raw = if (file.exists() && file.canRead()) runCatching { file.readText() }.getOrNull() else null
+                if (!raw.isNullOrBlank()) {
+                    return@withContext LyricsData(
+                        syncedLines = TagAndLyricsEngine.parseLrc(raw),
+                        rawText = raw,
+                        source = LyricsSource.SIDECAR_LRC,
+                        fromCache = true
+                    )
+                }
+            }
+        }
+
         // 1. Offline local sources first (Manual override, Sidecar .lrc, Embedded SYLT/USLT/FLAC, SAF .lrc)
         if (!track.isOnline) {
             val override = db.trackTagOverrideDao().getByUri(track.uriString)

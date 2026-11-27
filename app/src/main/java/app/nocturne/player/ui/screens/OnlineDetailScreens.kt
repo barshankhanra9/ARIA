@@ -24,6 +24,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Shuffle
@@ -40,6 +41,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.nocturne.player.data.db.DownloadedTrackEntity
+import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.ui.OnlineAlbumDetailState
@@ -66,7 +69,9 @@ fun OnlineArtistDetailScreen(
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
     onOpenContextMenu: (OnlineTrack) -> Unit,
-    onOpenAlbum: (String, OnlineProviderType, String?, Boolean) -> Unit
+    onOpenAlbum: (String, OnlineProviderType, String?, Boolean) -> Unit,
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null
 ) {
     BackHandler(onBack = onBack)
     val palette = AriaPaperTheme.palette
@@ -205,7 +210,9 @@ fun OnlineArtistDetailScreen(
                                     isCurrent = track.id == currentPlayingTrackId,
                                     onClick = { onPlayTracks(page.tracks, idx, false) },
                                     onToggleFavorite = { onToggleFavorite(track) },
-                                    onMoreClick = { onOpenContextMenu(track) }
+                                    onMoreClick = { onOpenContextMenu(track) },
+                                    downloadState = downloadStates[track.id],
+                                    onDownloadClick = onDownloadTrack?.let { cb -> { cb(track) } }
                                 )
                             }
                         } else {
@@ -233,7 +240,10 @@ fun OnlineAlbumDetailScreen(
     onRetry: (() -> Unit)?,
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
-    onOpenContextMenu: (OnlineTrack) -> Unit
+    onOpenContextMenu: (OnlineTrack) -> Unit,
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null,
+    onDownloadCollection: ((OnlineAlbumPage) -> Unit)? = null
 ) {
     BackHandler(onBack = onBack)
     val palette = AriaPaperTheme.palette
@@ -349,6 +359,18 @@ fun OnlineAlbumDetailScreen(
                                                 filled = false
                                             )
                                         }
+                                        if (onDownloadCollection != null) {
+                                            Spacer(Modifier.height(8.dp))
+                                            TactilePaperButton(
+                                                text = "Download All (${page.tracks.size})",
+                                                icon = Icons.Rounded.Download,
+                                                filled = false,
+                                                onClick = { onDownloadCollection(page) },
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .testTag("download_collection_btn")
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -364,7 +386,9 @@ fun OnlineAlbumDetailScreen(
                                         isCurrent = track.id == currentPlayingTrackId,
                                         onClick = { onPlayTracks(page.tracks, idx, false) },
                                         onToggleFavorite = { onToggleFavorite(track) },
-                                        onMoreClick = { onOpenContextMenu(track) }
+                                        onMoreClick = { onOpenContextMenu(track) },
+                                        downloadState = downloadStates[track.id],
+                                        onDownloadClick = onDownloadTrack?.let { cb -> { cb(track) } }
                                     )
                                 }
                             }
@@ -383,7 +407,9 @@ fun RelatedTracksSheet(
     onDismiss: () -> Unit,
     onPlayTracks: (List<OnlineTrack>, Int) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
-    onOpenContextMenu: (OnlineTrack) -> Unit
+    onOpenContextMenu: (OnlineTrack) -> Unit,
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null
 ) {
     PaperModalSheet(onDismissRequest = onDismiss) {
         Column(
@@ -417,7 +443,9 @@ fun RelatedTracksSheet(
                                 onPlayTracks(relatedTracks, idx)
                             },
                             onToggleFavorite = { onToggleFavorite(track) },
-                            onMoreClick = { onOpenContextMenu(track) }
+                            onMoreClick = { onOpenContextMenu(track) },
+                            downloadState = downloadStates[track.id],
+                            onDownloadClick = onDownloadTrack?.let { cb -> { cb(track) } }
                         )
                     }
                 }

@@ -36,7 +36,9 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Checklist
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.CreateNewFolder
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DoneAll
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.Folder
 import androidx.compose.material.icons.rounded.FolderOff
@@ -130,7 +132,9 @@ fun LibraryScreen(
     onRescanLibrary: () -> Unit,
     onPickMusicFolder: () -> Unit,
     onPickAudioFile: () -> Unit,
-    onToggleExcludeFolder: (String) -> Unit
+    onToggleExcludeFolder: (String) -> Unit,
+    downloadedOfflineTracks: List<Track> = emptyList(),
+    onDeleteDownloadedTrack: ((Track) -> Unit)? = null
 ) {
     val palette = AriaPaperTheme.palette
     val scope = rememberCoroutineScope()
@@ -149,7 +153,7 @@ fun LibraryScreen(
     var showSortSheet by remember { mutableStateOf(false) }
     var showDiagnosticsDialog by remember { mutableStateOf(false) }
 
-    val activeTrackList: List<Track> = remember(section, drillTarget, library, playback.queueTracks, sortField, sortOrder) {
+    val activeTrackList: List<Track> = remember(section, drillTarget, library, playback.queueTracks, downloadedOfflineTracks, sortField, sortOrder) {
         val base = when (drillTarget) {
             is LibraryDrillTarget.AlbumDetail ->
                 library.albums.firstOrNull { it.name == drillTarget.albumName }?.tracks.orEmpty()
@@ -166,6 +170,7 @@ fun LibraryScreen(
                 LibrarySection.RECENTLY_PLAYED -> library.recentlyPlayed
                 LibrarySection.MOST_PLAYED -> library.mostPlayed
                 LibrarySection.FAVORITES -> library.favorites
+                LibrarySection.DOWNLOADS -> downloadedOfflineTracks
                 LibrarySection.QUEUE -> playback.queueTracks
                 else -> emptyList()
             }
@@ -299,6 +304,7 @@ fun LibraryScreen(
                 LibrarySection.RECENTLY_PLAYED,
                 LibrarySection.MOST_PLAYED,
                 LibrarySection.FAVORITES,
+                LibrarySection.DOWNLOADS,
                 LibrarySection.QUEUE
             )
         ) {
@@ -367,7 +373,7 @@ fun LibraryScreen(
         Box(modifier = Modifier.weight(1f)) {
             if (library.isScanning && library.allTracks.isEmpty()) {
                 PaperSkeletonList(count = 6, modifier = Modifier.padding(horizontal = 18.dp))
-            } else if (!hasAudioPermission && library.allTracks.isEmpty() && section != LibrarySection.QUEUE) {
+            } else if (!hasAudioPermission && library.allTracks.isEmpty() && section != LibrarySection.QUEUE && section != LibrarySection.DOWNLOADS) {
                 Box(Modifier.padding(18.dp)) {
                     PaperEmptyState(
                         icon = Icons.Rounded.LibraryMusic,
@@ -584,13 +590,21 @@ fun LibraryScreen(
                 // Track list or grid (with Alphabetical Fast Scroller when sorted alphabetically)
                 if (activeTrackList.isEmpty()) {
                     Box(Modifier.padding(18.dp)) {
-                        PaperEmptyState(
-                            icon = Icons.Rounded.LibraryMusic,
-                            title = "Nothing in ${section.label}",
-                            subtitle = "Rescan your device audio library, add a music folder, or open an audio file.",
-                            actionLabel = if (section == LibrarySection.ALL_SONGS) "Rescan Device" else "Open Audio File",
-                            onAction = if (section == LibrarySection.ALL_SONGS) onRescanLibrary else onPickAudioFile
-                        )
+                        if (section == LibrarySection.DOWNLOADS) {
+                            PaperEmptyState(
+                                icon = Icons.Rounded.DownloadDone,
+                                title = "No Offline Downloads",
+                                subtitle = "Download any song or playlist in Online Music to play it completely offline here."
+                            )
+                        } else {
+                            PaperEmptyState(
+                                icon = Icons.Rounded.LibraryMusic,
+                                title = "Nothing in ${section.label}",
+                                subtitle = "Rescan your device audio library, add a music folder, or open an audio file.",
+                                actionLabel = if (section == LibrarySection.ALL_SONGS) "Rescan Device" else "Open Audio File",
+                                onAction = if (section == LibrarySection.ALL_SONGS) onRescanLibrary else onPickAudioFile
+                            )
+                        }
                     }
                 } else if (isGrid) {
                     LazyVerticalGrid(
@@ -632,20 +646,44 @@ fun LibraryScreen(
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             itemsIndexed(activeTrackList, key = { idx, t -> "${t.uriString}_$idx" }) { idx, track ->
-                                TrackListRow(
-                                    track = track,
-                                    isCurrent = track.uriString == playback.currentUri,
-                                    isSelected = track.uriString in selectedUris,
-                                    isMultiSelectMode = isMultiSelect,
-                                    preferFolderCover = settings.preferFolderCoverArt,
-                                    onClick = {
-                                        if (isMultiSelect) onToggleSelectTrack(track.uriString)
-                                        else onPlayTracks(activeTrackList, idx, false)
-                                    },
-                                    onLongClick = { onToggleSelectTrack(track.uriString) },
-                                    onToggleFavorite = { onToggleFavorite(track) },
-                                    onMoreClick = { onOpenContextMenu(track) }
-                                )
+                                if (section == LibrarySection.DOWNLOADS && onDeleteDownloadedTrack != null && !isMultiSelect) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Box(Modifier.weight(1f)) {
+                                            TrackListRow(
+                                                track = track,
+                                                isCurrent = track.uriString == playback.currentUri,
+                                                isSelected = track.uriString in selectedUris,
+                                                isMultiSelectMode = isMultiSelect,
+                                                preferFolderCover = settings.preferFolderCoverArt,
+                                                onClick = { onPlayTracks(activeTrackList, idx, false) },
+                                                onLongClick = { onToggleSelectTrack(track.uriString) },
+                                                onToggleFavorite = { onToggleFavorite(track) },
+                                                onMoreClick = { onOpenContextMenu(track) }
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = { onDeleteDownloadedTrack(track) },
+                                            modifier = Modifier.testTag("remove_offline_dl_${track.onlineTrackId}")
+                                        ) {
+                                            Icon(Icons.Rounded.Delete, "Remove offline download", tint = palette.inkTertiary, modifier = Modifier.size(20.dp))
+                                        }
+                                    }
+                                } else {
+                                    TrackListRow(
+                                        track = track,
+                                        isCurrent = track.uriString == playback.currentUri,
+                                        isSelected = track.uriString in selectedUris,
+                                        isMultiSelectMode = isMultiSelect,
+                                        preferFolderCover = settings.preferFolderCoverArt,
+                                        onClick = {
+                                            if (isMultiSelect) onToggleSelectTrack(track.uriString)
+                                            else onPlayTracks(activeTrackList, idx, false)
+                                        },
+                                        onLongClick = { onToggleSelectTrack(track.uriString) },
+                                        onToggleFavorite = { onToggleFavorite(track) },
+                                        onMoreClick = { onOpenContextMenu(track) }
+                                    )
+                                }
                             }
                         }
 

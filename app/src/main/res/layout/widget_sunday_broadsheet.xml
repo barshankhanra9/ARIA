@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/widget_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <ImageView
+        android:id="@+id/widget_canvas_image"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:contentDescription="@string/widget_open_player_desc"
+        android:scaleType="fitXY" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <FrameLayout
+            android:id="@+id/widget_open_player_area"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clickable="true"
+            android:contentDescription="@string/widget_open_player_desc"
+            android:focusable="true" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:gravity="center"
+            android:orientation="horizontal"
+            android:paddingStart="10dp"
+            android:paddingEnd="10dp"
+            android:paddingBottom="4dp">
+
+            <ImageButton
+                android:id="@+id/widget_btn_shuffle"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/widget_shuffle_desc"
+                android:padding="7dp"
+                android:scaleType="centerInside" />
+
+            <ImageButton
+                android:id="@+id/widget_btn_prev"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/widget_prev_desc"
+                android:padding="7dp"
+                android:scaleType="centerInside" />
+
+            <ImageButton
+                android:id="@+id/widget_btn_play_pause"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/widget_play_pause_desc"
+                android:padding="5dp"
+                android:scaleType="centerInside" />
+
+            <ImageButton
+                android:id="@+id/widget_btn_next"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/widget_next_desc"
+                android:padding="7dp"
+                android:scaleType="centerInside" />
+
+            <ImageButton
+                android:id="@+id/widget_btn_like"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:background="@android:color/transparent"
+                android:contentDescription="@string/widget_like_desc"
+                android:padding="7dp"
+                android:scaleType="centerInside" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>

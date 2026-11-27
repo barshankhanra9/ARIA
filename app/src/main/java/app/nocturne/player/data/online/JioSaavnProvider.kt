@@ -15,6 +15,7 @@ import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -242,6 +243,12 @@ class JioSaavnProvider(
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
+    ): OnlineStreamResolution = resolveStream(track, speedTier, null)
+
+    override suspend fun resolveStream(
+        track: OnlineTrack,
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality?
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val safeSourceId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid JioSaavn track ID")
@@ -280,11 +287,16 @@ class JioSaavnProvider(
         }
 
         val allowedOrigin = lastWorkingInstance?.takeIf { baseUrlsOverride != null }
-        val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
+        val effectiveTier = if (preferredQuality == null && speedTier == NetworkSpeedTier.STANDARD) {
+            NetworkSpeedTier.FAST_UNMETERED
+        } else {
+            speedTier
+        }
         val selected = StreamQualitySelector.selectBestAudioStream(
             streams = streams,
             speedTier = effectiveTier,
-            allowedLoopbackOrigin = allowedOrigin
+            allowedLoopbackOrigin = allowedOrigin,
+            preferredQuality = preferredQuality
         ) ?: throw IOException("No playable audio streams returned by $displayName for ${track.title}")
 
         val related = runCatching {

@@ -24,6 +24,7 @@ import app.nocturne.player.data.model.ProviderConnectivityTestResult
 import app.nocturne.player.data.model.ProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.ProviderHealthSnapshot
 import app.nocturne.player.data.model.RemoteProvidersConfig
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.prefs.SettingsRepository
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -49,7 +50,8 @@ class OnlineProviderManager(
     private val networkMonitor: NetworkMonitor? = null,
     private val remoteConfigRepository: RemoteConfigRepository? = null,
     private val httpClient: OkHttpClient = OnlineHttpClient.client,
-    private val allowLoopbackForTests: Boolean = false
+    private val allowLoopbackForTests: Boolean = false,
+    private val settingsRepository: SettingsRepository? = null
 ) {
     constructor(
         context: Context,
@@ -63,7 +65,8 @@ class OnlineProviderManager(
         networkMonitor = NetworkMonitor(context.applicationContext),
         remoteConfigRepository = remoteConfigRepository,
         httpClient = OnlineHttpClient.client,
-        allowLoopbackForTests = false
+        allowLoopbackForTests = false,
+        settingsRepository = SettingsRepository(context.applicationContext)
     )
 
     constructor(
@@ -202,6 +205,21 @@ class OnlineProviderManager(
 
     fun currentSpeedTier(): NetworkSpeedTier =
         networkMonitor?.currentSpeedTier() ?: NetworkSpeedTier.STANDARD
+
+    fun clearStreamCache() {
+        streamCache.clear()
+    }
+
+    suspend fun activeStreamingQuality(): StreamingQuality? {
+        val repo = settingsRepository ?: return null
+        val settings = runCatching { repo.getSettingsOnce() }.getOrNull() ?: return null
+        val isWifiOrUnmetered = networkMonitor?.isUnmeteredOrWifi() ?: true
+        return if (isWifiOrUnmetered) {
+            settings.wifiStreamingQuality
+        } else {
+            settings.mobileDataStreamingQuality
+        }
+    }
 
     fun getHealthSnapshots(): List<ProviderHealthSnapshot> {
         val adapters = currentAdaptersSnapshot()
@@ -777,10 +795,12 @@ class OnlineProviderManager(
             adapters
         }
         val speedTier = currentSpeedTier()
+        val preferredQuality = activeStreamingQuality()
         val resolved = playbackResolver.resolve(
             track = track,
             adapters = playbackAdapters,
             speedTier = speedTier,
+            preferredQuality = preferredQuality,
             excludedIds = allExcludedIds
         )
         streamCache.put(track.id, resolved)

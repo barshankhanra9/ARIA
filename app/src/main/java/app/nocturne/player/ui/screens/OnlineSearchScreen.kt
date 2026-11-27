@@ -49,6 +49,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.nocturne.player.data.db.DownloadedTrackEntity
 import app.nocturne.player.data.model.OnlineAlbumSummary
 import app.nocturne.player.data.model.OnlineArtistSummary
 import app.nocturne.player.data.model.OnlineProviderType
@@ -83,7 +84,9 @@ fun OnlineSearchScreen(
     onToggleFavorite: (OnlineTrack) -> Unit,
     onOpenContextMenu: (OnlineTrack) -> Unit,
     onOpenArtist: (String, OnlineProviderType, String?) -> Unit,
-    onOpenAlbum: (String, OnlineProviderType, String?, Boolean) -> Unit
+    onOpenAlbum: (String, OnlineProviderType, String?, Boolean) -> Unit,
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null
 ) {
     val palette = AriaPaperTheme.palette
     val keyboard = LocalSoftwareKeyboardController.current
@@ -377,7 +380,9 @@ fun OnlineSearchScreen(
                             isCurrent = track.id == currentPlayingTrackId,
                             onClick = { onPlayTracks(state.tracks, idx) },
                             onToggleFavorite = { onToggleFavorite(track) },
-                            onMoreClick = { onOpenContextMenu(track) }
+                            onMoreClick = { onOpenContextMenu(track) },
+                            downloadState = downloadStates[track.id],
+                            onDownloadClick = onDownloadTrack?.let { cb -> { cb(track) } }
                         )
                     }
 

@@ -24,10 +24,13 @@ import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.DragHandle
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -48,6 +51,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.nocturne.player.data.db.DownloadedTrackEntity
 import app.nocturne.player.data.model.OnlinePlaylist
 import app.nocturne.player.data.model.OnlineSmartPlaylistType
 import app.nocturne.player.data.model.OnlineTrack
@@ -77,7 +81,10 @@ fun OnlinePlaylistsScreen(
     onRenamePlaylist: (Long, String, String) -> Unit,
     onDeletePlaylist: (Long) -> Unit,
     onRemoveTrackFromPlaylist: (Long, Int) -> Unit,
-    onReorderPlaylistTracks: (Long, Int, Int) -> Unit
+    onReorderPlaylistTracks: (Long, Int, Int) -> Unit,
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null,
+    onDownloadPlaylist: ((String, String, String?, List<OnlineTrack>) -> Unit)? = null
 ) {
     val palette = AriaPaperTheme.palette
     var showCreateDialog by remember { mutableStateOf(false) }
@@ -97,6 +104,21 @@ fun OnlinePlaylistsScreen(
                         Column(Modifier.weight(1f)) {
                             Text("ONLINE SMART COLLECTION", style = MaterialTheme.typography.labelSmall, color = palette.accent)
                             Text(selectedTarget.type.title, style = MaterialTheme.typography.headlineMedium, color = palette.inkPrimary)
+                        }
+                        if (onDownloadPlaylist != null && tracks.isNotEmpty()) {
+                            IconButton(
+                                onClick = {
+                                    onDownloadPlaylist(
+                                        "smart_${selectedTarget.type.name}",
+                                        selectedTarget.type.title,
+                                        tracks.firstOrNull()?.thumbnailUrl,
+                                        tracks
+                                    )
+                                },
+                                modifier = Modifier.testTag("download_smart_playlist_btn")
+                            ) {
+                                Icon(Icons.Rounded.Download, "Download collection offline", tint = palette.accent)
+                            }
                         }
                     }
                     Spacer(Modifier.height(10.dp))
@@ -120,6 +142,16 @@ fun OnlinePlaylistsScreen(
                                         Column(Modifier.weight(1f)) {
                                             Text(track.title, style = MaterialTheme.typography.titleSmall, color = palette.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                             Text("${track.artist} · ${track.providerLabel}", style = MaterialTheme.typography.bodySmall, color = palette.inkSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        }
+                                        if (onDownloadTrack != null) {
+                                            val st = downloadStates[track.id]
+                                            IconButton(onClick = { onDownloadTrack(track) }) {
+                                                when (st?.status) {
+                                                    DownloadedTrackEntity.STATUS_DOWNLOADING -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = palette.accent)
+                                                    DownloadedTrackEntity.STATUS_COMPLETED -> Icon(Icons.Rounded.DownloadDone, "Saved offline", tint = palette.accent, modifier = Modifier.size(20.dp))
+                                                    else -> Icon(Icons.Rounded.Download, "Download track", tint = palette.inkTertiary, modifier = Modifier.size(20.dp))
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -145,6 +177,21 @@ fun OnlinePlaylistsScreen(
                             Column(Modifier.weight(1f)) {
                                 Text("ONLINE PLAYLIST", style = MaterialTheme.typography.labelSmall, color = palette.accent)
                                 Text(playlist.name, style = MaterialTheme.typography.headlineMedium, color = palette.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            if (onDownloadPlaylist != null && tracks.isNotEmpty()) {
+                                IconButton(
+                                    onClick = {
+                                        onDownloadPlaylist(
+                                            "online_pl_${playlist.id}",
+                                            playlist.name,
+                                            playlist.coverUrl ?: tracks.firstOrNull()?.thumbnailUrl,
+                                            tracks
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("download_online_playlist_btn")
+                                ) {
+                                    Icon(Icons.Rounded.Download, "Download playlist offline", tint = palette.accent)
+                                }
                             }
                             IconButton(onClick = { renameTarget = playlist }) {
                                 Icon(Icons.Rounded.Edit, "Rename online playlist", tint = palette.inkSecondary)
@@ -204,6 +251,16 @@ fun OnlinePlaylistsScreen(
                                             Column(Modifier.weight(1f)) {
                                                 Text(track.title, style = MaterialTheme.typography.titleSmall, color = palette.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                                 Text("${track.artist} · ${track.providerLabel}", style = MaterialTheme.typography.bodySmall, color = palette.inkSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            }
+                                            if (onDownloadTrack != null) {
+                                                val st = downloadStates[track.id]
+                                                IconButton(onClick = { onDownloadTrack(track) }) {
+                                                    when (st?.status) {
+                                                        DownloadedTrackEntity.STATUS_DOWNLOADING -> CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = palette.accent)
+                                                        DownloadedTrackEntity.STATUS_COMPLETED -> Icon(Icons.Rounded.DownloadDone, "Saved offline", tint = palette.accent, modifier = Modifier.size(20.dp))
+                                                        else -> Icon(Icons.Rounded.Download, "Download track", tint = palette.inkTertiary, modifier = Modifier.size(20.dp))
+                                                    }
+                                                }
                                             }
                                             IconButton(onClick = { onRemoveTrackFromPlaylist(playlist.id, idx) }) {
                                                 Icon(Icons.Rounded.Close, "Remove from online playlist", tint = palette.inkTertiary, modifier = Modifier.size(18.dp))

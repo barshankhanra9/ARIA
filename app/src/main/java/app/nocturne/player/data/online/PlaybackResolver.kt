@@ -8,6 +8,7 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.StreamingQuality
 import kotlin.math.abs
 
 /**
@@ -24,7 +25,8 @@ class PlaybackResolver(
         track: OnlineTrack,
         adapters: Map<String, OnlineMusicProvider>,
         speedTier: NetworkSpeedTier,
-        excludedIds: Set<String>
+        excludedIds: Set<String>,
+        preferredQuality: StreamingQuality? = null
     ): OnlineStreamResolution {
         val nativeIds = selectPrimaryCandidates(track, adapters)
             .filter { it !in excludedIds }
@@ -38,7 +40,7 @@ class PlaybackResolver(
             triedIds.add(pid)
             val start = System.currentTimeMillis()
             try {
-                val resolved = adapter.resolveStream(track, speedTier)
+                val resolved = adapter.resolveStream(track, speedTier, preferredQuality)
                 validateUrl(resolved.selectedStream.url)
                 healthTracker.recordProviderSuccess(
                     providerId = pid,
@@ -63,7 +65,8 @@ class PlaybackResolver(
             track = track,
             adapters = adapters,
             alreadyTriedIds = triedIds,
-            speedTier = speedTier
+            speedTier = speedTier,
+            preferredQuality = preferredQuality
         )
         if (fallback != null) {
             return fallback
@@ -76,7 +79,8 @@ class PlaybackResolver(
         track: OnlineTrack,
         adapters: Map<String, OnlineMusicProvider>,
         alreadyTriedIds: Set<String>,
-        speedTier: NetworkSpeedTier
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality? = null
     ): OnlineStreamResolution? {
         val cleaned = MetadataCleaner.clean(
             rawTitle = track.title,
@@ -140,7 +144,7 @@ class PlaybackResolver(
                     candidates = page.tracks
                 ) ?: continue
 
-                val resolved = adapter.resolveStream(bestMatch, speedTier)
+                val resolved = adapter.resolveStream(bestMatch, speedTier, preferredQuality)
                 validateUrl(resolved.selectedStream.url)
                 healthTracker.recordProviderSuccess(
                     providerId = pid,

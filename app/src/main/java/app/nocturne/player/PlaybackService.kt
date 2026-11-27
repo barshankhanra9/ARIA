@@ -1,5 +1,8 @@
 package app.nocturne.player
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
@@ -11,6 +14,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.annotation.OptIn
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -20,6 +25,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.FileDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.TransferListener
@@ -39,9 +45,12 @@ import app.nocturne.player.data.audio.LyricsRepository
 import app.nocturne.player.data.audio.MetadataCleaner
 import app.nocturne.player.data.audio.TagAndLyricsEngine
 import app.nocturne.player.data.db.AriaDatabase
+import app.nocturne.player.data.downloads.OfflineDownloadManager
 import app.nocturne.player.data.model.OnlineProviderType
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.PlaybackMode
 import app.nocturne.player.data.model.ReplayGainMode
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.Track
 import app.nocturne.player.data.model.UserSettings
 import app.nocturne.player.data.online.OnlineDependencies
@@ -60,6 +69,8 @@ import app.nocturne.player.playback.OfflinePlaybackBridge
 import app.nocturne.player.playback.OnlinePlaybackBridge
 import app.nocturne.player.playback.PlaybackRuntimeBus
 import app.nocturne.player.playback.SleepTimerState
+import app.nocturne.player.widget.WidgetStatePrefs
+import app.nocturne.player.widget.WidgetUpdater
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -75,6 +86,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 
@@ -90,6 +102,7 @@ class PlaybackService : MediaLibraryService() {
     private lateinit var affinityRepo: AffinityRepository
     private lateinit var recommendationEngine: RecommendationEngine
     private lateinit var lyricsRepository: LyricsRepository
+    private lateinit var downloadManager: OfflineDownloadManager
 
     // Offline playback engine (existing behavior preserved)
     private lateinit var player: ExoPlayer
@@ -103,12 +116,17 @@ class PlaybackService : MediaLibraryService() {
     private val effectsManager = AudioEffectsManager()
     private lateinit var balanceAndRgProcessor: BalanceAndReplayGainAudioProcessor
     private var currentSettings = UserSettings()
+    private var prevWifiQuality: StreamingQuality? = null
+    private var prevMobileQuality: StreamingQuality? = null
+    private var prevWidgetSharpCorners: Boolean? = null
     private var sleepTimerJob: Job? = null
+    @Volatile private var sleepTimerEndOfTrack: Boolean = false
     private var progressSaverJob: Job? = null
     private var onlineProgressJob: Job? = null
     private var crossfadeJob: Job? = null
     private var lyricsPreloadJob: Job? = null
     private var radioFetchJob: Job? = null
+    private var queueRestoreJob: Job? = null
     private var receiversRegistered = false
 
     private data class ResolvedStreamCtx(
@@ -173,6 +191,7 @@ class PlaybackService : MediaLibraryService() {
             remoteConfigRepository = remoteConfigRepo,
             healthTracker = OnlineDependencies.getHealthTracker()
         )
+        downloadManager = OnlineDependencies.getOfflineDownloadManager(this)
 
         balanceAndRgProcessor = BalanceAndReplayGainAudioProcessor { sampleRate, channels, encoding ->
             PlaybackRuntimeBus.updateTelemetry {
@@ -214,20 +233,35 @@ class PlaybackService : MediaLibraryService() {
             }
 
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                if (sleepTimerEndOfTrack && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                    completeSleepTimerNow(player)
+                    syncOfflineSnapshot()
+                    savePlaybackStateAsync()
+                    return
+                }
                 applyReplayGainForCurrentItem(mediaItem)
                 applyCrossfadeFadeInIfActive()
                 preloadLyricsForOfflineMediaItem(mediaItem)
                 syncOfflineSnapshot()
                 savePlaybackStateAsync()
+                if (activeEngine == ActiveAudioEngine.OFFLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_ENDED && sleepTimerEndOfTrack) {
+                    completeSleepTimerNow(player)
+                }
                 if (playbackState == Player.STATE_READY && activeEngine == ActiveAudioEngine.OFFLINE) {
                     attachEffects(player.audioSessionId)
                     applyReplayGainForCurrentItem(player.currentMediaItem)
                 }
                 syncOfflineSnapshot()
                 savePlaybackStateAsync()
+                if (activeEngine == ActiveAudioEngine.OFFLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -238,11 +272,17 @@ class PlaybackService : MediaLibraryService() {
                 }
                 syncOfflineSnapshot()
                 savePlaybackStateAsync()
+                if (activeEngine == ActiveAudioEngine.OFFLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
                 syncOfflineSnapshot()
                 savePlaybackStateAsync()
+                if (activeEngine == ActiveAudioEngine.OFFLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onRepeatModeChanged(repeatMode: Int) {
@@ -304,6 +344,12 @@ class PlaybackService : MediaLibraryService() {
                 evaluateOutgoingOnlineTrack(reason)
                 onlineAccumulatedMs = 0L
                 lastCountedOnlineId = null
+                if (sleepTimerEndOfTrack && reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+                    completeSleepTimerNow(onlinePlayer)
+                    syncOnlineSnapshot()
+                    saveOnlineQueueStateAsync()
+                    return
+                }
                 val nextTrack = mediaItem?.mediaId?.let { id -> onlineTrackMap[id] }
                 resetOnlineTrackingFor(nextTrack)
                 nextTrack?.let { tr ->
@@ -311,6 +357,9 @@ class PlaybackService : MediaLibraryService() {
                 }
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
+                if (activeEngine == ActiveAudioEngine.ONLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
                 if (onlinePlayer.mediaItemCount > 0 &&
                     onlinePlayer.currentMediaItemIndex >= onlinePlayer.mediaItemCount - 1
                 ) {
@@ -343,10 +392,19 @@ class PlaybackService : MediaLibraryService() {
                             affinityRepo.recordTrackCompleted(prev, incrementPlayCount = needsPlayIncrement)
                         }
                     }
+                    if (sleepTimerEndOfTrack) {
+                        completeSleepTimerNow(onlinePlayer)
+                        syncOnlineSnapshot()
+                        saveOnlineQueueStateAsync()
+                        return
+                    }
                     maybeTriggerInfiniteRadio(autoAdvanceAfterAppend = true)
                 }
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
+                if (activeEngine == ActiveAudioEngine.ONLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -359,11 +417,17 @@ class PlaybackService : MediaLibraryService() {
                 }
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
+                if (activeEngine == ActiveAudioEngine.ONLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
                 syncOnlineSnapshot()
                 saveOnlineQueueStateAsync()
+                if (activeEngine == ActiveAudioEngine.ONLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
             }
 
             override fun onRepeatModeChanged(repeatMode: Int) {
@@ -392,8 +456,18 @@ class PlaybackService : MediaLibraryService() {
 
         registerAudioReceivers()
         observeSettings()
-        restorePersistedQueue()
-        restorePersistedOnlineQueue()
+        queueRestoreJob = serviceScope.launch {
+            restorePersistedQueueSuspend()
+            restorePersistedOnlineQueueSuspend()
+            val settings = runCatching { settingsRepository.getSettingsOnce() }.getOrNull()
+            if (settings?.activePlaybackMode == PlaybackMode.ONLINE &&
+                onlinePlayer.mediaItemCount > 0 &&
+                !player.isPlaying
+            ) {
+                activateEngine(ActiveAudioEngine.ONLINE, pauseOther = false)
+            }
+            WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+        }
     }
 
     @OptIn(UnstableApi::class)
@@ -427,6 +501,37 @@ class PlaybackService : MediaLibraryService() {
 
         PlaybackRuntimeBus.updateOnlineSnapshot {
             it.copy(isResolving = true, errorMessage = null)
+        }
+
+        // Check completed offline downloads first so playback works seamlessly with zero network!
+        val downloaded = runBlocking {
+            runCatching { downloadManager.getCompletedDownload(trackId) }.getOrNull()
+        }
+        if (downloaded != null) {
+            val localFile = File(downloaded.localAudioPath)
+            if (localFile.exists() && localFile.length() > 0L) {
+                val localUri = Uri.fromFile(localFile)
+                val localArtUri = downloaded.localArtworkPath
+                    ?.let { File(it) }
+                    ?.takeIf { it.exists() && it.length() > 0L }
+                    ?.let { Uri.fromFile(it).toString() }
+                val updatedTrack = track.copy(thumbnailUrl = localArtUri ?: track.thumbnailUrl)
+                onlineTrackMap[track.id] = updatedTrack
+                val label = "OFFLINE · ${downloaded.formatLabel}"
+                preloadLyricsForOnlineTrack(updatedTrack, label)
+                PlaybackRuntimeBus.updateOnlineSnapshot { snap ->
+                    snap.copy(
+                        isResolving = false,
+                        activeStreamLabel = label,
+                        activeProviderLabel = "OFFLINE",
+                        errorMessage = null
+                    )
+                }
+                return dataSpec.buildUpon()
+                    .setUri(localUri)
+                    .setHttpRequestHeaders(emptyMap())
+                    .build()
+            }
         }
 
         return try {
@@ -467,15 +572,23 @@ class PlaybackService : MediaLibraryService() {
     private inner class FailoverStreamDataSource(
         private val upstream: HttpDataSource
     ) : DataSource {
+        private val fileUpstream = FileDataSource()
+        private var activeUpstream: DataSource = upstream
         private var currentUri: Uri? = null
 
         override fun addTransferListener(transferListener: TransferListener) {
             upstream.addTransferListener(transferListener)
+            fileUpstream.addTransferListener(transferListener)
         }
 
         override fun open(dataSpec: DataSpec): Long {
+            currentUri = dataSpec.uri
+            if (dataSpec.uri.scheme.equals("file", ignoreCase = true)) {
+                activeUpstream = fileUpstream
+                return fileUpstream.open(dataSpec)
+            }
+            activeUpstream = upstream
             return try {
-                currentUri = dataSpec.uri
                 upstream.open(dataSpec)
             } catch (err: HttpDataSource.HttpDataSourceException) {
                 val isRecoverableHttp = when (err) {
@@ -546,15 +659,16 @@ class PlaybackService : MediaLibraryService() {
         }
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-            return upstream.read(buffer, offset, length)
+            return activeUpstream.read(buffer, offset, length)
         }
 
-        override fun getUri(): Uri? = upstream.uri ?: currentUri
+        override fun getUri(): Uri? = activeUpstream.uri ?: currentUri
 
-        override fun getResponseHeaders(): Map<String, List<String>> = upstream.responseHeaders
+        override fun getResponseHeaders(): Map<String, List<String>> =
+            if (activeUpstream === upstream) upstream.responseHeaders else emptyMap()
 
         override fun close() {
-            upstream.close()
+            activeUpstream.close()
         }
     }
 
@@ -695,6 +809,23 @@ class PlaybackService : MediaLibraryService() {
         serviceScope.launch {
             settingsRepository.settingsFlow.collectLatest { settings ->
                 currentSettings = settings
+                if ((prevWifiQuality != null && prevWifiQuality != settings.wifiStreamingQuality) ||
+                    (prevMobileQuality != null && prevMobileQuality != settings.mobileDataStreamingQuality)
+                ) {
+                    providerManager.clearStreamCache()
+                }
+                prevWifiQuality = settings.wifiStreamingQuality
+                prevMobileQuality = settings.mobileDataStreamingQuality
+
+                if (prevWidgetSharpCorners == null) {
+                    prevWidgetSharpCorners = settings.widgetSharpCorners
+                    WidgetStatePrefs.setGlobalSharpCorners(this@PlaybackService, settings.widgetSharpCorners)
+                } else if (prevWidgetSharpCorners != settings.widgetSharpCorners) {
+                    prevWidgetSharpCorners = settings.widgetSharpCorners
+                    WidgetStatePrefs.setGlobalSharpCorners(this@PlaybackService, settings.widgetSharpCorners)
+                    WidgetUpdater.refreshAllWidgets(this@PlaybackService)
+                }
+
                 val audioAttrs = AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
                     .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
@@ -785,6 +916,9 @@ class PlaybackService : MediaLibraryService() {
                 if (tick % 6 == 0) {
                     savePlaybackStateAsync()
                 }
+                if (activeEngine == ActiveAudioEngine.OFFLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = false)
+                }
                 tick++
                 delay(250L)
             }
@@ -823,6 +957,7 @@ class PlaybackService : MediaLibraryService() {
     }
 
     private fun maybeTriggerInfiniteRadio(autoAdvanceAfterAppend: Boolean) {
+        if (sleepTimerEndOfTrack) return
         if (!::onlinePlayer.isInitialized || !::recommendationEngine.isInitialized) return
         if (!currentSettings.infiniteRadioEnabled) return
         if (onlinePlayer.repeatMode != Player.REPEAT_MODE_OFF) return
@@ -959,6 +1094,9 @@ class PlaybackService : MediaLibraryService() {
                 if (tick % 8 == 0) {
                     saveOnlineQueueStateAsync()
                 }
+                if (activeEngine == ActiveAudioEngine.ONLINE) {
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = false)
+                }
                 tick++
                 delay(250L)
             }
@@ -982,77 +1120,124 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
-    private fun startSleepTimer(minutes: Int) {
+    private fun completeSleepTimerNow(targetPlayer: ExoPlayer?) {
+        sleepTimerEndOfTrack = false
         sleepTimerJob?.cancel()
-        if (minutes <= 0) {
+        targetPlayer?.pause()
+        if (::player.isInitialized) {
+            if (player.isPlaying) player.pause()
+            player.volume = 1f
+        }
+        if (::onlinePlayer.isInitialized) {
+            if (onlinePlayer.isPlaying) onlinePlayer.pause()
+            onlinePlayer.volume = 1f
+        }
+        PlaybackRuntimeBus.updateSleepTimer(SleepTimerState())
+        WidgetUpdater.syncAndRefreshFromPlayback(this, activeEngine, forceImmediate = true)
+    }
+
+    private fun startSleepTimer(minutes: Int, endOfTrack: Boolean = false) {
+        sleepTimerJob?.cancel()
+        sleepTimerEndOfTrack = endOfTrack
+        if (!endOfTrack && minutes <= 0) {
             if (::player.isInitialized) player.volume = 1f
             if (::onlinePlayer.isInitialized) onlinePlayer.volume = 1f
             PlaybackRuntimeBus.updateSleepTimer(SleepTimerState())
             return
         }
+        if (endOfTrack) {
+            sleepTimerJob = serviceScope.launch {
+                val fadeWindowMs = 4_000L
+                while (sleepTimerEndOfTrack) {
+                    val active = activePlayer()
+                    val dur = active?.duration?.takeIf { it > 0L } ?: 0L
+                    val pos = active?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    val remaining = if (dur > 0L) (dur - pos).coerceAtLeast(0L) else 0L
+                    PlaybackRuntimeBus.updateSleepTimer(
+                        SleepTimerState(
+                            isActive = true,
+                            remainingMs = remaining,
+                            totalMs = dur,
+                            isEndOfTrack = true
+                        )
+                    )
+                    if (active != null && active.isPlaying && dur > fadeWindowMs && remaining in 1L..fadeWindowMs) {
+                        val vol = (remaining.toFloat() / fadeWindowMs.toFloat()).coerceIn(0.04f, 1f)
+                        active.volume = vol
+                    }
+                    if (active != null && active.playbackState == Player.STATE_ENDED) {
+                        completeSleepTimerNow(active)
+                        break
+                    }
+                    delay(200L)
+                }
+            }
+            return
+        }
         val totalMs = minutes * 60_000L
         sleepTimerJob = serviceScope.launch {
             var remaining = totalMs
+            val fadeWindowMs = 5_000L
             while (remaining > 0L) {
                 PlaybackRuntimeBus.updateSleepTimer(
-                    SleepTimerState(isActive = true, remainingMs = remaining, totalMs = totalMs)
+                    SleepTimerState(
+                        isActive = true,
+                        remainingMs = remaining,
+                        totalMs = totalMs,
+                        isEndOfTrack = false
+                    )
                 )
-                if (remaining <= 3000L) {
-                    val vol = (remaining / 3000f).coerceIn(0.05f, 1f)
+                if (remaining <= fadeWindowMs) {
+                    val vol = (remaining.toFloat() / fadeWindowMs.toFloat()).coerceIn(0.04f, 1f)
                     activePlayer()?.volume = vol
                 }
-                delay(1000L)
-                remaining -= 1000L
+                delay(500L)
+                remaining = (remaining - 500L).coerceAtLeast(0L)
             }
-            activePlayer()?.pause()
-            if (::player.isInitialized) player.volume = 1f
-            if (::onlinePlayer.isInitialized) onlinePlayer.volume = 1f
-            PlaybackRuntimeBus.updateSleepTimer(SleepTimerState())
+            completeSleepTimerNow(activePlayer())
         }
     }
 
-    private fun restorePersistedQueue() {
-        serviceScope.launch {
-            val settings = settingsRepository.getSettingsOnce()
-            currentSettings = settings
-            val saved = settingsRepository.loadQueueState()
-            if (saved.queueUris.isEmpty()) return@launch
-            if (player.mediaItemCount > 0) return@launch
+    private suspend fun restorePersistedQueueSuspend() {
+        val settings = settingsRepository.getSettingsOnce()
+        currentSettings = settings
+        val saved = settingsRepository.loadQueueState()
+        if (saved.queueUris.isEmpty()) return
+        if (player.mediaItemCount > 0) return
 
-            val items = saved.queueUris.mapNotNull { uriStr ->
-                val parsed = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return@mapNotNull null
-                if (!InputAndUrlSecurity.isSafePlayableLocalUri(parsed)) return@mapNotNull null
-                runCatching { buildMediaItem(parsed) }.getOrNull()
+        val items = saved.queueUris.mapNotNull { uriStr ->
+            val parsed = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return@mapNotNull null
+            if (!InputAndUrlSecurity.isSafePlayableLocalUri(parsed) &&
+                !InputAndUrlSecurity.isSafeAppPrivateDownloadUri(this, parsed)
+            ) return@mapNotNull null
+            runCatching { buildMediaItem(parsed) }.getOrNull()
+        }
+        if (items.isNotEmpty()) {
+            val safeIndex = saved.currentIndex.coerceIn(items.indices)
+            player.setMediaItems(items, safeIndex, saved.positionMs.coerceAtLeast(0L))
+            player.shuffleModeEnabled = saved.shuffleEnabled
+            player.repeatMode = saved.repeatMode
+            player.prepare()
+            if (settings.resumePlaybackOnStart) {
+                player.pause()
             }
-            if (items.isNotEmpty()) {
-                val safeIndex = saved.currentIndex.coerceIn(items.indices)
-                player.setMediaItems(items, safeIndex, saved.positionMs.coerceAtLeast(0L))
-                player.shuffleModeEnabled = saved.shuffleEnabled
-                player.repeatMode = saved.repeatMode
-                player.prepare()
-                if (settings.resumePlaybackOnStart) {
-                    player.pause()
-                }
-                syncOfflineSnapshot()
-            }
+            syncOfflineSnapshot()
         }
     }
 
-    private fun restorePersistedOnlineQueue() {
-        serviceScope.launch {
-            val saved = settingsRepository.loadOnlineQueueState()
-            if (saved.tracks.isEmpty()) return@launch
-            if (onlinePlayer.mediaItemCount > 0) return@launch
+    private suspend fun restorePersistedOnlineQueueSuspend() {
+        val saved = settingsRepository.loadOnlineQueueState()
+        if (saved.tracks.isEmpty()) return
+        if (onlinePlayer.mediaItemCount > 0) return
 
-            saved.tracks.forEach { onlineTrackMap[it.id] = it }
-            val items = saved.tracks.map { buildOnlineMediaItem(it) }
-            val safeIdx = saved.currentIndex.coerceIn(items.indices)
-            onlinePlayer.setMediaItems(items, safeIdx, saved.positionMs.coerceAtLeast(0L))
-            onlinePlayer.shuffleModeEnabled = saved.shuffleEnabled
-            onlinePlayer.repeatMode = saved.repeatMode
-            // Don't prepare immediately so we don't hit network until user plays Online
-            syncOnlineSnapshot()
-        }
+        saved.tracks.forEach { onlineTrackMap[it.id] = it }
+        val items = saved.tracks.map { buildOnlineMediaItem(it) }
+        val safeIdx = saved.currentIndex.coerceIn(items.indices)
+        onlinePlayer.setMediaItems(items, safeIdx, saved.positionMs.coerceAtLeast(0L))
+        onlinePlayer.shuffleModeEnabled = saved.shuffleEnabled
+        onlinePlayer.repeatMode = saved.repeatMode
+        // Don't prepare immediately so we don't hit network until user plays Online
+        syncOnlineSnapshot()
     }
 
     private fun savePlaybackStateAsync() {
@@ -1190,15 +1375,96 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        val active = activePlayer()
-        if (active != null) {
-            when (intent?.action) {
-                ACTION_TOGGLE_PLAY -> if (active.isPlaying) active.pause() else if (active.mediaItemCount > 0) active.play()
-                ACTION_NEXT -> if (active.mediaItemCount > 0) active.seekToNextMediaItem()
-                ACTION_PREVIOUS -> if (active.mediaItemCount > 0) active.seekToPreviousMediaItem()
+        val action = intent?.action
+        val isWidgetTransportAction = action in setOf(
+            ACTION_TOGGLE_PLAY,
+            ACTION_NEXT,
+            ACTION_PREVIOUS,
+            ACTION_TOGGLE_SHUFFLE
+        )
+        if (isWidgetTransportAction) {
+            val postedTempFg = ensureTempWidgetForegroundIfNeeded()
+            serviceScope.launch {
+                queueRestoreJob?.join()
+                val active = activePlayer()
+                if (active != null && active.mediaItemCount > 0) {
+                    when (action) {
+                        ACTION_TOGGLE_PLAY -> {
+                            if (active.isPlaying) {
+                                active.pause()
+                            } else {
+                                if (active.playbackState == Player.STATE_IDLE) active.prepare()
+                                active.play()
+                            }
+                        }
+                        ACTION_NEXT -> {
+                            if (active.hasNextMediaItem()) active.seekToNextMediaItem()
+                            else active.seekToDefaultPosition(0)
+                            if (active.playbackState == Player.STATE_IDLE) active.prepare()
+                            active.play()
+                        }
+                        ACTION_PREVIOUS -> {
+                            if (active.currentPosition > 3000L) active.seekTo(0L)
+                            else if (active.hasPreviousMediaItem()) active.seekToPreviousMediaItem()
+                            else active.seekToDefaultPosition(active.mediaItemCount - 1)
+                            if (active.playbackState == Player.STATE_IDLE) active.prepare()
+                            active.play()
+                        }
+                        ACTION_TOGGLE_SHUFFLE -> {
+                            active.shuffleModeEnabled = !active.shuffleModeEnabled
+                        }
+                    }
+                    if (activeEngine == ActiveAudioEngine.ONLINE) {
+                        syncOnlineSnapshot()
+                        saveOnlineQueueStateAsync()
+                    } else {
+                        syncOfflineSnapshot()
+                        savePlaybackStateAsync()
+                    }
+                    WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
+                }
+                if (postedTempFg) {
+                    delay(if (active?.isPlaying == true) 1200L else 150L)
+                    if (active?.isPlaying != true) {
+                        runCatching { ServiceCompat.stopForeground(this@PlaybackService, ServiceCompat.STOP_FOREGROUND_REMOVE) }
+                    }
+                    runCatching {
+                        val nm = getSystemService(NotificationManager::class.java)
+                        nm?.cancel(WIDGET_FG_NOTIFICATION_ID)
+                    }
+                }
             }
         }
         return START_STICKY
+    }
+
+    private fun ensureTempWidgetForegroundIfNeeded(): Boolean {
+        if (Build.VERSION.SDK_INT < 26) return false
+        val alreadyPlaying = (::player.isInitialized && player.isPlaying) ||
+            (::onlinePlayer.isInitialized && onlinePlayer.isPlaying)
+        if (alreadyPlaying) return false
+
+        val nm = getSystemService(NotificationManager::class.java) ?: return false
+        if (nm.getNotificationChannel(WIDGET_FG_CHANNEL_ID) == null) {
+            val ch = NotificationChannel(
+                WIDGET_FG_CHANNEL_ID,
+                "Playback Controls",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            nm.createNotificationChannel(ch)
+        }
+        val state = WidgetStatePrefs.loadState(this)
+        val notification: Notification = NotificationCompat.Builder(this, WIDGET_FG_CHANNEL_ID)
+            .setSmallIcon(R.drawable.aria_app_logo)
+            .setContentTitle(state.title.ifBlank { "ARIA" })
+            .setContentText(state.artist.ifBlank { "Resuming playback" })
+            .setOngoing(false)
+            .setSilent(true)
+            .build()
+        return runCatching {
+            startForeground(WIDGET_FG_NOTIFICATION_ID, notification)
+            true
+        }.getOrDefault(false)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
@@ -1243,6 +1509,7 @@ class PlaybackService : MediaLibraryService() {
             }.getOrNull()
             if (loaded != null && loaded.hasContent) {
                 PlaybackRuntimeBus.updatePreloadedLyrics(uiTrack.uriString, loaded)
+                WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
             }
         }
     }
@@ -1292,6 +1559,7 @@ class PlaybackService : MediaLibraryService() {
             }.getOrNull()
             if (loaded != null && loaded.hasContent) {
                 PlaybackRuntimeBus.updatePreloadedLyrics(uriStr, loaded)
+                WidgetUpdater.syncAndRefreshFromPlayback(this@PlaybackService, activeEngine, forceImmediate = true)
             }
         }
     }
@@ -1788,6 +2056,7 @@ class PlaybackService : MediaLibraryService() {
             val sessionCommands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
                 .buildUpon()
                 .add(SessionCommand(CMD_SLEEP_TIMER, Bundle.EMPTY))
+                .add(SessionCommand(CMD_SLEEP_TIMER_END_OF_TRACK, Bundle.EMPTY))
                 .add(SessionCommand(CMD_CANCEL_SLEEP_TIMER, Bundle.EMPTY))
                 .add(SessionCommand(CMD_PREVIEW_EQ_PRESET, Bundle.EMPTY))
                 .add(SessionCommand(CMD_ACTIVATE_OFFLINE_ENGINE, Bundle.EMPTY))
@@ -1805,11 +2074,15 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<SessionResult> {
             when (customCommand.customAction) {
                 CMD_SLEEP_TIMER -> {
+                    val isEnd = args.getBoolean(ARG_END_OF_TRACK, false)
                     val minutes = args.getInt(ARG_MINUTES, 30).coerceIn(0, 480)
-                    startSleepTimer(minutes)
+                    startSleepTimer(minutes = minutes, endOfTrack = isEnd)
+                }
+                CMD_SLEEP_TIMER_END_OF_TRACK -> {
+                    startSleepTimer(minutes = 0, endOfTrack = true)
                 }
                 CMD_CANCEL_SLEEP_TIMER -> {
-                    startSleepTimer(0)
+                    startSleepTimer(minutes = 0, endOfTrack = false)
                 }
                 CMD_PREVIEW_EQ_PRESET -> {
                     val presetIdx = args.getInt(ARG_PRESET_INDEX, -1)
@@ -1833,13 +2106,17 @@ class PlaybackService : MediaLibraryService() {
             val resolved = mediaItems.mapNotNull { item ->
                 val uri = item.requestMetadata.mediaUri ?: runCatching { Uri.parse(item.mediaId) }.getOrNull()
                 val localUri = item.localConfiguration?.uri
+                val isAllowedLocal = { u: Uri ->
+                    InputAndUrlSecurity.isSafePlayableLocalUri(u) ||
+                        InputAndUrlSecurity.isSafeAppPrivateDownloadUri(this@PlaybackService, u)
+                }
                 when {
-                    localUri != null && (localUri.scheme == OnlineTrack.ONLINE_SCHEME || InputAndUrlSecurity.isSafePlayableLocalUri(localUri)) -> item
+                    localUri != null && (localUri.scheme == OnlineTrack.ONLINE_SCHEME || isAllowedLocal(localUri)) -> item
                     uri != null && uri.scheme == OnlineTrack.ONLINE_SCHEME -> {
                         val track = onlineTrackMap[item.mediaId]
                         if (track != null) buildOnlineMediaItem(track) else null
                     }
-                    uri != null && InputAndUrlSecurity.isSafePlayableLocalUri(uri) -> buildMediaItem(uri)
+                    uri != null && isAllowedLocal(uri) -> buildMediaItem(uri)
                     else -> null
                 }
             }
@@ -1932,13 +2209,19 @@ class PlaybackService : MediaLibraryService() {
         const val ACTION_TOGGLE_PLAY = "app.nocturne.player.TOGGLE_PLAY"
         const val ACTION_PREVIOUS = "app.nocturne.player.PREVIOUS"
         const val ACTION_NEXT = "app.nocturne.player.NEXT"
+        const val ACTION_TOGGLE_SHUFFLE = "app.nocturne.player.TOGGLE_SHUFFLE"
 
         const val CMD_SLEEP_TIMER = "app.nocturne.player.CMD_SLEEP_TIMER"
+        const val CMD_SLEEP_TIMER_END_OF_TRACK = "app.nocturne.player.CMD_SLEEP_TIMER_END_OF_TRACK"
         const val CMD_CANCEL_SLEEP_TIMER = "app.nocturne.player.CMD_CANCEL_SLEEP_TIMER"
         const val CMD_PREVIEW_EQ_PRESET = "app.nocturne.player.CMD_PREVIEW_EQ_PRESET"
         const val CMD_ACTIVATE_OFFLINE_ENGINE = "app.nocturne.player.CMD_ACTIVATE_OFFLINE_ENGINE"
         const val ARG_MINUTES = "minutes"
+        const val ARG_END_OF_TRACK = "end_of_track"
         const val ARG_PRESET_INDEX = "preset_index"
+
+        private const val WIDGET_FG_CHANNEL_ID = "aria_widget_playback"
+        private const val WIDGET_FG_NOTIFICATION_ID = 1091
 
         const val EXTRA_RG_TRACK = "rg_track_db"
         const val EXTRA_RG_ALBUM = "rg_album_db"

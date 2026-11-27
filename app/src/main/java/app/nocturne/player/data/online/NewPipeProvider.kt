@@ -13,6 +13,7 @@ import app.nocturne.player.data.model.OnlineSearchFilter
 import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.OperationType
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -148,6 +149,12 @@ class NewPipeProvider(
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
+    ): OnlineStreamResolution = resolveStream(track, speedTier, null)
+
+    override suspend fun resolveStream(
+        track: OnlineTrack,
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality?
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val service = getService()
         val rawTargetUrl = track.sourceUrl.ifBlank {
@@ -163,7 +170,11 @@ class NewPipeProvider(
             ?: throw IllegalArgumentException("Untrusted or invalid ${providerType.displayName} track URL")
         val info = StreamInfo.getInfo(service, targetUrl)
         val mappedStreams = info.audioStreams.mapNotNull { mapAudioStream(it) }
-        val selected = StreamQualitySelector.selectBestAudioStream(mappedStreams, speedTier)
+        val selected = StreamQualitySelector.selectBestAudioStream(
+            streams = mappedStreams,
+            speedTier = speedTier,
+            preferredQuality = preferredQuality
+        )
             ?: throw IllegalStateException("No playable audio streams found via ${providerType.displayName}")
 
         val updatedTrack = track.copy(

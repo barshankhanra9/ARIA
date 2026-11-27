@@ -46,5 +46,58 @@
                 <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
             </intent-filter>
         </service>
+
+        <activity
+            android:name=".widget.WidgetConfigActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.NoActionBar">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
+        <receiver
+            android:name=".widget.DailyStripWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_daily_strip_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_daily_strip_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.FrontPageWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_front_page_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_front_page_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.SundayBroadsheetWidgetProvider"
+            android:exported="true"
+            android:label="@string/widget_sunday_broadsheet_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_sunday_broadsheet_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.WidgetActionReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="app.nocturne.player.widget.ACTION_TOGGLE_FAVORITE" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

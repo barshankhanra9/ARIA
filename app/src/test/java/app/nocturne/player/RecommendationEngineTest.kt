@@ -148,7 +148,12 @@ class RecommendationEngineTest {
         v3Helper.close()
 
         val db = Room.databaseBuilder(context, AriaDatabase::class.java, dbName)
-            .addMigrations(AriaDatabase.MIGRATION_1_2, AriaDatabase.MIGRATION_2_3, AriaDatabase.MIGRATION_3_4)
+            .addMigrations(
+                AriaDatabase.MIGRATION_1_2,
+                AriaDatabase.MIGRATION_2_3,
+                AriaDatabase.MIGRATION_3_4,
+                AriaDatabase.MIGRATION_4_5
+            )
             .allowMainThreadQueries()
             .build()
 

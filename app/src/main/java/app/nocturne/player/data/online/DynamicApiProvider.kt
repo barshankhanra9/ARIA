@@ -16,6 +16,7 @@ import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.PaginationRule
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -165,6 +166,12 @@ class DynamicApiProvider(
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
+    ): OnlineStreamResolution = resolveStream(track, speedTier, null)
+
+    override suspend fun resolveStream(
+        track: OnlineTrack,
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality?
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val currentCfg = cfg
         val safeId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
@@ -182,7 +189,8 @@ class DynamicApiProvider(
             val preSelected = StreamQualitySelector.selectBestAudioStream(
                 streams = streams,
                 speedTier = speedTier,
-                allowedLoopbackOrigin = preAllowedOrigin
+                allowedLoopbackOrigin = preAllowedOrigin,
+                preferredQuality = preferredQuality
             )
             val inlineUsable = if (preSelected == null) {
                 false
@@ -299,7 +307,8 @@ class DynamicApiProvider(
         val selected = StreamQualitySelector.selectBestAudioStream(
             streams = streams,
             speedTier = speedTier,
-            allowedLoopbackOrigin = allowedOrigin
+            allowedLoopbackOrigin = allowedOrigin,
+            preferredQuality = preferredQuality
         ) ?: throw IOException("No playable audio streams returned by ${currentCfg.displayName}")
 
         if (currentCfg.verifyStreamReachable) {

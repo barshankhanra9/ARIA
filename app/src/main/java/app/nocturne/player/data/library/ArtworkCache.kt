@@ -43,10 +43,12 @@ object ArtworkCache {
 
         var bitmap: Bitmap? = null
 
-        // 1. Custom cover override (from Tag Editor or Playlist artwork picker)
+        // 1. Custom cover override (from Tag Editor, Playlist artwork picker, or Offline Downloads)
         if (!customCoverUri.isNullOrBlank()) {
             val parsedCover = runCatching { Uri.parse(customCoverUri) }.getOrNull()
-            if (InputAndUrlSecurity.isSafePlayableLocalUri(parsedCover)) {
+            if (InputAndUrlSecurity.isSafePlayableLocalUri(parsedCover) ||
+                InputAndUrlSecurity.isSafeAppPrivateDownloadUri(context, parsedCover)
+            ) {
                 bitmap = decodeUriSampled(context, parsedCover!!, targetSizePx)
             }
         }
@@ -54,7 +56,9 @@ object ArtworkCache {
         // 2. Embedded artwork via MediaMetadataRetriever
         if (bitmap == null && trackUri.isNotBlank()) {
             val parsedTrack = runCatching { Uri.parse(trackUri) }.getOrNull()
-            if (InputAndUrlSecurity.isSafePlayableLocalUri(parsedTrack)) {
+            if (InputAndUrlSecurity.isSafePlayableLocalUri(parsedTrack) ||
+                InputAndUrlSecurity.isSafeAppPrivateDownloadUri(context, parsedTrack)
+            ) {
                 val retriever = MediaMetadataRetriever()
                 try {
                     retriever.setDataSource(context, parsedTrack!!)
@@ -110,7 +114,9 @@ object ArtworkCache {
     }
 
     private fun decodeUriSampled(context: Context, uri: Uri, targetPx: Int): Bitmap? {
-        if (!InputAndUrlSecurity.isSafePlayableLocalUri(uri)) return null
+        if (!InputAndUrlSecurity.isSafePlayableLocalUri(uri) &&
+            !InputAndUrlSecurity.isSafeAppPrivateDownloadUri(context, uri)
+        ) return null
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             context.contentResolver.openInputStream(uri)?.use {

@@ -43,6 +43,7 @@ enum class OnlineLibrarySection(val label: String) {
     RECENTLY_PLAYED("Recently Played"),
     MOST_PLAYED("Most Played"),
     QUEUE("Current Queue"),
+    DOWNLOADS("Downloads"),
     ARTISTS("Artists"),
     PLAYLISTS("Playlists")
 }

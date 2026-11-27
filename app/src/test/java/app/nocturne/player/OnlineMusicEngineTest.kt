@@ -381,9 +381,14 @@ class OnlineMusicEngineTest {
         v1OpenHelper.writableDatabase.close()
         v1OpenHelper.close()
 
-        // Step 2: Open with Room using MIGRATION_1_2 + MIGRATION_2_3 + MIGRATION_3_4 and verify offline data survives
+        // Step 2: Open with Room using MIGRATION_1_2 + MIGRATION_2_3 + MIGRATION_3_4 + MIGRATION_4_5 and verify offline data survives
         val db = Room.databaseBuilder(context, AriaDatabase::class.java, dbName)
-            .addMigrations(AriaDatabase.MIGRATION_1_2, AriaDatabase.MIGRATION_2_3, AriaDatabase.MIGRATION_3_4)
+            .addMigrations(
+                AriaDatabase.MIGRATION_1_2,
+                AriaDatabase.MIGRATION_2_3,
+                AriaDatabase.MIGRATION_3_4,
+                AriaDatabase.MIGRATION_4_5
+            )
             .allowMainThreadQueries()
             .build()
 

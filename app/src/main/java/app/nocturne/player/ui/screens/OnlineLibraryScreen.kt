@@ -19,7 +19,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Person
@@ -40,6 +42,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.nocturne.player.data.db.DownloadedTrackEntity
+import app.nocturne.player.data.downloads.DownloadedPlaylistWithTracks
+import app.nocturne.player.data.downloads.OfflineDownloadManager
 import app.nocturne.player.data.model.OnlineHistoryEntry
 import app.nocturne.player.data.model.OnlineLibrarySection
 import app.nocturne.player.data.model.OnlinePlaylist
@@ -51,10 +56,13 @@ import app.nocturne.player.ui.components.InkStampTag
 import app.nocturne.player.ui.components.OnlineTrackListRow
 import app.nocturne.player.ui.components.PaperAlertDialog
 import app.nocturne.player.ui.components.PaperCard
+import app.nocturne.player.ui.components.PaperDebossedWell
+import app.nocturne.player.ui.components.PaperDivider
 import app.nocturne.player.ui.components.PaperEmptyState
 import app.nocturne.player.ui.components.PaperFilterChip
 import app.nocturne.player.ui.components.PrintedArtwork
 import app.nocturne.player.ui.components.TactilePaperButton
+import app.nocturne.player.ui.components.formatFileSize
 import app.nocturne.player.ui.theme.AriaPaperTheme
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -80,7 +88,16 @@ fun OnlineLibraryScreen(
     onClearQueue: () -> Unit,
     onOpenQueueSheet: () -> Unit,
     onOpenArtist: (String, OnlineProviderType, String?) -> Unit,
-    onOpenPlaylist: (OnlinePlaylist) -> Unit
+    onOpenPlaylist: (OnlinePlaylist) -> Unit,
+    downloadedTracks: List<DownloadedTrackEntity> = emptyList(),
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    downloadedPlaylists: List<DownloadedPlaylistWithTracks> = emptyList(),
+    totalDownloadBytes: Long = 0L,
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null,
+    onDeleteDownload: (String) -> Unit = {},
+    onDeleteDownloadedPlaylist: (String) -> Unit = {},
+    onPlayDownloadedTracks: (List<DownloadedTrackEntity>, Int, Boolean) -> Unit = { _, _, _ -> },
+    onPlayDownloadedPlaylist: (DownloadedPlaylistWithTracks, Int, Boolean) -> Unit = { _, _, _ -> }
 ) {
     val palette = AriaPaperTheme.palette
     var showClearHistoryDialog by remember { mutableStateOf(false) }
@@ -124,6 +141,150 @@ fun OnlineLibraryScreen(
         Spacer(Modifier.height(12.dp))
 
         when (section) {
+            OnlineLibrarySection.DOWNLOADS -> {
+                PaperDebossedWell(
+                    cornerRadius = 12.dp,
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("OFFLINE STORAGE", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                            Text(
+                                text = "${downloadedTracks.size} saved song(s) · ${downloadedPlaylists.size} collection(s)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = palette.inkPrimary
+                            )
+                        }
+                        InkStampTag(text = formatFileSize(totalDownloadBytes), accented = true)
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                if (downloadedTracks.isEmpty() && downloadedPlaylists.isEmpty()) {
+                    PaperEmptyState(
+                        icon = Icons.Rounded.DownloadDone,
+                        title = "No Offline Downloads Yet",
+                        subtitle = "Tap the download icon on any online song or playlist to save audio, album cover, and synced lyrics for offline playback."
+                    )
+                } else {
+                    if (downloadedTracks.isNotEmpty()) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            TactilePaperButton(
+                                text = "Play Offline (${downloadedTracks.size})",
+                                icon = Icons.Rounded.PlayArrow,
+                                onClick = { onPlayDownloadedTracks(downloadedTracks, 0, false) },
+                                modifier = Modifier.weight(1f)
+                            )
+                            TactilePaperButton(
+                                text = "Shuffle",
+                                icon = Icons.Rounded.Shuffle,
+                                filled = false,
+                                onClick = { onPlayDownloadedTracks(downloadedTracks, downloadedTracks.indices.random(), true) },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(bottom = 24.dp)
+                    ) {
+                        if (downloadedPlaylists.isNotEmpty()) {
+                            item(key = "dl_collections_hdr") {
+                                Text("SAVED COLLECTIONS", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                            }
+                            items(downloadedPlaylists, key = { "dl_pl_${it.id}" }) { pl ->
+                                PaperCard(
+                                    containerColor = palette.paperCream,
+                                    elevation = 2.dp,
+                                    onClick = { onPlayDownloadedPlaylist(pl, 0, false) },
+                                    contentPadding = PaddingValues(12.dp)
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        PrintedArtwork(
+                                            trackUri = pl.localCoverUri,
+                                            customCoverUri = pl.localCoverUri,
+                                            modifier = Modifier.size(50.dp),
+                                            mattePadding = 2.dp,
+                                            targetSizePx = 160
+                                        )
+                                        Spacer(Modifier.width(12.dp))
+                                        Column(Modifier.weight(1f)) {
+                                            Text(pl.title, style = MaterialTheme.typography.titleMedium, color = palette.inkPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Text("${pl.tracks.size} offline track(s) · ${pl.subtitle.ifBlank { "Saved collection" }}", style = MaterialTheme.typography.bodySmall, color = palette.inkSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        }
+                                        IconButton(onClick = { onDeleteDownloadedPlaylist(pl.id) }) {
+                                            Icon(Icons.Rounded.Delete, "Remove offline collection", tint = palette.inkTertiary, modifier = Modifier.size(19.dp))
+                                        }
+                                    }
+                                }
+                            }
+                            item(key = "dl_tracks_divider") {
+                                Spacer(Modifier.height(4.dp))
+                                PaperDivider()
+                                Spacer(Modifier.height(4.dp))
+                                Text("SAVED SONGS (${downloadedTracks.size})", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                            }
+                        }
+                        itemsIndexed(downloadedTracks, key = { idx, e -> "dl_${e.trackId}_$idx" }) { idx, entity ->
+                            val onlineTrack = remember(entity) { OfflineDownloadManager.entityToOnlineTrack(entity) }
+                            val isCurrent = onlineTrack.id == onlineSnapshot.currentTrack?.id
+                            PaperCard(
+                                containerColor = if (isCurrent) palette.paperCream else palette.paperElevated,
+                                elevation = if (isCurrent) 4.dp else 2.dp,
+                                selected = isCurrent,
+                                onClick = { onPlayDownloadedTracks(downloadedTracks, idx, false) },
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    PrintedArtwork(
+                                        trackUri = onlineTrack.thumbnailUrl,
+                                        customCoverUri = onlineTrack.thumbnailUrl,
+                                        modifier = Modifier.size(52.dp),
+                                        mattePadding = 2.dp,
+                                        targetSizePx = 192
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        Text(
+                                            text = entity.title,
+                                            style = MaterialTheme.typography.titleMedium,
+                                            color = if (isCurrent) palette.accent else palette.inkPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            text = "${entity.artist} · ${formatFileSize(entity.fileSizeBytes)}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = palette.inkSecondary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Spacer(Modifier.height(4.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            InkStampTag(text = "OFFLINE · ${entity.formatLabel}", accented = isCurrent)
+                                            if (!entity.localLyricsPath.isNullOrBlank()) {
+                                                InkStampTag(text = "LYRICS", accented = false)
+                                            }
+                                        }
+                                    }
+                                    IconButton(
+                                        onClick = { onDeleteDownload(entity.trackId) },
+                                        modifier = Modifier.testTag("delete_download_${entity.trackId}")
+                                    ) {
+                                        Icon(Icons.Rounded.Delete, "Delete offline download", tint = palette.inkTertiary, modifier = Modifier.size(20.dp))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             OnlineLibrarySection.FAVORITES -> OnlineTrackCollectionBody(
                 tracks = favorites,
                 currentTrackId = onlineSnapshot.currentTrack?.id,
@@ -132,7 +293,9 @@ fun OnlineLibraryScreen(
                 emptySubtitle = "Heart any online track to save its stream identity and artwork locally.",
                 onPlayTracks = onPlayTracks,
                 onToggleFavorite = onToggleFavorite,
-                onOpenContextMenu = onOpenContextMenu
+                onOpenContextMenu = onOpenContextMenu,
+                downloadStates = downloadStates,
+                onDownloadTrack = onDownloadTrack
             )
 
             OnlineLibrarySection.RECENTLY_PLAYED -> OnlineTrackCollectionBody(
@@ -143,7 +306,9 @@ fun OnlineLibraryScreen(
                 emptySubtitle = "Tracks you stream online will appear here for one-tap replay.",
                 onPlayTracks = onPlayTracks,
                 onToggleFavorite = onToggleFavorite,
-                onOpenContextMenu = onOpenContextMenu
+                onOpenContextMenu = onOpenContextMenu,
+                downloadStates = downloadStates,
+                onDownloadTrack = onDownloadTrack
             )
 
             OnlineLibrarySection.MOST_PLAYED -> OnlineTrackCollectionBody(
@@ -154,7 +319,9 @@ fun OnlineLibraryScreen(
                 emptySubtitle = "Stream tracks across your configured providers to build your rotation.",
                 onPlayTracks = onPlayTracks,
                 onToggleFavorite = onToggleFavorite,
-                onOpenContextMenu = onOpenContextMenu
+                onOpenContextMenu = onOpenContextMenu,
+                downloadStates = downloadStates,
+                onDownloadTrack = onDownloadTrack
             )
 
             OnlineLibrarySection.HISTORY -> {
@@ -200,7 +367,9 @@ fun OnlineLibraryScreen(
                                     isCurrent = entry.track.id == onlineSnapshot.currentTrack?.id,
                                     onClick = { onPlayTracks(tracksFromHistory, idx, false) },
                                     onToggleFavorite = { onToggleFavorite(entry.track) },
-                                    onMoreClick = { onOpenContextMenu(entry.track) }
+                                    onMoreClick = { onOpenContextMenu(entry.track) },
+                                    downloadState = downloadStates[entry.track.id],
+                                    onDownloadClick = onDownloadTrack?.let { cb -> { cb(entry.track) } }
                                 )
                             }
                         }
@@ -406,7 +575,9 @@ private fun OnlineTrackCollectionBody(
     emptySubtitle: String,
     onPlayTracks: (List<OnlineTrack>, Int, Boolean) -> Unit,
     onToggleFavorite: (OnlineTrack) -> Unit,
-    onOpenContextMenu: (OnlineTrack) -> Unit
+    onOpenContextMenu: (OnlineTrack) -> Unit,
+    downloadStates: Map<String, DownloadedTrackEntity> = emptyMap(),
+    onDownloadTrack: ((OnlineTrack) -> Unit)? = null
 ) {
     if (tracks.isEmpty()) {
         PaperEmptyState(icon = emptyIcon, title = emptyTitle, subtitle = emptySubtitle)
@@ -437,7 +608,9 @@ private fun OnlineTrackCollectionBody(
                     isCurrent = track.id == currentTrackId,
                     onClick = { onPlayTracks(tracks, idx, false) },
                     onToggleFavorite = { onToggleFavorite(track) },
-                    onMoreClick = { onOpenContextMenu(track) }
+                    onMoreClick = { onOpenContextMenu(track) },
+                    downloadState = downloadStates[track.id],
+                    onDownloadClick = onDownloadTrack?.let { cb -> { cb(track) } }
                 )
             }
         }

@@ -227,6 +227,76 @@ data class AffinityStateEntity(
     val lastDecayAt: Long = System.currentTimeMillis()
 )
 
+@Entity(
+    tableName = "downloaded_tracks",
+    indices = [Index("status"), Index("downloadedAt")]
+)
+data class DownloadedTrackEntity(
+    @PrimaryKey val trackId: String,
+    val sourceId: String,
+    val providerType: String,
+    val providerId: String = "jiosaavn",
+    val providerLabel: String = "JioSaavn",
+    val sourceUrl: String = "",
+    val title: String,
+    val artist: String,
+    val artistId: String? = null,
+    val artistUrl: String? = null,
+    val album: String = "Online Stream",
+    val albumUrl: String? = null,
+    val durationMs: Long = 0L,
+    val thumbnailUrl: String? = null,
+    val localAudioPath: String = "",
+    val localArtworkPath: String? = null,
+    val localLyricsPath: String? = null,
+    val mimeType: String = "audio/mp4",
+    val formatLabel: String = "M4A",
+    val bitrateKbps: Int = 0,
+    val fileSizeBytes: Long = 0L,
+    val status: String = STATUS_DOWNLOADING,
+    val progressPercent: Int = 0,
+    val errorMessage: String? = null,
+    val downloadedAt: Long = System.currentTimeMillis()
+) {
+    companion object {
+        const val STATUS_DOWNLOADING = "DOWNLOADING"
+        const val STATUS_COMPLETED = "COMPLETED"
+        const val STATUS_FAILED = "FAILED"
+    }
+}
+
+@Entity(tableName = "downloaded_playlists")
+data class DownloadedPlaylistEntity(
+    @PrimaryKey val id: String,
+    val title: String,
+    val subtitle: String = "",
+    val coverUrl: String? = null,
+    val localCoverPath: String? = null,
+    val providerType: String = "JIOSAAVN",
+    val providerId: String = "jiosaavn",
+    val trackCount: Int = 0,
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(
+    tableName = "downloaded_playlist_entries",
+    foreignKeys = [
+        ForeignKey(
+            entity = DownloadedPlaylistEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["playlistId"],
+            onDelete = ForeignKey.CASCADE
+        )
+    ],
+    indices = [Index("playlistId"), Index("trackId")]
+)
+data class DownloadedPlaylistEntryEntity(
+    @PrimaryKey(autoGenerate = true) val entryId: Long = 0L,
+    val playlistId: String,
+    val trackId: String,
+    val position: Int
+)
+
 @Dao
 interface TrackStatsDao {
     @Query("SELECT * FROM track_stats")
@@ -505,6 +575,61 @@ interface UserAffinityDao {
     suspend fun clearArtistAffinities()
 }
 
+@Dao
+interface OfflineDownloadDao {
+    @Query("SELECT * FROM downloaded_tracks WHERE status = 'COMPLETED' ORDER BY downloadedAt DESC")
+    fun observeCompletedTracks(): Flow<List<DownloadedTrackEntity>>
+
+    @Query("SELECT * FROM downloaded_tracks ORDER BY downloadedAt DESC")
+    fun observeAllTracks(): Flow<List<DownloadedTrackEntity>>
+
+    @Query("SELECT * FROM downloaded_tracks WHERE trackId = :trackId LIMIT 1")
+    suspend fun getByTrackId(trackId: String): DownloadedTrackEntity?
+
+    @Query("SELECT * FROM downloaded_tracks WHERE trackId = :trackId AND status = 'COMPLETED' LIMIT 1")
+    suspend fun getCompletedTrackOnce(trackId: String): DownloadedTrackEntity?
+
+    @Query("SELECT * FROM downloaded_tracks WHERE status = 'COMPLETED' ORDER BY downloadedAt DESC")
+    suspend fun getCompletedTracksOnce(): List<DownloadedTrackEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTrack(entity: DownloadedTrackEntity)
+
+    @Query("UPDATE downloaded_tracks SET progressPercent = :progress WHERE trackId = :trackId")
+    suspend fun updateProgress(trackId: String, progress: Int)
+
+    @Query("DELETE FROM downloaded_tracks WHERE trackId = :trackId")
+    suspend fun deleteTrack(trackId: String)
+
+    @Query("SELECT * FROM downloaded_playlists ORDER BY createdAt DESC")
+    fun observeDownloadedPlaylists(): Flow<List<DownloadedPlaylistEntity>>
+
+    @Query("SELECT * FROM downloaded_playlist_entries ORDER BY playlistId ASC, position ASC")
+    fun observeAllPlaylistEntries(): Flow<List<DownloadedPlaylistEntryEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertPlaylist(playlist: DownloadedPlaylistEntity)
+
+    @Insert
+    suspend fun insertPlaylistEntries(entries: List<DownloadedPlaylistEntryEntity>)
+
+    @Query("DELETE FROM downloaded_playlist_entries WHERE playlistId = :playlistId")
+    suspend fun clearPlaylistEntries(playlistId: String)
+
+    @Query("DELETE FROM downloaded_playlists WHERE id = :playlistId")
+    suspend fun deletePlaylist(playlistId: String)
+
+    @Transaction
+    suspend fun replacePlaylist(playlist: DownloadedPlaylistEntity, trackIds: List<String>) {
+        upsertPlaylist(playlist)
+        clearPlaylistEntries(playlist.id)
+        val entries = trackIds.mapIndexed { idx, tid ->
+            DownloadedPlaylistEntryEntity(playlistId = playlist.id, trackId = tid, position = idx)
+        }
+        if (entries.isNotEmpty()) insertPlaylistEntries(entries)
+    }
+}
+
 @Database(
     entities = [
         TrackStatsEntity::class,
@@ -520,9 +645,12 @@ interface UserAffinityDao {
         LyricsCacheEntity::class,
         UserAffinityEntity::class,
         ArtistAffinityEntity::class,
-        AffinityStateEntity::class
+        AffinityStateEntity::class,
+        DownloadedTrackEntity::class,
+        DownloadedPlaylistEntity::class,
+        DownloadedPlaylistEntryEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class AriaDatabase : RoomDatabase() {
@@ -536,6 +664,7 @@ abstract class AriaDatabase : RoomDatabase() {
     abstract fun onlineSearchHistoryDao(): OnlineSearchHistoryDao
     abstract fun lyricsCacheDao(): LyricsCacheDao
     abstract fun userAffinityDao(): UserAffinityDao
+    abstract fun offlineDownloadDao(): OfflineDownloadDao
 
     companion object {
         @Volatile
@@ -713,6 +842,76 @@ abstract class AriaDatabase : RoomDatabase() {
             }
         }
 
+        internal val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `downloaded_tracks` (
+                        `trackId` TEXT NOT NULL,
+                        `sourceId` TEXT NOT NULL,
+                        `providerType` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `providerLabel` TEXT NOT NULL,
+                        `sourceUrl` TEXT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `artist` TEXT NOT NULL,
+                        `artistId` TEXT,
+                        `artistUrl` TEXT,
+                        `album` TEXT NOT NULL,
+                        `albumUrl` TEXT,
+                        `durationMs` INTEGER NOT NULL,
+                        `thumbnailUrl` TEXT,
+                        `localAudioPath` TEXT NOT NULL,
+                        `localArtworkPath` TEXT,
+                        `localLyricsPath` TEXT,
+                        `mimeType` TEXT NOT NULL,
+                        `formatLabel` TEXT NOT NULL,
+                        `bitrateKbps` INTEGER NOT NULL,
+                        `fileSizeBytes` INTEGER NOT NULL,
+                        `status` TEXT NOT NULL,
+                        `progressPercent` INTEGER NOT NULL,
+                        `errorMessage` TEXT,
+                        `downloadedAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`trackId`)
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_downloaded_tracks_status` ON `downloaded_tracks` (`status`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_downloaded_tracks_downloadedAt` ON `downloaded_tracks` (`downloadedAt`)")
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `downloaded_playlists` (
+                        `id` TEXT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `subtitle` TEXT NOT NULL,
+                        `coverUrl` TEXT,
+                        `localCoverPath` TEXT,
+                        `providerType` TEXT NOT NULL,
+                        `providerId` TEXT NOT NULL,
+                        `trackCount` INTEGER NOT NULL,
+                        `createdAt` INTEGER NOT NULL,
+                        PRIMARY KEY(`id`)
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `downloaded_playlist_entries` (
+                        `entryId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `playlistId` TEXT NOT NULL,
+                        `trackId` TEXT NOT NULL,
+                        `position` INTEGER NOT NULL,
+                        FOREIGN KEY(`playlistId`) REFERENCES `downloaded_playlists`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_downloaded_playlist_entries_playlistId` ON `downloaded_playlist_entries` (`playlistId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_downloaded_playlist_entries_trackId` ON `downloaded_playlist_entries` (`trackId`)")
+            }
+        }
+
         fun getInstance(context: Context): AriaDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -720,7 +919,7 @@ abstract class AriaDatabase : RoomDatabase() {
                     AriaDatabase::class.java,
                     "aria_paper_library.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }

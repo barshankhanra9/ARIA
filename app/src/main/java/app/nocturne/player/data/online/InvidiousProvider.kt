@@ -14,6 +14,7 @@ import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -127,6 +128,12 @@ class InvidiousProvider(
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
+    ): OnlineStreamResolution = resolveStream(track, speedTier, null)
+
+    override suspend fun resolveStream(
+        track: OnlineTrack,
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality?
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val videoId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Invidious video ID")
@@ -141,7 +148,11 @@ class InvidiousProvider(
         ).let { if (endpointFailover) it else it.take(1) }
         val epByUrl = endpoints.associateBy { it.url.trimEnd('/') }
         val path = "/api/v1/videos/${Uri.encode(videoId)}"
-        val effectiveTier = if (speedTier == NetworkSpeedTier.STANDARD) NetworkSpeedTier.FAST_UNMETERED else speedTier
+        val effectiveTier = if (preferredQuality == null && speedTier == NetworkSpeedTier.STANDARD) {
+            NetworkSpeedTier.FAST_UNMETERED
+        } else {
+            speedTier
+        }
 
         var lastError: Throwable? = null
         for (epUrl in orderedUrls) {
@@ -200,7 +211,8 @@ class InvidiousProvider(
                     streams = streams,
                     speedTier = effectiveTier,
                     allowedLoopbackOrigin = allowedTestOrigin,
-                    preferWebmOpus = true
+                    preferWebmOpus = true,
+                    preferredQuality = preferredQuality
                 ) ?: throw IllegalStateException("No audio stream returned by $displayName")
 
                 lastWorkingInstance = instanceUrl

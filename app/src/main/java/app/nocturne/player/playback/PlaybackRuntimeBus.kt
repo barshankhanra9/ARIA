@@ -11,7 +11,8 @@ import kotlinx.coroutines.flow.update
 data class SleepTimerState(
     val isActive: Boolean = false,
     val remainingMs: Long = 0L,
-    val totalMs: Long = 0L
+    val totalMs: Long = 0L,
+    val isEndOfTrack: Boolean = false
 )
 
 enum class ActiveAudioEngine {

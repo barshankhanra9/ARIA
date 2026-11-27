@@ -1,6 +1,9 @@
 package app.nocturne.player.ui.screens
 
+import android.appwidget.AppWidgetManager
+import android.content.ComponentName
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,13 +35,16 @@ import androidx.compose.material.icons.rounded.CloudSync
 import androidx.compose.material.icons.rounded.CreateNewFolder
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Equalizer
+import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.Newspaper
 import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Restore
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material.icons.rounded.Widgets
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -58,6 +64,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -75,6 +82,7 @@ import app.nocturne.player.data.model.RemoteProvidersConfig
 import app.nocturne.player.data.model.ReplayGainMode
 import app.nocturne.player.data.model.SortField
 import app.nocturne.player.data.model.SortOrder
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.SwipeVerticalAction
 import app.nocturne.player.data.model.ThemeMode
 import app.nocturne.player.data.model.UserSettings
@@ -88,6 +96,9 @@ import app.nocturne.player.ui.components.PaperFilterChip
 import app.nocturne.player.ui.components.TactilePaperButton
 import app.nocturne.player.ui.components.paperGrainBackground
 import app.nocturne.player.ui.theme.AriaPaperTheme
+import app.nocturne.player.widget.DailyStripWidgetProvider
+import app.nocturne.player.widget.FrontPageWidgetProvider
+import app.nocturne.player.widget.SundayBroadsheetWidgetProvider
 import kotlin.math.roundToInt
 
 @Composable
@@ -105,9 +116,11 @@ fun SettingsScreen(
     remoteConfig: RemoteProvidersConfig = RemoteProvidersConfig.DEFAULT,
     remoteConfigStatus: RemoteConfigStatus = RemoteConfigStatus(),
     lastRemoteConfigError: String? = null,
-    onOpenStreamingConfig: () -> Unit = {}
+    onOpenStreamingConfig: () -> Unit = {},
+    onNotifyMessage: (String) -> Unit = {}
 ) {
     val palette = AriaPaperTheme.palette
+    val context = LocalContext.current
     var showLicensesDialog by remember { mutableStateOf(false) }
     var showPrivacyDialog by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
@@ -543,6 +556,96 @@ fun SettingsScreen(
             }
         }
 
+        // 5b. AUDIO STREAMING QUALITY (Wi-Fi & Mobile Data)
+        item {
+            SettingsCategoryCard(title = "Streaming Quality", icon = Icons.Rounded.GraphicEq) {
+                Text(
+                    text = "Applied to JioSaavn (96 / 160 / 320 kbps) and YouTube / Piped streams based on your active network connection.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.inkSecondary
+                )
+                Spacer(Modifier.height(10.dp))
+                Text("WI-FI STREAMING QUALITY", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                Spacer(Modifier.height(6.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StreamingQuality.entries.forEach { q ->
+                        PaperFilterChip(
+                            label = q.shortLabel,
+                            selected = settings.wifiStreamingQuality == q,
+                            onClick = { onUpdateSettings { it.copy(wifiStreamingQuality = q) } },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("wifi_quality_${q.name}")
+                        )
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+                Text("MOBILE DATA STREAMING QUALITY", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                Spacer(Modifier.height(6.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StreamingQuality.entries.forEach { q ->
+                        PaperFilterChip(
+                            label = q.shortLabel,
+                            selected = settings.mobileDataStreamingQuality == q,
+                            onClick = { onUpdateSettings { it.copy(mobileDataStreamingQuality = q) } },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("mobile_quality_${q.name}")
+                        )
+                    }
+                }
+            }
+        }
+
+        // 5c. NEWSPRINT HOME SCREEN WIDGETS
+        item {
+            SettingsCategoryCard(title = "Newsprint Home Widgets", icon = Icons.Rounded.Newspaper) {
+                SettingsSwitchRow(
+                    title = "Sharp Newsprint Corners",
+                    subtitle = "Use square cut-paper corners instead of rounded widget cards",
+                    checked = settings.widgetSharpCorners,
+                    onCheckedChange = { c -> onUpdateSettings { it.copy(widgetSharpCorners = c) } },
+                    modifier = Modifier.testTag("widget_sharp_corners_switch")
+                )
+                Spacer(Modifier.height(8.dp))
+                Text("ADD WIDGET EDITION TO HOME SCREEN", style = MaterialTheme.typography.labelSmall, color = palette.accent)
+                Spacer(Modifier.height(6.dp))
+
+                fun requestPin(providerCls: Class<*>, label: String) {
+                    val awm = AppWidgetManager.getInstance(context)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && awm.isRequestPinAppWidgetSupported) {
+                        awm.requestPinAppWidget(ComponentName(context, providerCls), null, null)
+                    } else {
+                        onNotifyMessage("Long-press your home screen -> Widgets -> ARIA ($label)")
+                    }
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TactilePaperButton(
+                        text = "The Daily Strip (4×1)",
+                        icon = Icons.Rounded.Widgets,
+                        filled = false,
+                        onClick = { requestPin(DailyStripWidgetProvider::class.java, "The Daily Strip") },
+                        modifier = Modifier.fillMaxWidth().testTag("pin_widget_daily_strip")
+                    )
+                    TactilePaperButton(
+                        text = "Front Page Headline (2×2)",
+                        icon = Icons.Rounded.Widgets,
+                        filled = false,
+                        onClick = { requestPin(FrontPageWidgetProvider::class.java, "Front Page Headline") },
+                        modifier = Modifier.fillMaxWidth().testTag("pin_widget_front_page")
+                    )
+                    TactilePaperButton(
+                        text = "Sunday Broadsheet (4×3 + Lyrics)",
+                        icon = Icons.Rounded.Widgets,
+                        filled = false,
+                        onClick = { requestPin(SundayBroadsheetWidgetProvider::class.java, "Sunday Broadsheet") },
+                        modifier = Modifier.fillMaxWidth().testTag("pin_widget_sunday_broadsheet")
+                    )
+                }
+            }
+        }
+
         // 6. BACKUP, PRIVACY & ABOUT
         item {
             SettingsCategoryCard(title = "Backup & Information", icon = Icons.Rounded.Info) {
@@ -945,11 +1048,12 @@ private fun SettingsSwitchRow(
     title: String,
     subtitle: String,
     checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val palette = AriaPaperTheme.palette
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable { onCheckedChange(!checked) }
             .padding(vertical = 6.dp),

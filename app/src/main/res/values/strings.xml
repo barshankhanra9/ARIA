@@ -1,4 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">ARIA</string>
+    <string name="widget_daily_strip_label">The Daily Strip (4x1)</string>
+    <string name="widget_daily_strip_desc">Compact horizontal newsprint masthead with album art and playback controls.</string>
+    <string name="widget_front_page_label">Front Page Headline (2x2)</string>
+    <string name="widget_front_page_desc">Classic square editorial card with framed art, headline, favorite stamp, and playback controls.</string>
+    <string name="widget_sunday_broadsheet_label">Sunday Broadsheet (4x3)</string>
+    <string name="widget_sunday_broadsheet_desc">Multi-column newspaper layout with synced lyric pull-quote, progress rule, and full transport controls.</string>
+    <string name="widget_open_player_desc">Open ARIA Now Playing screen</string>
+    <string name="widget_prev_desc">Previous track</string>
+    <string name="widget_play_pause_desc">Play or pause playback</string>
+    <string name="widget_next_desc">Next track</string>
+    <string name="widget_like_desc">Toggle favorite</string>
+    <string name="widget_shuffle_desc">Toggle shuffle</string>
 </resources>

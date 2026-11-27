@@ -51,6 +51,8 @@ import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Lyrics
 import androidx.compose.material.icons.rounded.Bedtime
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Equalizer
 import androidx.compose.material.icons.rounded.Favorite
@@ -103,6 +105,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.media3.common.Player
 import androidx.palette.graphics.Palette
+import app.nocturne.player.data.db.DownloadedTrackEntity
 import app.nocturne.player.data.library.ArtworkCache
 import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.ArtworkTapAction
@@ -168,7 +171,10 @@ fun NowPlayingScreen(
     errorMessage: String? = null,
     onRetryStream: (() -> Unit)? = null,
     onOpenRelated: (() -> Unit)? = null,
-    onRetryLyrics: (() -> Unit)? = null
+    onRetryLyrics: (() -> Unit)? = null,
+    downloadState: DownloadedTrackEntity? = null,
+    onDownloadTrack: ((Track) -> Unit)? = null,
+    onStartEndOfTrackSleepTimer: (() -> Unit)? = null
 ) {
     BackHandler(onBack = onDismiss)
 
@@ -674,6 +680,38 @@ fun NowPlayingScreen(
                     }
                 }
                 if (track != null) {
+                    if (track.isOnline && onDownloadTrack != null) {
+                        IconButton(
+                            onClick = { onDownloadTrack(track) },
+                            modifier = Modifier.testTag("now_playing_download_btn")
+                        ) {
+                            when (downloadState?.status) {
+                                DownloadedTrackEntity.STATUS_DOWNLOADING -> {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp,
+                                        color = palette.accent
+                                    )
+                                }
+                                DownloadedTrackEntity.STATUS_COMPLETED -> {
+                                    Icon(
+                                        imageVector = Icons.Rounded.DownloadDone,
+                                        contentDescription = "Saved offline",
+                                        tint = palette.accent,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                                else -> {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Download,
+                                        contentDescription = "Download for offline",
+                                        tint = palette.inkSecondary,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
                     IconButton(
                         onClick = { onToggleFavorite(track) },
                         modifier = Modifier.testTag("now_playing_favorite_btn")
@@ -907,9 +945,14 @@ fun NowPlayingScreen(
                     )
                     DockControlButton(
                         icon = Icons.Rounded.Bedtime,
-                        label = if (sleepTimer.isActive) formatDuration(sleepTimer.remainingMs) else "Timer",
+                        label = when {
+                            sleepTimer.isActive && sleepTimer.isEndOfTrack -> "End"
+                            sleepTimer.isActive -> formatDuration(sleepTimer.remainingMs)
+                            else -> "Timer"
+                        },
                         active = sleepTimer.isActive,
-                        onClick = { showSleepSheet = true }
+                        onClick = { showSleepSheet = true },
+                        modifier = Modifier.testTag("now_playing_sleep_timer_btn")
                     )
                     DockControlButton(
                         icon = Icons.Outlined.Lyrics,
@@ -969,13 +1012,18 @@ fun NowPlayingScreen(
 
     if (showSleepSheet) {
         var customMinutes by remember { mutableIntStateOf(settings.sleepTimerDefaultMinutes) }
+        var useEndOfTrack by remember { mutableStateOf(sleepTimer.isEndOfTrack) }
         PaperModalSheet(onDismissRequest = { showSleepSheet = false }) {
             Column(Modifier.padding(horizontal = 22.dp, vertical = 12.dp)) {
                 Text("Sleep Timer", style = MaterialTheme.typography.headlineSmall, color = palette.inkPrimary)
                 Spacer(Modifier.height(6.dp))
                 if (sleepTimer.isActive) {
                     Text(
-                        "Stopping gently in ${formatDuration(sleepTimer.remainingMs)}",
+                        text = if (sleepTimer.isEndOfTrack) {
+                            "Stopping gently at end of current track"
+                        } else {
+                            "Stopping gently in ${formatDuration(sleepTimer.remainingMs)}"
+                        },
                         style = MaterialTheme.typography.bodyLarge,
                         color = palette.accent
                     )
@@ -993,22 +1041,50 @@ fun NowPlayingScreen(
                         listOf(15, 30, 45, 60).forEach { min ->
                             PaperFilterChip(
                                 label = "${min}m",
-                                selected = customMinutes == min,
-                                onClick = { customMinutes = min },
+                                selected = !useEndOfTrack && customMinutes == min,
+                                onClick = {
+                                    useEndOfTrack = false
+                                    customMinutes = min
+                                },
                                 modifier = Modifier.weight(1f)
                             )
                         }
                     }
-                    Spacer(Modifier.height(12.dp))
-                    Slider(
-                        value = customMinutes.toFloat(),
-                        onValueChange = { customMinutes = it.roundToInt().coerceIn(5, 120) },
-                        valueRange = 5f..120f,
-                        colors = SliderDefaults.colors(thumbColor = palette.accent, activeTrackColor = palette.accent)
-                    )
+                    if (onStartEndOfTrackSleepTimer != null) {
+                        Spacer(Modifier.height(8.dp))
+                        PaperFilterChip(
+                            label = "End of Track",
+                            selected = useEndOfTrack,
+                            onClick = { useEndOfTrack = true },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("sleep_timer_end_of_track")
+                        )
+                    }
+                    if (!useEndOfTrack) {
+                        Spacer(Modifier.height(12.dp))
+                        Slider(
+                            value = customMinutes.toFloat(),
+                            onValueChange = {
+                                useEndOfTrack = false
+                                customMinutes = it.roundToInt().coerceIn(5, 120)
+                            },
+                            valueRange = 5f..120f,
+                            colors = SliderDefaults.colors(thumbColor = palette.accent, activeTrackColor = palette.accent)
+                        )
+                    } else {
+                        Spacer(Modifier.height(14.dp))
+                    }
                     TactilePaperButton(
-                        text = "Start $customMinutes min Timer",
-                        onClick = { onStartSleepTimer(customMinutes); showSleepSheet = false },
+                        text = if (useEndOfTrack) "Stop at End of Track" else "Start $customMinutes min Timer",
+                        onClick = {
+                            if (useEndOfTrack) {
+                                onStartEndOfTrackSleepTimer?.invoke()
+                            } else {
+                                onStartSleepTimer(customMinutes)
+                            }
+                            showSleepSheet = false
+                        },
                         modifier = Modifier.fillMaxWidth()
                     )
                 }

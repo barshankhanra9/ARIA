@@ -14,6 +14,7 @@ import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.model.ProviderEndpointConfig
 import app.nocturne.player.data.security.InputAndUrlSecurity
 import kotlinx.coroutines.Dispatchers
@@ -122,6 +123,12 @@ class AudiusProvider(
     override suspend fun resolveStream(
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
+    ): OnlineStreamResolution = resolveStream(track, speedTier, null)
+
+    override suspend fun resolveStream(
+        track: OnlineTrack,
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality?
     ): OnlineStreamResolution = withContext(Dispatchers.IO) {
         val safeSourceId = InputAndUrlSecurity.sanitizePathSegment(track.sourceId)
             ?: throw IllegalArgumentException("Invalid Audius track ID")
@@ -171,7 +178,8 @@ class AudiusProvider(
         val selected = StreamQualitySelector.selectBestAudioStream(
             streams = listOf(stream),
             speedTier = speedTier,
-            allowedLoopbackOrigin = allowedTestOrigin
+            allowedLoopbackOrigin = allowedTestOrigin,
+            preferredQuality = preferredQuality
         ) ?: throw IOException("No valid Audius stream available")
 
         OnlineStreamResolution(

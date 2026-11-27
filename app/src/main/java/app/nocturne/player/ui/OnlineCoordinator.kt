@@ -4,6 +4,9 @@ import android.app.Application
 import android.content.Intent
 import app.nocturne.player.PlaybackService
 import app.nocturne.player.data.audio.MetadataCleaner
+import app.nocturne.player.data.db.DownloadedTrackEntity
+import app.nocturne.player.data.downloads.DownloadedPlaylistWithTracks
+import app.nocturne.player.data.downloads.OfflineDownloadManager
 import app.nocturne.player.data.model.LyricsProviderDiagnosticsSnapshot
 import app.nocturne.player.data.model.OnlineAlbumPage
 import app.nocturne.player.data.model.OnlineAlbumSummary
@@ -26,6 +29,8 @@ import app.nocturne.player.data.security.InputAndUrlSecurity
 import app.nocturne.player.playback.OnlineEngineSnapshot
 import app.nocturne.player.playback.OnlinePlaybackBridge
 import app.nocturne.player.playback.PlaybackRuntimeBus
+import app.nocturne.player.widget.WidgetStatePrefs
+import app.nocturne.player.widget.WidgetUpdater
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -112,8 +117,21 @@ class OnlineCoordinator(
     private val repository = OnlineDependencies.getRepository(app)
     private val affinityRepo = OnlineDependencies.getAffinityRepository(app)
     private val recommendationEngine = OnlineDependencies.getRecommendationEngine(app)
+    private val downloadManager = OnlineDependencies.getOfflineDownloadManager(app)
 
     val remoteConfigStatus: StateFlow<RemoteConfigStatus> = remoteConfigRepo.status
+
+    val downloadedTracks: StateFlow<List<DownloadedTrackEntity>> = downloadManager.completedDownloads
+        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+
+    val downloadStates: StateFlow<Map<String, DownloadedTrackEntity>> = downloadManager.allDownloadStates
+        .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+
+    val downloadedPlaylists: StateFlow<List<DownloadedPlaylistWithTracks>> = downloadManager.downloadedPlaylists
+        .stateIn(scope, SharingStarted.Eagerly, emptyList())
+
+    val totalDownloadBytes: StateFlow<Long> = downloadManager.totalDownloadBytes
+        .stateIn(scope, SharingStarted.Eagerly, 0L)
 
     val allTracks: StateFlow<List<OnlineTrack>> = repository.allTracks
         .stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -1021,8 +1039,81 @@ class OnlineCoordinator(
     fun toggleFavorite(track: OnlineTrack) {
         scope.launch {
             val nowFav = repository.toggleFavorite(track)
+            val wState = WidgetStatePrefs.loadState(app)
+            if (wState.trackId == track.id) {
+                WidgetStatePrefs.updateFavoriteOnly(app, nowFav)
+                WidgetUpdater.refreshAllWidgets(app)
+            }
             emitMessage(if (nowFav) "Saved to online favorites" else "Removed from online favorites")
         }
+    }
+
+    fun downloadTrack(track: OnlineTrack) {
+        val currentState = downloadStates.value[track.id]
+        if (currentState?.status == DownloadedTrackEntity.STATUS_COMPLETED) {
+            emitMessage("\"${track.title}\" is already saved offline")
+            return
+        }
+        if (currentState?.status == DownloadedTrackEntity.STATUS_DOWNLOADING) {
+            emitMessage("Already downloading \"${track.title}\"")
+            return
+        }
+        emitMessage("Downloading \"${track.title}\" for offline playback...")
+        downloadManager.downloadTrack(track)
+    }
+
+    fun downloadPlaylist(
+        playlistId: String,
+        title: String,
+        subtitle: String = "",
+        coverUrl: String? = null,
+        providerType: OnlineProviderType = OnlineProviderType.JIOSAAVN,
+        providerId: String = "jiosaavn",
+        tracks: List<OnlineTrack>
+    ) {
+        if (tracks.isEmpty()) return
+        emitMessage("Downloading ${tracks.size} tracks from \"$title\"...")
+        downloadManager.downloadPlaylist(
+            id = playlistId,
+            title = title,
+            subtitle = subtitle,
+            coverUrl = coverUrl,
+            providerType = providerType,
+            providerId = providerId,
+            tracks = tracks
+        )
+    }
+
+    fun deleteDownloadedTrack(trackId: String) {
+        scope.launch {
+            downloadManager.deleteTrack(trackId)
+            emitMessage("Removed from offline downloads")
+        }
+    }
+
+    fun deleteDownloadedPlaylist(playlistId: String) {
+        scope.launch {
+            downloadManager.deletePlaylist(playlistId)
+            emitMessage("Removed downloaded collection")
+        }
+    }
+
+    fun playDownloadedTracks(
+        entities: List<DownloadedTrackEntity>,
+        startIndex: Int = 0,
+        shuffle: Boolean = false
+    ) {
+        if (entities.isEmpty()) return
+        val tracks = entities.map { OfflineDownloadManager.entityToOnlineTrack(it) }
+        playTracks(tracks, startIndex, shuffle)
+    }
+
+    fun playDownloadedPlaylist(
+        playlist: DownloadedPlaylistWithTracks,
+        startIndex: Int = 0,
+        shuffle: Boolean = false
+    ) {
+        playDownloadedTracks(playlist.tracks, startIndex, shuffle)
     }
 
     fun clearListeningHistory() {

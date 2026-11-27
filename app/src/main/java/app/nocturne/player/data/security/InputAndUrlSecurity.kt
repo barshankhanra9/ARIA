@@ -1,5 +1,6 @@
 package app.nocturne.player.data.security
 
+import android.content.Context
 import android.net.Uri
 import app.nocturne.player.data.model.HomeSectionConfig
 import app.nocturne.player.data.model.HomeSectionId
@@ -11,6 +12,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.ResponseBody
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -466,6 +468,17 @@ object InputAndUrlSecurity {
             }
             else -> false
         }
+    }
+
+    fun isSafeAppPrivateDownloadUri(context: Context, uri: Uri?): Boolean {
+        if (uri == null || !uri.scheme.equals("file", ignoreCase = true)) return false
+        val path = uri.path.orEmpty()
+        if (path.isBlank() || path.contains("..")) return false
+        return runCatching {
+            val downloadsDir = File(context.filesDir, "downloads").canonicalPath
+            val targetPath = File(path).canonicalPath
+            targetPath == downloadsDir || targetPath.startsWith(downloadsDir + File.separator)
+        }.getOrDefault(false)
     }
 
     fun isSafeArtworkUri(raw: String?): Boolean {

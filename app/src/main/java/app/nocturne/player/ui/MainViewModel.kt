@@ -28,6 +28,7 @@ import app.nocturne.player.data.db.PlaylistEntity
 import app.nocturne.player.data.db.RecentSearchEntity
 import app.nocturne.player.data.db.TrackStatsEntity
 import app.nocturne.player.data.db.TrackTagOverrideEntity
+import app.nocturne.player.data.downloads.OfflineDownloadManager
 import app.nocturne.player.data.library.ArtworkCache
 import app.nocturne.player.data.library.MediaLibraryScanner
 import app.nocturne.player.data.model.Album
@@ -66,6 +67,8 @@ import app.nocturne.player.playback.OfflineEngineSnapshot
 import app.nocturne.player.playback.OnlineEngineSnapshot
 import app.nocturne.player.playback.PlaybackRuntimeBus
 import app.nocturne.player.playback.SleepTimerState
+import app.nocturne.player.widget.WidgetStatePrefs
+import app.nocturne.player.widget.WidgetUpdater
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -138,6 +141,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         remoteConfigRepository = remoteConfigRepo,
         healthTracker = OnlineDependencies.getHealthTracker()
     )
+    private val downloadManager = OnlineDependencies.getOfflineDownloadManager(app)
 
     val settings: StateFlow<UserSettings> = settingsRepo.settingsFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, UserSettings())
@@ -241,6 +245,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val statsFlow = db.trackStatsDao().observeAllStats()
     private val overridesFlow = db.trackTagOverrideDao().observeAllOverrides()
+
+    val downloadedOfflineTracks: StateFlow<List<Track>> = combine(
+        downloadManager.completedDownloads,
+        statsFlow
+    ) { downloadedList, statsList ->
+        val statsMap = statsList.associateBy { it.uriString }
+        downloadedList.map { entity ->
+            val base = OfflineDownloadManager.entityToOfflineTrack(entity)
+            val st = statsMap[base.uriString]
+            if (st != null) {
+                base.copy(
+                    isFavorite = st.isFavorite,
+                    playCount = st.playCount,
+                    lastPlayedAt = st.lastPlayedAt,
+                    totalListenMs = st.totalListenMs
+                )
+            } else base
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val library: StateFlow<LibraryDerivedState> = combine(
         _rawTracks,
@@ -783,9 +806,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startSleepTimer(minutes: Int) {
         val ctrl = mediaController ?: return
-        val args = Bundle().apply { putInt(PlaybackService.ARG_MINUTES, minutes) }
+        val args = Bundle().apply {
+            putInt(PlaybackService.ARG_MINUTES, minutes)
+            putBoolean(PlaybackService.ARG_END_OF_TRACK, false)
+        }
         ctrl.sendCustomCommand(SessionCommand(PlaybackService.CMD_SLEEP_TIMER, Bundle.EMPTY), args)
         emitMessage("Sleep timer set for $minutes min")
+    }
+
+    fun startEndOfTrackSleepTimer() {
+        val ctrl = mediaController ?: return
+        ctrl.sendCustomCommand(
+            SessionCommand(PlaybackService.CMD_SLEEP_TIMER_END_OF_TRACK, Bundle.EMPTY),
+            Bundle.EMPTY
+        )
+        emitMessage("Sleep timer set for End of Track")
     }
 
     fun cancelSleepTimer() {
@@ -1005,7 +1040,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val existing = db.trackStatsDao().getByUri(track.uriString)
                 ?: TrackStatsEntity(uriString = track.uriString)
-            db.trackStatsDao().upsert(existing.copy(isFavorite = !existing.isFavorite))
+            val newFav = !existing.isFavorite
+            db.trackStatsDao().upsert(existing.copy(isFavorite = newFav))
+            val wState = WidgetStatePrefs.loadState(app)
+            if (wState.uriString == track.uriString) {
+                WidgetStatePrefs.updateFavoriteOnly(app, newFav)
+                WidgetUpdater.refreshAllWidgets(app)
+            }
         }
     }
 

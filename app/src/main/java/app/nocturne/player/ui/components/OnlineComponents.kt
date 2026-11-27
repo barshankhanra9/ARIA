@@ -26,6 +26,9 @@ import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.rounded.Album
 import androidx.compose.material.icons.rounded.CloudQueue
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.DownloadDone
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.FolderOpen
 import androidx.compose.material.icons.rounded.MoreVert
@@ -33,6 +36,7 @@ import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlaylistPlay
 import androidx.compose.material.icons.rounded.Stream
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -57,6 +61,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.nocturne.player.data.db.DownloadedTrackEntity
 import app.nocturne.player.data.model.ArtworkShape
 import app.nocturne.player.data.model.OnlinePlaylist
 import app.nocturne.player.data.model.OnlineTrack
@@ -179,7 +184,9 @@ fun OnlineTrackListRow(
     onClick: () -> Unit,
     onToggleFavorite: () -> Unit,
     onMoreClick: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    downloadState: DownloadedTrackEntity? = null,
+    onDownloadClick: (() -> Unit)? = null
 ) {
     val palette = AriaPaperTheme.palette
     PaperCard(
@@ -270,6 +277,38 @@ fun OnlineTrackListRow(
                 }
             }
 
+            if (onDownloadClick != null) {
+                IconButton(
+                    onClick = onDownloadClick,
+                    modifier = Modifier.testTag("download_track_btn_${track.id}")
+                ) {
+                    when (downloadState?.status) {
+                        DownloadedTrackEntity.STATUS_DOWNLOADING -> {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = palette.accent
+                            )
+                        }
+                        DownloadedTrackEntity.STATUS_COMPLETED -> {
+                            Icon(
+                                imageVector = Icons.Rounded.DownloadDone,
+                                contentDescription = "Saved offline",
+                                tint = palette.accent,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                        else -> {
+                            Icon(
+                                imageVector = Icons.Rounded.Download,
+                                contentDescription = "Download for offline",
+                                tint = palette.inkTertiary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
             IconButton(onClick = onToggleFavorite) {
                 Icon(
                     imageVector = if (track.isFavorite) Icons.Rounded.Favorite else Icons.Outlined.FavoriteBorder,
@@ -301,7 +340,10 @@ fun OnlineTrackContextMenuSheet(
     onToggleFavorite: () -> Unit,
     onOpenArtist: (() -> Unit)?,
     onOpenAlbum: (() -> Unit)?,
-    onViewDetails: () -> Unit
+    onViewDetails: () -> Unit,
+    downloadState: DownloadedTrackEntity? = null,
+    onDownloadClick: (() -> Unit)? = null,
+    onRemoveDownload: (() -> Unit)? = null
 ) {
     val palette = AriaPaperTheme.palette
     PaperModalSheet(onDismissRequest = onDismiss) {
@@ -351,6 +393,22 @@ fun OnlineTrackContextMenuSheet(
                 if (track.isFavorite) Icons.Rounded.Favorite else Icons.Outlined.FavoriteBorder,
                 if (track.isFavorite) "Remove from online favorites" else "Save to online favorites"
             ) { onDismiss(); onToggleFavorite() }
+            if (downloadState?.status == DownloadedTrackEntity.STATUS_COMPLETED && onRemoveDownload != null) {
+                OnlineSheetActionItem(Icons.Rounded.Delete, "Remove offline download") {
+                    onDismiss()
+                    onRemoveDownload()
+                }
+            } else if (onDownloadClick != null) {
+                val dlLabel = if (downloadState?.status == DownloadedTrackEntity.STATUS_DOWNLOADING) {
+                    "Downloading for offline..."
+                } else {
+                    "Download for offline playback"
+                }
+                OnlineSheetActionItem(Icons.Rounded.Download, dlLabel) {
+                    onDismiss()
+                    onDownloadClick()
+                }
+            }
             if (onOpenArtist != null || onOpenAlbum != null) {
                 HorizontalDivider(color = palette.divider.copy(alpha = 0.6f), modifier = Modifier.padding(vertical = 4.dp))
             }

@@ -10,6 +10,7 @@ import app.nocturne.player.data.model.OnlineSearchPage
 import app.nocturne.player.data.model.OnlineStreamResolution
 import app.nocturne.player.data.model.OnlineTrack
 import app.nocturne.player.data.model.OperationType
+import app.nocturne.player.data.model.StreamingQuality
 
 interface OnlineMusicProvider {
     val providerType: OnlineProviderType
@@ -39,6 +40,12 @@ interface OnlineMusicProvider {
         track: OnlineTrack,
         speedTier: NetworkSpeedTier
     ): OnlineStreamResolution
+
+    suspend fun resolveStream(
+        track: OnlineTrack,
+        speedTier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality?
+    ): OnlineStreamResolution = resolveStream(track, speedTier)
 
     suspend fun fetchArtist(artistIdOrUrl: String): OnlineArtistPage
 

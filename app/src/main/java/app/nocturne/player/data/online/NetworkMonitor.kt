@@ -31,5 +31,15 @@ class NetworkMonitor(private val context: Context) {
         }
     }
 
+    fun isUnmeteredOrWifi(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val activeNetwork = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(activeNetwork) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) ||
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+    }
+
     fun isOnline(): Boolean = currentSpeedTier() != NetworkSpeedTier.OFFLINE
 }

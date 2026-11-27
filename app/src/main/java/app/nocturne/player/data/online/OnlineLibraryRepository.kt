@@ -323,6 +323,9 @@ object OnlineDependencies {
     @Volatile
     private var recommendationEngine: RecommendationEngine? = null
 
+    @Volatile
+    private var downloadManager: app.nocturne.player.data.downloads.OfflineDownloadManager? = null
+
     fun getHealthTracker(): ProviderHealthTracker {
         return healthTracker ?: synchronized(this) {
             healthTracker ?: ProviderHealthTracker().also {
@@ -345,14 +348,38 @@ object OnlineDependencies {
         val appCtx = context.applicationContext
         val configRepo = getRemoteConfigRepository(appCtx)
         val tracker = getHealthTracker()
+        val settingsRepo = app.nocturne.player.data.prefs.SettingsRepository(appCtx)
         return providerManager ?: synchronized(this) {
             providerManager ?: OnlineProviderManager(
                 providers = null,
                 healthTracker = tracker,
                 networkMonitor = NetworkMonitor(appCtx),
-                remoteConfigRepository = configRepo
+                remoteConfigRepository = configRepo,
+                settingsRepository = settingsRepo
             ).also {
                 providerManager = it
+            }
+        }
+    }
+
+    fun getOfflineDownloadManager(context: Context): app.nocturne.player.data.downloads.OfflineDownloadManager {
+        val appCtx = context.applicationContext
+        val db = AriaDatabase.getInstance(appCtx)
+        val pm = getProviderManager(appCtx)
+        val lyricsRepo = app.nocturne.player.data.audio.LyricsRepository(
+            context = appCtx,
+            db = db,
+            remoteConfigRepository = getRemoteConfigRepository(appCtx),
+            healthTracker = getHealthTracker()
+        )
+        return downloadManager ?: synchronized(this) {
+            downloadManager ?: app.nocturne.player.data.downloads.OfflineDownloadManager(
+                context = appCtx,
+                db = db,
+                providerManager = pm,
+                lyricsRepository = lyricsRepo
+            ).also {
+                downloadManager = it
             }
         }
     }

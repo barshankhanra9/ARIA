@@ -5,7 +5,9 @@ import android.util.LruCache
 import app.nocturne.player.data.model.NetworkSpeedTier
 import app.nocturne.player.data.model.OnlineAudioStream
 import app.nocturne.player.data.model.OnlineStreamResolution
+import app.nocturne.player.data.model.StreamingQuality
 import app.nocturne.player.data.security.InputAndUrlSecurity
+import kotlin.math.abs
 
 object StreamQualitySelector {
 
@@ -13,7 +15,8 @@ object StreamQualitySelector {
         streams: List<OnlineAudioStream>,
         speedTier: NetworkSpeedTier,
         allowedLoopbackOrigin: String? = null,
-        preferWebmOpus: Boolean = false
+        preferWebmOpus: Boolean = false,
+        preferredQuality: StreamingQuality? = null
     ): OnlineAudioStream? {
         val valid = streams.mapNotNull { stream ->
             val safeUrl = InputAndUrlSecurity.validateRemoteHttpsUrl(stream.url, allowedLoopbackOrigin)
@@ -22,7 +25,11 @@ object StreamQualitySelector {
         }
         if (valid.isEmpty()) return null
 
-        val pool = if (preferWebmOpus && speedTier != NetworkSpeedTier.SLOW_OR_METERED) {
+        val shouldFilterOpus = preferWebmOpus &&
+            speedTier != NetworkSpeedTier.SLOW_OR_METERED &&
+            preferredQuality != StreamingQuality.LOW_96
+
+        val pool = if (shouldFilterOpus) {
             valid.filter { s ->
                 val mime = s.mimeType.lowercase()
                 val codec = s.codec.lowercase()
@@ -33,12 +40,16 @@ object StreamQualitySelector {
         }
 
         val scored = pool.map { stream ->
-            stream to scoreStream(stream, speedTier)
+            stream to scoreStream(stream, speedTier, preferredQuality)
         }
         return scored.maxByOrNull { it.second }?.first
     }
 
-    private fun scoreStream(stream: OnlineAudioStream, tier: NetworkSpeedTier): Int {
+    private fun scoreStream(
+        stream: OnlineAudioStream,
+        tier: NetworkSpeedTier,
+        preferredQuality: StreamingQuality? = null
+    ): Int {
         val codecLower = stream.codec.lowercase()
         val mimeLower = stream.mimeType.lowercase()
         val codecBonus = when {
@@ -49,6 +60,29 @@ object StreamQualitySelector {
         }
 
         val kbps = stream.bitrateKbps.coerceAtLeast(32)
+        if (preferredQuality != null) {
+            val qualityScore = when (preferredQuality) {
+                StreamingQuality.LOW_96 -> {
+                    if (kbps <= 112) {
+                        600 - abs(kbps - 96) * 3
+                    } else {
+                        (300 - (kbps - 96)).coerceAtLeast(10)
+                    }
+                }
+                StreamingQuality.MEDIUM_160 -> {
+                    if (kbps in 110..192) {
+                        600 - abs(kbps - 160) * 3
+                    } else {
+                        (360 - abs(kbps - 160)).coerceAtLeast(10)
+                    }
+                }
+                StreamingQuality.HIGH_320 -> {
+                    kbps.coerceAtMost(320) * 2
+                }
+            }
+            return qualityScore + codecBonus
+        }
+
         val bitrateScore = when (tier) {
             NetworkSpeedTier.FAST_UNMETERED -> kbps.coerceAtMost(320) * 2
             NetworkSpeedTier.STANDARD -> {

@@ -52,7 +52,15 @@ enum class LibrarySection(val label: String) {
     RECENTLY_PLAYED("Recently Played"),
     MOST_PLAYED("Most Played"),
     FAVORITES("Favorites"),
+    DOWNLOADS("Downloads"),
     QUEUE("Queue")
+}
+
+@Serializable
+enum class StreamingQuality(val label: String, val shortLabel: String, val targetKbps: Int) {
+    LOW_96("Low (96kbps)", "96kbps", 96),
+    MEDIUM_160("Medium (160kbps)", "160kbps", 160),
+    HIGH_320("High (320kbps / Best Available)", "320kbps", 320)
 }
 
 @Serializable
@@ -187,6 +195,11 @@ data class UserSettings(
 
     // Online Recommendations & Infinite Radio
     val infiniteRadioEnabled: Boolean = true,
+
+    // Online Streaming Quality & Widgets
+    val wifiStreamingQuality: StreamingQuality = StreamingQuality.HIGH_320,
+    val mobileDataStreamingQuality: StreamingQuality = StreamingQuality.MEDIUM_160,
+    val widgetSharpCorners: Boolean = true,
 
     // Remote Provider Config
     val remoteProviderConfigUrl: String = DEFAULT_REMOTE_CONFIG_URL,
