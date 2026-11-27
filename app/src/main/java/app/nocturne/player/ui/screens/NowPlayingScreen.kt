@@ -28,6 +28,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -40,10 +41,13 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.QueueMusic
@@ -286,7 +290,7 @@ fun NowPlayingScreen(
     } else {
         if (palette.isDark) 0.14f else 0.08f
     }
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .paperGrainBackground(palette.paperBackground)
@@ -300,9 +304,16 @@ fun NowPlayingScreen(
             .statusBarsPadding()
             .navigationBarsPadding()
     ) {
+        val isCompactHeight = maxHeight < 640.dp
+        val maxArtSide = if (isCompactHeight) {
+            (maxHeight * 0.34f).coerceAtLeast(110.dp)
+        } else {
+            (maxHeight * 0.46f).coerceAtLeast(200.dp)
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .let { if (isCompactHeight) it.verticalScroll(rememberScrollState()) else it }
                 .padding(horizontal = 22.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -396,7 +407,11 @@ fun NowPlayingScreen(
 
             Spacer(Modifier.height(6.dp))
             PaperDivider(doubleRule = true)
-            Spacer(Modifier.weight(0.42f))
+            if (isCompactHeight) {
+                Spacer(Modifier.height(8.dp))
+            } else {
+                Spacer(Modifier.weight(0.42f))
+            }
 
             val playScale by animateFloatAsState(
                 targetValue = if (playback.isPlaying || motion.isReduced) 1f else 0.965f,
@@ -414,6 +429,7 @@ fun NowPlayingScreen(
             // Layered Printed-Photo Artwork Frame with Gestures
             Box(
                 modifier = Modifier
+                    .sizeIn(maxWidth = maxArtSide, maxHeight = maxArtSide)
                     .fillMaxWidth()
                     .padding(horizontal = 10.dp)
                     .aspectRatio(1f),
@@ -924,7 +940,11 @@ fun NowPlayingScreen(
                 }
             }
 
-            Spacer(Modifier.weight(0.55f))
+            if (isCompactHeight) {
+                Spacer(Modifier.height(10.dp))
+            } else {
+                Spacer(Modifier.weight(0.55f))
+            }
 
             // Secondary Feature Dock
             PaperDebossedWell(
@@ -1011,9 +1031,9 @@ fun NowPlayingScreen(
     }
 
     if (showSleepSheet) {
-        var customMinutes by remember { mutableIntStateOf(settings.sleepTimerDefaultMinutes) }
-        var useEndOfTrack by remember { mutableStateOf(sleepTimer.isEndOfTrack) }
         PaperModalSheet(onDismissRequest = { showSleepSheet = false }) {
+            var customMinutes by remember { mutableIntStateOf(settings.sleepTimerDefaultMinutes) }
+            var useEndOfTrack by remember { mutableStateOf(sleepTimer.isEndOfTrack) }
             Column(Modifier.padding(horizontal = 22.dp, vertical = 12.dp)) {
                 Text("Sleep Timer", style = MaterialTheme.typography.headlineSmall, color = palette.inkPrimary)
                 Spacer(Modifier.height(6.dp))
@@ -1085,7 +1105,9 @@ fun NowPlayingScreen(
                             }
                             showSleepSheet = false
                         },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("sleep_timer_confirm_btn")
                     )
                 }
                 Spacer(Modifier.height(22.dp))

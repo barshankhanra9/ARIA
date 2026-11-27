@@ -2,11 +2,14 @@ package app.nocturne.player
 
 import android.app.Application
 import android.net.Uri
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.media3.common.Player
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -67,21 +70,24 @@ class FeaturesAndWidgetsTest {
                 mimeType = "audio/mp4",
                 bitrateKbps = 96,
                 codec = "aac",
-                formatLabel = "M4A · 96k"
+                formatLabel = "M4A · 96k",
+                expiresAtMs = 0L
             ),
             OnlineAudioStream(
                 url = "https://aac.saavncdn.com/test_160.mp4",
                 mimeType = "audio/mp4",
                 bitrateKbps = 160,
                 codec = "aac",
-                formatLabel = "M4A · 160k"
+                formatLabel = "M4A · 160k",
+                expiresAtMs = 0L
             ),
             OnlineAudioStream(
                 url = "https://aac.saavncdn.com/test_320.mp4",
                 mimeType = "audio/mp4",
                 bitrateKbps = 320,
                 codec = "aac",
-                formatLabel = "M4A · 320k"
+                formatLabel = "M4A · 320k",
+                expiresAtMs = 0L
             )
         )
 
@@ -337,15 +343,20 @@ class FeaturesAndWidgetsTest {
         composeRule.onNodeWithTag("now_playing_download_btn").assertIsDisplayed().performClick()
         assertTrue(downloadTriggered)
 
-        composeRule.onNodeWithTag("now_playing_sleep_timer_btn").assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("now_playing_sleep_timer_btn").performScrollTo().assertIsDisplayed().performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithText("15m").assertIsDisplayed()
         composeRule.onNodeWithText("30m").assertIsDisplayed()
         composeRule.onNodeWithText("45m").assertIsDisplayed()
         composeRule.onNodeWithText("60m").assertIsDisplayed()
-        composeRule.onNodeWithTag("sleep_timer_end_of_track").assertIsDisplayed().performClick()
+        composeRule.onNodeWithText("Start 30 min Timer").assertIsDisplayed()
+        composeRule.onNodeWithTag("sleep_timer_end_of_track")
+            .assertIsDisplayed()
+            .performSemanticsAction(SemanticsActions.OnClick)
         composeRule.waitForIdle()
-        composeRule.onNodeWithText("Stop at End of Track").performClick()
+        composeRule.onNodeWithText("Stop at End of Track").assertIsDisplayed()
+        composeRule.onNodeWithTag("sleep_timer_confirm_btn").performSemanticsAction(SemanticsActions.OnClick)
+        composeRule.waitForIdle()
         assertTrue(endOfTrackTriggered)
     }
 }
